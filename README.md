@@ -39,7 +39,7 @@ Terminal 1 - chạy FUSE (foreground):
 Terminal 2 - test:
 ```bash
 touch mountpoint/test.txt
-echo "Hello world from transparent compression FUSE!" > mountpoint/test.txt
+echo "XIN CHAO THE GIOIIIII" > mountpoint/test.txt
 cat mountpoint/test.txt
 ls -la mountpoint
 ls -la backing
@@ -61,5 +61,4 @@ Triển khai chunk map + metadata persistence (remount OK)
 - Hiện tại chỉ hỗ trợ dữ liệu raw (chưa nén).
 - Backing directory phải tồn tại trước khi chạy.
 - Project dùng FUSE 3.
-
 ```
