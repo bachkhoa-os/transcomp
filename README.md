@@ -12,6 +12,7 @@ Giai đoạn hiện tại (Tuần 2):
 - Hỗ trợ create, read, write, readdir, mkdir, rmdir (dữ liệu raw - chưa nén)
 
 ## Cấu trúc thư mục
+```markdown
 transcomp/
 ├── Makefile
 ├── README.md
@@ -23,6 +24,7 @@ transcomp/
 ├── backing/          ← thư mục lưu file thật (tự động tạo)
 ├── mountpoint/       ← thư mục mount (tự động tạo khi chạy)
 └── myfs              ← file thực thi (sau khi make)
+```
 
 ## Cách build
 ```bash
