@@ -1,4 +1,3 @@
-```markdown
 # Transparent Compression FUSE
 
 Project môn Hệ điều hành - Adding Transparent Compression Support to the File System - Nhóm 25228
@@ -61,4 +60,3 @@ Triển khai chunk map + metadata persistence (remount OK)
 - Hiện tại chỉ hỗ trợ dữ liệu raw (chưa nén).
 - Backing directory phải tồn tại trước khi chạy.
 - Project dùng FUSE 3.
-```
