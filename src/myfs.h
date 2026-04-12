@@ -1,6 +1,8 @@
 #ifndef MYFS_H
 #define MYFS_H
 
+#define FUSE_USE_VERSION 31
+
 #include <fuse.h>
 #include <stdio.h>
 #include <string.h>
@@ -21,7 +23,8 @@ struct myfs_config
 extern struct myfs_config *conf;
 
 void build_path(char *dest, const char *path);
-int myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg);
+
+void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg);
 void myfs_destroy(void *private_data);
 
 int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi);
