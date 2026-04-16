@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -g
+CFLAGS = -Wall -g -Wno-format-truncation
 LIBS = `pkg-config fuse3 --cflags --libs`
 
 all: myfs
