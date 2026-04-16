@@ -20,7 +20,6 @@ Các tính năng đã triển khai:
 Kết quả kiểm tra:
 - Tạo/ghi file → tự động sinh .data và .meta
 - Unmount → remount → file vẫn tồn tại, nội dung và kích thước logic không thay đổi
-- Không còn lỗi “Function not implemented” khi dùng lệnh touch
 
 ## Cấu trúc thư mục
 ```markdown
