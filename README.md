@@ -1,7 +1,6 @@
 # Transparent Compression FUSE
 
-Project môn Hệ điều hành - Adding Transparent Compression Support to the File System  
-Nhóm 25228
+Project môn Hệ điều hành - Adding Transparent Compression Support to the File System - Nhóm 25228
 
 ## Giới thiệu
 Đây là prototype File System sử dụng FUSE 3 hỗ trợ transparent compression (nén/giải nén trong suốt).  
