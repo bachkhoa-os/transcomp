@@ -52,7 +52,7 @@ make clean && make
 ```bash
 # 1. Tạo file và ghi dữ liệu
 touch mountpoint/test.txt
-echo "XIN CHAO THE GIOIIIII - Sprint 3 OK - metadata persistence working" > mountpoint/test.txt
+echo "XIN CHAO THE GIOIIIII" > mountpoint/test.txt
 
 # 2. Kiểm tra file logic
 cat mountpoint/test.txt
