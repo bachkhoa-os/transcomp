@@ -1,15 +1,27 @@
 # Transparent Compression FUSE
 
-Project môn Hệ điều hành - Adding Transparent Compression Support to the File System - Nhóm 25228
+Project môn Hệ điều hành - Adding Transparent Compression Support to the File System  
+Nhóm 25228
 
 ## Giới thiệu
-Đây là prototype File System sử dụng FUSE hỗ trợ transparent compression (nén/giải nén trong suốt).  
-Ứng dụng vẫn đọc/ghi file bình thường, file system tự động nén dữ liệu theo chunk trước khi lưu xuống backing store và tự động giải nén khi đọc.
+Đây là prototype File System sử dụng FUSE 3 hỗ trợ transparent compression (nén/giải nén trong suốt).  
+Ứng dụng vẫn gọi read/write bình thường, file system tự động nén/giải nén dữ liệu theo chunk 64 KB và lưu metadata bền vững sau remount.
 
-Giai đoạn hiện tại (Tuần 2):  
-- Skeleton FUSE hoàn chỉnh  
-- Backing store là thư mục thật  
-- Hỗ trợ create, read, write, readdir, mkdir, rmdir (dữ liệu raw - chưa nén)
+## Giai đoạn hiện tại (Tuần 3 - Sprint 3)
+Hoàn thành: Chunk map + metadata persistence (remount OK)
+
+Các tính năng đã triển khai:
+- Thiết kế và định nghĩa cấu trúc myfs_chunk_t, myfs_chunk_map_t, myfs_inode_t
+- Xây dựng cơ chế lưu trữ: mỗi file logic tương ứng với filename.data (dữ liệu) và filename.meta (chunk map dạng binary)
+- Implement load_chunk_map() và save_chunk_map() với cơ chế atomic write (file tạm + rename + fsync)
+- Cập nhật myfs_create, myfs_open, myfs_getattr, myfs_truncate và myfs_utimens
+- readdir tự động ẩn .data và .meta, chỉ hiển thị tên file logic
+- Logical size được quản lý và trả về đúng qua getattr
+
+Kết quả kiểm tra:
+- Tạo/ghi file → tự động sinh .data và .meta
+- Unmount → remount → file vẫn tồn tại, nội dung và kích thước logic không thay đổi
+- Không còn lỗi “Function not implemented” khi dùng lệnh touch
 
 ## Cấu trúc thư mục
 ```markdown
@@ -21,44 +33,50 @@ transcomp/
 │   ├── myfs.h
 │   ├── helpers.c
 │   └── operations.c
-├── backing/          ← thư mục lưu file thật (tự động tạo)
-├── mountpoint/       ← thư mục mount (tự động tạo khi chạy)
-└── myfs              ← file thực thi (sau khi make)
+├── backing/          ← thư mục lưu file thật (.data + .meta)
+├── mountpoint/       ← thư mục mount
+└── myfs              ← file thực thi
 ```
 
 ## Cách build
 ```bash
-make
+make clean && make
 ```
 
-## Cách chạy
-Terminal 1 - chạy FUSE (foreground):
+## Cách chạy (2 terminal)
+
+**Terminal 1** (chạy FUSE):
 ```bash
 ./myfs -f mountpoint ./backing
 ```
 
-Terminal 2 - test:
+**Terminal 2** (test):
 ```bash
 touch mountpoint/test.txt
 echo "XIN CHAO THE GIOIIIII" > mountpoint/test.txt
 cat mountpoint/test.txt
 ls -la mountpoint
-ls -la backing
-```
-
-Để unmount:
-```bash
+ls -la backing          # kiểm tra .data và .meta
 fusermount -u mountpoint
+
+# Remount và kiểm tra persistence
+./myfs -f mountpoint ./backing
+cat mountpoint/test.txt
+ls -la mountpoint
 ```
 
 ## Debug
-Mọi hàm đều in [DEBUG] ra terminal đang chạy FUSE.  
-Nếu gặp lỗi, xem ngay terminal chạy ./myfs để thấy thông báo [ERROR].
+Mọi hàm đều in log [DEBUG] rõ ràng trên terminal chạy FUSE.  
+Xem file .meta bằng lệnh:
+```bash
+hexdump -C backing/test.txt.meta
+```
 
-## Kế hoạch tiếp theo (Sprint 3)
-Triển khai chunk map + metadata persistence (remount OK)
+## Kế hoạch tiếp theo (Sprint 4)
+- Compression engine (Zstd) + read path hoàn chỉnh
+- Tích hợp giải nén tự động khi đọc dữ liệu từ chunk
 
 ## Lưu ý
-- Hiện tại chỉ hỗ trợ dữ liệu raw (chưa nén).
-- Backing directory phải tồn tại trước khi chạy.
-- Project dùng FUSE 3.
+- Hiện tại vẫn hoạt động trên dữ liệu raw (chưa nén)
+- Backing directory phải tồn tại trước khi chạy
+- Project dùng FUSE 3, chunk size 64 KB
