@@ -6,18 +6,24 @@ int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi
     (void)fi;
     printf("[DEBUG] getattr: %s\n", path);
 
+    // Thử build_path trước (cho thư mục)
+    char real_path[PATH_MAX];
+    build_path(real_path, path);
+
+    if (stat(real_path, stbuf) == 0 && S_ISDIR(stbuf->st_mode))
+        return 0;  // là thư mục → trả về luôn
+
+    // Nếu không phải thư mục, thử với .data (cho file)
     char data_path[PATH_MAX];
     build_data_path(data_path, path);
 
     if (stat(data_path, stbuf) == -1)
         return -errno;
 
-    // Sử dụng logical_size từ chunk map (quan trọng nhất)
+    // Cập nhật logical_size từ chunk map
     myfs_inode_t inode = {0};
     if (load_chunk_map(path, &inode) == 0)
-    {
         stbuf->st_size = inode.logical_size;
-    }
 
     return 0;
 }
