@@ -50,17 +50,31 @@ make clean && make
 
 **Terminal 2** (test):
 ```bash
+# 1. Tạo file và ghi dữ liệu
 touch mountpoint/test.txt
-echo "XIN CHAO THE GIOIIIII" > mountpoint/test.txt
+echo "XIN CHAO THE GIOIIIII - Sprint 3 OK - metadata persistence working" > mountpoint/test.txt
+
+# 2. Kiểm tra file logic
 cat mountpoint/test.txt
 ls -la mountpoint
-ls -la backing          # kiểm tra .data và .meta
+
+# 3. Kiểm tra backing store (phải thấy .data và .meta)
+ls -la backing
+
+# 4. Xem metadata binary (chunk map)
+hexdump -C backing/test.txt.meta
+
+# 5. Kiểm tra persistence (Unmount → Remount)
 fusermount -u mountpoint
 
-# Remount và kiểm tra persistence
+# Remount
 ./myfs -f mountpoint ./backing
+
+# Kiểm tra lại sau remount
 cat mountpoint/test.txt
 ls -la mountpoint
+ls -la backing
+hexdump -C backing/test.txt.meta
 ```
 
 ## Debug
