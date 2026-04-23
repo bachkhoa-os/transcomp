@@ -14,6 +14,7 @@
 #include <dirent.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <zstd.h>
 
 #define CHUNK_SIZE (64 * 1024ULL) // 64 KB
 
@@ -77,5 +78,9 @@ int load_chunk_map(const char *path, myfs_inode_t *inode);
 int save_chunk_map(const char *path, myfs_inode_t *inode);
 int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi);
 int myfs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi);
+int zstd_decompress(const void *src, size_t src_size,
+                    void *dst, size_t dst_capacity,
+                    size_t *decompressed_size);
+ZSTD_DCtx *zstd_create_dctx(void);
 
 #endif
