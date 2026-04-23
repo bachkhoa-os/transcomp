@@ -209,9 +209,7 @@ int myfs_read(const char *path, char *buf, size_t size,
             return cleanup_fd(fd, use_fi_fd, -EIO);
 
         size_t logical_remaining = (size_t)(inode.logical_size - (size_t)cur_offset);
-        size_t bytes_in_chunk = min(remaining,
-                                    min(chunk_size - chunk_offset,
-                                        logical_remaining));
+        size_t bytes_in_chunk = min(remaining, min(chunk_size - chunk_offset, logical_remaining));
 
         char *raw_buf = malloc(chunk->raw_size);
         if (guard_malloc(raw_buf) < 0)
