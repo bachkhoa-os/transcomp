@@ -191,3 +191,29 @@ int save_chunk_map(const char *path, myfs_inode_t *inode)
 
     return 0;
 }
+
+// Giải nén một chunk Zstd
+int zstd_decompress(const void *src, size_t src_size,
+                    void *dst, size_t dst_capacity,
+                    size_t *decompressed_size)
+{
+    size_t const result = ZSTD_decompress(dst, dst_capacity, src, src_size);
+    if (ZSTD_isError(result)) {
+        fprintf(stderr, "[ERROR] ZSTD_decompress failed: %s\n",
+                ZSTD_getErrorName(result));
+        return -EIO;
+    }
+    *decompressed_size = result;
+    return 0;
+}
+
+// Tạo ZSTD_DCtx reusable (sẽ tối ưu sau)
+ZSTD_DCtx* zstd_create_dctx(void)
+{
+    ZSTD_DCtx* dctx = ZSTD_createDCtx();
+    if (!dctx) {
+        fprintf(stderr, "[ERROR] ZSTD_createDCtx failed\n");
+        return NULL;
+    }
+    return dctx;
+}
