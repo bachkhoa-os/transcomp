@@ -70,7 +70,7 @@ dd if=mountpoint/test.txt bs=1 skip=4 count=4
 
 # 6. Test write file lớn
 dd if=/dev/urandom bs=1K count=128 > mountpoint/bigfile.bin
-# Lưu ý: IO error là expected — myfs_write() chưa tích hợp compression engine (Sprint 5)
+# Lưu ý: kết quả sẽ trả về  131072 byte tương ứng với 128kB
 
 # 7. Kiểm tra persistence (Unmount → Remount)
 fusermount -u mountpoint
