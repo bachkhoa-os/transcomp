@@ -52,7 +52,7 @@ make clean && make
 ```bash
 # 1. Tạo file và ghi dữ liệu
 touch mountpoint/test.txt
-echo "XIN CHAO THE GIOIIIII" > mountpoint/test.txt
+echo "XIN CHAO THE GIOIIIII - Sprint 4 read path OK" > mountpoint/test.txt
 
 # 2. Kiểm tra file logic
 cat mountpoint/test.txt
@@ -64,7 +64,15 @@ ls -la backing
 # 4. Xem metadata binary (chunk map)
 hexdump -C backing/test.txt.meta
 
-# 5. Kiểm tra persistence (Unmount → Remount)
+# 5. Test partial read (offset > 0)
+dd if=mountpoint/test.txt bs=1 skip=4 count=4
+# Lưu ý: trả 0 bytes là expected — write path chưa cập nhật chunk map (Sprint 5)
+
+# 6. Test write file lớn
+dd if=/dev/urandom bs=1K count=128 > mountpoint/bigfile.bin
+# Lưu ý: IO error là expected — myfs_write() chưa tích hợp compression engine (Sprint 5)
+
+# 7. Kiểm tra persistence (Unmount → Remount)
 fusermount -u mountpoint
 
 # Remount
@@ -76,6 +84,9 @@ ls -la mountpoint
 ls -la backing
 hexdump -C backing/test.txt.meta
 ```
+
+> **Ghi chú Sprint 4:** Read path hoạt động đúng với dữ liệu đã có sẵn trong `.data`.  
+> Partial read và write file lớn chưa hoạt động do write path chưa tích hợp chunk map — đây là phạm vi Sprint 5.
 
 ## Debug
 Mọi hàm đều in log [DEBUG] rõ ràng trên terminal chạy FUSE.  
