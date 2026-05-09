@@ -15,50 +15,65 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <zstd.h>
+#include <time.h>
 
-#define CHUNK_SIZE (64 * 1024ULL) // 64 KB
+/*
+ * Macro ghi log debug kèm timestamp theo định dạng [HH:MM:SS.mmm].
+ * Mục đích là giúp đối chiếu thứ tự sự kiện và thời điểm phát sinh lỗi
+ * trong quá trình mount, đọc, ghi và đồng bộ metadata của filesystem.
+ */
+#define LOG(fmt, ...) do { \
+    struct timespec _ts; \
+    clock_gettime(CLOCK_REALTIME, &_ts); \
+    struct tm *_tm = localtime(&_ts.tv_sec); \
+    fprintf(stderr, "[%02d:%02d:%02d.%03ld] " fmt, \
+            _tm->tm_hour, _tm->tm_min, _tm->tm_sec, \
+            _ts.tv_nsec / 1000000, ##__VA_ARGS__); \
+} while(0)
 
-typedef struct
-{
-    uint64_t logical_offset;  // offset in the logical file
-    uint32_t raw_size;        // size of the chunk data on disk
-    uint32_t stored_size;     // size of the chunk data after decompression (if compressed)
-    uint8_t codec_type;       // 0 = none, 1 = zstd, etc.
-    uint8_t flags;            // bit 0: compressed, bit 1: encrypted, etc.
-    uint32_t checksum;        // checksum of the chunk data for integrity verification
-    uint64_t physical_offset; // offset on disk where the chunk data is stored
-} myfs_chunk_t;               // metadata for each chunk of a file
-
-typedef struct
-{
-    uint32_t num_chunks;   // number of chunks in the file
-    uint64_t logical_size; // total logical size of the file (sum of stored_size of all chunks)
-    myfs_chunk_t *chunks;  // array of chunk metadata
-} myfs_chunk_map_t;        // metadata for a file, including its chunk map
+#define CHUNK_SIZE (64 * 1024ULL) /* 64 KB */
 
 typedef struct
 {
-    uint64_t logical_size;      // sync with chunk_map.logical_size for convenience
-    myfs_chunk_map_t chunk_map; // chunk map for this file
-} myfs_inode_t;                 // placeholder for inode metadata (can be extended as needed)
+    uint64_t logical_offset;  /* Vị trí của chunk trong không gian logic của file. */
+    uint32_t raw_size;        /* Kích thước dữ liệu thực tế được lưu trên đĩa. */
+    uint32_t stored_size;     /* Kích thước dữ liệu sau giải nén nếu chunk được nén. */
+    uint8_t codec_type;       /* Mã codec: 0 = none, 1 = zstd, ... */
+    uint8_t flags;            /* Các cờ trạng thái của chunk, ví dụ compressed, encrypted. */
+    uint32_t checksum;        /* Giá trị kiểm tra toàn vẹn của dữ liệu chunk. */
+    uint64_t physical_offset; /* Vị trí vật lý của chunk trong file lưu trữ. */
+} myfs_chunk_t;               /* Metadata của một chunk trong file. */
+
+typedef struct
+{
+    uint32_t num_chunks;   /* Tổng số chunk hiện có trong file. */
+    uint64_t logical_size; /* Kích thước logic tổng cộng của file. */
+    myfs_chunk_t *chunks;  /* Mảng metadata cho từng chunk. */
+} myfs_chunk_map_t;        /* Cấu trúc chunk map của một file. */
+
+typedef struct
+{
+    uint64_t logical_size;      /* Trường thuận tiện, luôn đồng bộ với chunk_map.logical_size. */
+    myfs_chunk_map_t chunk_map; /* Chunk map hiện hành của file. */
+} myfs_inode_t;                 /* Lớp chứa metadata inode, có thể mở rộng về sau. */
 
 struct myfs_config
 {
     char root[PATH_MAX];
 };
 
-// Hàm lấy cấu hình từ context của FUSE
+/* Dựng các đường dẫn vật lý từ path logic của FUSE. */
 void build_path(char *dest, const char *path);
 void build_data_path(char *dest, const char *path);
 void build_meta_path(char *dest, const char *path);
 
-// Khởi tạo filesystem, thiết lập cấu hình, v.v.
+/* Khởi tạo filesystem, thiết lập cấu hình runtime và bật các tuỳ chọn cần thiết. */
 void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg);
 
-// Dọn dẹp tài nguyên đã cấp phát (nếu có)
+/* Giải phóng tài nguyên đã cấp phát khi filesystem bị tháo mount. */
 void myfs_destroy(void *private_data);
 
-// Prototypes
+/* Các callback và helper chính của filesystem. */
 int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi);
 int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                  off_t offset, struct fuse_file_info *fi,
@@ -73,11 +88,15 @@ int myfs_write(const char *path, const char *buf, size_t size,
 int myfs_release(const char *path, struct fuse_file_info *fi);
 int myfs_mkdir(const char *path, mode_t mode);
 int myfs_rmdir(const char *path);
+int myfs_unlink(const char *path);
 
 int load_chunk_map(const char *path, myfs_inode_t *inode);
 int save_chunk_map(const char *path, myfs_inode_t *inode);
 int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi);
 int myfs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi);
+int zstd_compress(const void *src, size_t src_size,
+                  void *dst, size_t dst_capacity,
+                  size_t *compressed_size);
 int zstd_decompress(const void *src, size_t src_size,
                     void *dst, size_t dst_capacity,
                     size_t *decompressed_size);
