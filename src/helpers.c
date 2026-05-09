@@ -1,77 +1,109 @@
 #include "myfs.h"
 #include <inttypes.h>
 
-// Hàm lấy cấu hình từ context của FUSE
+/*
+ * Truy xuất cấu hình của hệ thống tập tin từ private_data của FUSE context.
+ * Hàm này đóng vai trò là điểm truy cập chung để các helper khác lấy cấu hình
+ * hiện hành mà không cần truyền thủ công qua từng lời gọi.
+ */
 static inline struct myfs_config *get_conf()
 {
     return (struct myfs_config *)fuse_get_context()->private_data;
 }
 
-// Khởi tạo filesystem, thiết lập cấu hình, v.v.
+/*
+ * Khởi tạo filesystem và thiết lập các tuỳ chọn runtime cho FUSE.
+ * Hiện tại kernel cache được bật để giảm số lần truy cập không cần thiết
+ * tới lớp user-space trong các thao tác đọc lặp lại.
+ */
 void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
     (void)conn;
     cfg->kernel_cache = 1;
-    printf("[DEBUG] FUSE init called\n");
+    LOG("[DEBUG] FUSE init called\n");
     return fuse_get_context()->private_data;
 }
 
-// Dọn dẹp tài nguyên đã cấp phát (nếu có)
+/*
+ * Giải phóng tài nguyên mà filesystem đã cấp phát trong suốt vòng đời hoạt động.
+ * Mọi con trỏ được gắn vào private_data cần được thu hồi tại đây để tránh rò rỉ
+ * bộ nhớ khi mountpoint bị tháo gỡ.
+ */
 void myfs_destroy(void *private_data)
 {
     free(private_data);
-    printf("[DEBUG] FUSE destroy called\n");
+    LOG("[DEBUG] FUSE destroy called\n");
 }
 
-// Dựng đường dẫn đầy đủ cho file lưu trữ thực tế dựa trên đường dẫn logic
+/*
+ * Dựng đường dẫn vật lý đầy đủ trên backing storage từ đường dẫn logic của FUSE.
+ * Hàm này ghép thư mục gốc cấu hình với path do FUSE cung cấp để các thao tác
+ * phía sau luôn làm việc trên đúng đối tượng lưu trữ.
+ */
 void build_path(char *dest, const char *path)
 {
     struct myfs_config *conf = get_conf();
     if (!conf || conf->root[0] == '\0')
     {
-        fprintf(stderr, "[ERROR] config not initialized\n");
+        LOG("[ERROR] config not initialized\n");
         return;
     }
     snprintf(dest, PATH_MAX, "%s%s", conf->root, path);
 }
 
-// Dựng đường dẫn cho file data (.data)
+/*
+ * Tạo đường dẫn tới file dữ liệu thực tế tương ứng với một path logic.
+ * Tệp .data lưu nội dung người dùng, tách biệt khỏi metadata để việc quản lý
+ * dữ liệu và trạng thái nén được rõ ràng hơn.
+ */
 void build_data_path(char *dest, const char *path)
 {
-    build_path(dest, path);                    // đã có null terminator
+    /* build_path đã đảm bảo dest là chuỗi kết thúc bằng null. */
+    build_path(dest, path);
     size_t len = strlen(dest);
-    if (len + 6 >= PATH_MAX) {                 // 5 ký tự + null
-        fprintf(stderr, "[ERROR] path too long for .data\n");
+    if (len + 6 >= PATH_MAX)
+    {
+        /* 5 ký tự của ".data" cộng với ký tự null kết thúc chuỗi. */
+        LOG("[ERROR] path too long for .data\n");
         dest[0] = '\0';
         return;
     }
     strcat(dest, ".data");
 }
 
-// Dựng đường dẫn cho file metadata (.meta)
+/*
+ * Tạo đường dẫn tới file metadata tương ứng với một path logic.
+ * File .meta lưu chunk map và logical size của đối tượng, tách riêng khỏi
+ * payload để cập nhật metadata không ảnh hưởng trực tiếp đến dữ liệu chính.
+ */
 void build_meta_path(char *dest, const char *path)
 {
     build_path(dest, path);
     size_t len = strlen(dest);
-    if (len + 6 >= PATH_MAX) {
-        fprintf(stderr, "[ERROR] path too long for .meta\n");
+    if (len + 6 >= PATH_MAX)
+    {
+        LOG("[ERROR] path too long for .meta\n");
         dest[0] = '\0';
         return;
     }
     strcat(dest, ".meta");
 }
 
-// Load chunk map từ file .meta (binary)
+/*
+ * Nạp chunk map từ file metadata dạng nhị phân.
+ * Trạng thái được lưu gồm số lượng chunk, logical size và danh sách chunk.
+ * Nếu metadata chưa tồn tại, inode được khởi tạo ở trạng thái rỗng hợp lệ.
+ */
 int load_chunk_map(const char *path, myfs_inode_t *inode)
 {
     char meta_path[PATH_MAX];
     build_meta_path(meta_path, path);
 
-    printf("[DEBUG] load_chunk_map: %s\n", meta_path);
+    LOG("[DEBUG] load_chunk_map: %s\n", meta_path);
 
     struct stat st;
 
-    // Nếu file .meta không tồn tại, khởi tạo inode trống
+    /* Nếu file .meta chưa tồn tại, xem đây là inode mới và khởi tạo rỗng. */
     if (stat(meta_path, &st) == -1)
     {
         inode->logical_size = 0;
@@ -87,7 +119,7 @@ int load_chunk_map(const char *path, myfs_inode_t *inode)
         return -errno;
     }
 
-    // Đọc số lượng chunk và logical size
+    /* Đọc phần header của metadata: số chunk và kích thước logic. */
     if (fread(&inode->chunk_map.num_chunks, sizeof(uint32_t), 1, f) != 1 ||
         fread(&inode->chunk_map.logical_size, sizeof(uint64_t), 1, f) != 1)
     {
@@ -95,23 +127,22 @@ int load_chunk_map(const char *path, myfs_inode_t *inode)
         return -EIO;
     }
 
-    // Cấp phát và đọc mảng chunk
+    /* Giải phóng dữ liệu cũ trước khi nạp trạng thái mới từ đĩa. */
     free(inode->chunk_map.chunks);
     inode->chunk_map.chunks = NULL;
 
-    // Nếu có chunk nào, cấp phát mảng và đọc vào
+    /* Nếu metadata có danh sách chunk, cấp phát đúng kích thước và đọc vào RAM. */
     if (inode->chunk_map.num_chunks > 0)
     {
-        // Cấp phát mảng chunk
         inode->chunk_map.chunks = malloc(inode->chunk_map.num_chunks * sizeof(myfs_chunk_t));
 
-        // Kiểm tra cấp phát thành công
+        /* Bảo đảm cấp phát bộ nhớ thành công trước khi đọc dữ liệu. */
         if (!inode->chunk_map.chunks)
         {
             fclose(f);
             return -ENOMEM;
         }
-        // Đọc mảng chunk từ file .meta
+        /* Đọc toàn bộ mảng chunk từ file metadata. */
         if (fread(inode->chunk_map.chunks, sizeof(myfs_chunk_t),
                   inode->chunk_map.num_chunks, f) != inode->chunk_map.num_chunks)
         {
@@ -122,17 +153,30 @@ int load_chunk_map(const char *path, myfs_inode_t *inode)
     }
     else
     {
-        // Nếu không có chunk nào, đảm bảo con trỏ chunks là NULL
+        /* Không có chunk nào thì giữ con trỏ ở trạng thái NULL rõ ràng. */
         inode->chunk_map.chunks = NULL;
     }
 
     fclose(f);
-    printf("[DEBUG] load_chunk_map success: %u chunks, logical_size=%lu\n",
+
+    /*
+     * Đồng bộ logical size từ chunk_map sang inode.
+     * Cấu trúc chunk_map là nguồn dữ liệu vừa được nạp từ đĩa, còn inode.logical_size
+     * là trường được các hàm như myfs_read và myfs_getattr sử dụng trực tiếp.
+     * Giữ hai giá trị này nhất quán là cần thiết để tránh đọc sai kích thước file.
+     */
+    inode->logical_size = inode->chunk_map.logical_size;
+
+    LOG("[DEBUG] load_chunk_map success: %u chunks, logical_size=%lu\n",
            inode->chunk_map.num_chunks, inode->chunk_map.logical_size);
     return 0;
 }
 
-// Save chunk map xuống file .meta (binary)
+/*
+ * Ghi chunk map xuống file metadata nhị phân theo cách an toàn hơn.
+ * Dữ liệu được ghi vào file tạm trước, sau đó mới rename sang file chính thức
+ * để hạn chế nguy cơ metadata bị hỏng nếu quá trình ghi bị gián đoạn.
+ */
 int save_chunk_map(const char *path, myfs_inode_t *inode)
 {
     char meta_path[PATH_MAX];
@@ -140,13 +184,13 @@ int save_chunk_map(const char *path, myfs_inode_t *inode)
 
     build_meta_path(meta_path, path);
 
-    // Tạo đường dẫn tạm để ghi dữ liệu trước khi rename
+    /* Dựng đường dẫn file tạm để thực hiện ghi theo kiểu atomic-ish. */
     if (snprintf(tmp_path, PATH_MAX, "%s.tmp", meta_path) >= PATH_MAX)
     {
-        fprintf(stderr, "[ERROR] tmp path too long\n");
+        LOG("[ERROR] tmp path too long\n");
         return -ENAMETOOLONG;
     }
-    printf("[DEBUG] save_chunk_map: %s\n", meta_path);
+    LOG("[DEBUG] save_chunk_map: %s\n", meta_path);
 
     FILE *f = fopen(tmp_path, "wb");
     if (!f)
@@ -155,7 +199,7 @@ int save_chunk_map(const char *path, myfs_inode_t *inode)
         return -errno;
     }
 
-    // Ghi số lượng chunk và logical size
+    /* Ghi header metadata gồm số chunk và logical size hiện tại. */
     if (fwrite(&inode->chunk_map.num_chunks, sizeof(uint32_t), 1, f) != 1 ||
         fwrite(&inode->chunk_map.logical_size, sizeof(uint64_t), 1, f) != 1)
     {
@@ -163,7 +207,7 @@ int save_chunk_map(const char *path, myfs_inode_t *inode)
         return -EIO;
     }
 
-    // Ghi mảng chunk nếu có
+    /* Nếu tồn tại chunk map, ghi toàn bộ danh sách chunk theo sau header. */
     if (inode->chunk_map.num_chunks > 0)
     {
         if (fwrite(inode->chunk_map.chunks, sizeof(myfs_chunk_t),
@@ -174,32 +218,73 @@ int save_chunk_map(const char *path, myfs_inode_t *inode)
         }
     }
 
-    // Đảm bảo dữ liệu được ghi ra đĩa trước khi rename
+    /* Buộc flush dữ liệu xuống thiết bị trước khi đổi tên file tạm. */
     fflush(f);
     fsync(fileno(f));
     fclose(f);
 
-    // Rename file tạm thành file .meta chính thức
+    /* Hoàn tất bằng cách thay thế file metadata cũ bằng file tạm đã ghi xong. */
     if (rename(tmp_path, meta_path) != 0)
     {
         perror("[ERROR] rename");
         return -errno;
     }
 
-    printf("[DEBUG] save_chunk_map success: %u chunks, logical_size=%" PRIu64 "\n",
+    LOG("[DEBUG] save_chunk_map success: %u chunks, logical_size=%" PRIu64 "\n",
            inode->chunk_map.num_chunks, inode->chunk_map.logical_size);
 
     return 0;
 }
 
-// Giải nén một chunk Zstd
+/*
+ * Nén một chunk bằng Zstd theo one-shot API với mức nén mặc định.
+ *
+ * Quy ước kết quả:
+ * - Là 0 nếu nén thành công và kích thước sau nén giảm ít nhất 12.5%.
+ * - Là -EFBIG nếu dữ liệu không đáng để nén thêm, ví dụ ảnh, video, zip hoặc dữ liệu ngẫu nhiên.
+ *   Trong trường hợp này caller có thể lưu raw thay vì lưu bản đã nén.
+ * - Là -EIO nếu Zstd báo lỗi trong quá trình nén.
+ */
+int zstd_compress(const void *src, size_t src_size,
+                  void *dst, size_t dst_capacity,
+                  size_t *compressed_size)
+{
+    size_t const result = ZSTD_compress(dst, dst_capacity, src, src_size,
+                                        ZSTD_CLEVEL_DEFAULT);
+    if (ZSTD_isError(result))
+    {
+        LOG("[ERROR] ZSTD_compress failed: %s\n",
+                ZSTD_getErrorName(result));
+        return -EIO;
+    }
+
+    /*
+     * Bỏ qua nén nếu mức giảm không đạt tối thiểu 12.5%.
+     * Ngưỡng này giúp tránh tốn CPU cho dữ liệu vốn đã nén tốt hoặc có tính entropy cao.
+     */
+    if (result >= src_size - src_size / 8)
+    {
+        LOG("[DEBUG] zstd_compress: skip (compressed=%zu original=%zu)\n",
+               result, src_size);
+        return -EFBIG;
+    }
+
+    *compressed_size = result;
+    return 0;
+}
+
+/*
+ * Giải nén một chunk đã được mã hoá bằng Zstd.
+ * Kết quả giải nén được ghi vào dst và kích thước thực tế được trả qua decompressed_size.
+ */
 int zstd_decompress(const void *src, size_t src_size,
                     void *dst, size_t dst_capacity,
                     size_t *decompressed_size)
 {
     size_t const result = ZSTD_decompress(dst, dst_capacity, src, src_size);
-    if (ZSTD_isError(result)) {
-        fprintf(stderr, "[ERROR] ZSTD_decompress failed: %s\n",
+    if (ZSTD_isError(result))
+    {
+        LOG("[ERROR] ZSTD_decompress failed: %s\n",
                 ZSTD_getErrorName(result));
         return -EIO;
     }
@@ -207,12 +292,17 @@ int zstd_decompress(const void *src, size_t src_size,
     return 0;
 }
 
-// Tạo ZSTD_DCtx reusable (sẽ tối ưu sau)
-ZSTD_DCtx* zstd_create_dctx(void)
+/*
+ * Tạo một ZSTD_DCtx có thể tái sử dụng cho các lần giải nén sau.
+ * Việc giữ context ở dạng reusable có thể giảm chi phí khởi tạo nếu luồng xử lý
+ * thực hiện nhiều thao tác giải nén liên tiếp.
+ */
+ZSTD_DCtx *zstd_create_dctx(void)
 {
-    ZSTD_DCtx* dctx = ZSTD_createDCtx();
-    if (!dctx) {
-        fprintf(stderr, "[ERROR] ZSTD_createDCtx failed\n");
+    ZSTD_DCtx *dctx = ZSTD_createDCtx();
+    if (!dctx)
+    {
+        LOG("[ERROR] ZSTD_createDCtx failed\n");
         return NULL;
     }
     return dctx;
