@@ -30,7 +30,10 @@ transcomp/
 │   ├── main.c
 │   ├── myfs.h
 │   ├── helpers.c
-│   └── operations.c
+│   ├── operations.c
+│   └── guards/
+│       ├── guards.h
+│       └── guards.c    ← metadata validation guards
 ├── backing/          ← thư mục lưu file thật (.data + .meta)
 ├── mountpoint/       ← thư mục mount
 └── myfs              ← file thực thi
@@ -38,68 +41,42 @@ transcomp/
 
 ## Cách build
 ```bash
-make clean && make
-```
+# 1. Write và read basic
+echo "HELLO WORLD" > mountpoint/test.txt
+cat mountpoint/test.txt                             # HELLO WORLD
 
-## Cách chạy (2 terminal)
+# 2. Partial overwrite (RMW)
+printf 'FUSE!' | dd of=mountpoint/test.txt bs=1 seek=6 conv=notrunc
+cat mountpoint/test.txt                             # HELLO FUSE!
 
-**Terminal 1** (chạy FUSE):
-```bash
-./myfs -f mountpoint ./backing
-```
+# 3. Incompressible data (random binary)
+dd if=/dev/urandom bs=1K count=1 > mountpoint/rand.bin 2>/dev/null
+# log: write: incompressible, storing raw
 
-**Terminal 2** (test):
-```bash
-# 1. Tạo file và ghi dữ liệu
-touch mountpoint/test.txt
-echo "XIN CHAO THE GIOIIIII - Sprint 4 read path OK" > mountpoint/test.txt
-
-# 2. Kiểm tra file logic
-cat mountpoint/test.txt
-ls -la mountpoint
-
-# 3. Kiểm tra backing store (phải thấy .data và .meta)
-ls -la backing
-
-# 4. Xem metadata binary (chunk map)
+# 4. Xem metadata binary
 hexdump -C backing/test.txt.meta
 
-# 5. Test partial read (offset > 0)
-dd if=mountpoint/test.txt bs=1 skip=4 count=4
-# Lưu ý: trả 0 bytes là expected — write path chưa cập nhật chunk map (Sprint 5)
+# 5. Xóa file
+rm mountpoint/test.txt
+ls mountpoint/                                      # trống
+ls backing/                                         # chỉ còn . và ..
 
-# 6. Test write file lớn
-dd if=/dev/urandom bs=1K count=128 > mountpoint/bigfile.bin
-# Lưu ý: kết quả sẽ trả về  131072 byte tương ứng với 128kB
-
-# 7. Kiểm tra persistence (Unmount → Remount)
-fusermount -u mountpoint
-
-# Remount
-./myfs -f mountpoint ./backing
-
-# Kiểm tra lại sau remount
-cat mountpoint/test.txt
-ls -la mountpoint
-ls -la backing
-hexdump -C backing/test.txt.meta
+# 6. Persistence (unmount → remount)
+make umount && make run
+cat mountpoint/test.txt                             # vẫn đúng nội dung
 ```
-
-> **Ghi chú Sprint 4:** Read path hoạt động đúng với dữ liệu đã có sẵn trong `.data`.  
-> Partial read và write file lớn chưa hoạt động do write path chưa tích hợp chunk map — đây là phạm vi Sprint 5.
 
 ## Debug
-Mọi hàm đều in log [DEBUG] rõ ràng trên terminal chạy FUSE.  
-Xem file .meta bằng lệnh:
-```bash
-hexdump -C backing/test.txt.meta
+
+Log có timestamp `[HH:MM:SS.mmm]` in ra stderr trên terminal chạy FUSE:
+```
+[13:05:01.234] [DEBUG] write: /test.txt offset=0 size=12
+[13:05:01.235] [DEBUG] write: incompressible, storing raw
+[13:05:01.236] [DEBUG] write OK: chunks=1 logical_size=12 codec=0
 ```
 
-## Kế hoạch tiếp theo (Sprint 4)
-- Compression engine (Zstd) + read path hoàn chỉnh
-- Tích hợp giải nén tự động khi đọc dữ liệu từ chunk
+## Kế hoạch tiếp theo (Sprint 6)
 
-## Lưu ý
-- Hiện tại vẫn hoạt động trên dữ liệu raw (chưa nén)
-- Backing directory phải tồn tại trước khi chạy
-- Project dùng FUSE 3, chunk size 64 KB
+- Heuristic skip compression nâng cao (detect magic bytes)
+- Corner case testing toàn diện (file rỗng, truncate nhiều lần, append lớn)
+- Garbage collection: thu hồi orphan blob trong `.data`

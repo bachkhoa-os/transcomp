@@ -7,5 +7,11 @@ all: myfs
 myfs: src/main.c src/helpers.c src/operations.c src/guards/guards.c
 	$(CC) $(CFLAGS) -o myfs src/main.c src/helpers.c src/operations.c src/guards/guards.c $(LIBS)
 
+run: myfs
+	./myfs -f mountpoint ./backing
+
+umount:
+	fusermount -u mountpoint
+
 clean:
 	rm -f myfs

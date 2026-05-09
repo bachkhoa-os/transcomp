@@ -11,6 +11,7 @@ static struct fuse_operations myfs_oper = {
     .release = myfs_release,
     .mkdir = myfs_mkdir,
     .rmdir = myfs_rmdir,
+    .unlink = myfs_unlink,
     .init = myfs_init,
     .destroy = myfs_destroy,
     .truncate = myfs_truncate,
@@ -21,14 +22,18 @@ int main(int argc, char *argv[])
 {
     printf("[DEBUG] FUSE file system is starting up...\n");
 
-    // Đảm bảo người dùng cung cấp đủ tham số
+    /*
+     * Điểm khởi động của chương trình mount FUSE.
+     * Quy trình ở đây gồm kiểm tra tham số, chuẩn hoá đường dẫn backing store,
+     * xác thực thư mục lưu trữ và cuối cùng chuyển quyền điều khiển cho fuse_main.
+     */
     if (argc < 3)
     {
         fprintf(stderr, "Usage: %s <mountpoint> <backing_dir>\n", argv[0]);
         return 1;
     }
 
-    // Khởi tạo cấu hình và xác thực thư mục lưu trữ
+    /* Khởi tạo cấu hình runtime của filesystem và cấp phát vùng nhớ chứa nó. */
     struct myfs_config *conf = calloc(1, sizeof(struct myfs_config));
     if (!conf)
     {
@@ -36,7 +41,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Lấy đường dẫn tuyệt đối của thư mục lưu trữ
+    /* Chuẩn hoá backing directory thành đường dẫn tuyệt đối để tránh nhập nhằng. */
     if (!realpath(argv[argc - 1], conf->root))
     {
         perror("realpath");
@@ -44,7 +49,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Kiểm tra xem đường dẫn lưu trữ có tồn tại và là thư mục hay không
+    /* Xác nhận backing path tồn tại và thực sự là một thư mục hợp lệ. */
     struct stat st;
     if (stat(conf->root, &st) == -1 || !S_ISDIR(st.st_mode))
     {
@@ -54,7 +59,10 @@ int main(int argc, char *argv[])
     }
     printf("[DEBUG] backing dir = %s\n", conf->root);
 
-    // Truyền cấu hình qua context của FUSE
+    /*
+     * Fuse nhận cấu hình qua private_data, vì vậy loại bỏ backing_dir khỏi argv
+     * trước khi gọi fuse_main để chỉ còn các tham số dành cho FUSE.
+     */
     argv[argc - 1] = NULL;
     argc--;
 
