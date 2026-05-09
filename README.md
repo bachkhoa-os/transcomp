@@ -4,22 +4,26 @@ Project môn Hệ điều hành - Adding Transparent Compression Support to the 
 
 ## Giới thiệu
 Đây là prototype File System sử dụng FUSE 3 hỗ trợ transparent compression (nén/giải nén trong suốt).  
-Ứng dụng vẫn gọi read/write bình thường, file system tự động nén/giải nén dữ liệu theo chunk 64 KB và lưu metadata bền vững sau remount.
+Ứng dụng vẫn gọi read/write bình thường; file system tự động nén/giải nén theo chunk 64 KB (Zstd), hỗ trợ ghi đè từng phần và lưu metadata bền vững sau remount.
 
-## Giai đoạn hiện tại (Tuần 3 - Sprint 3)
-Hoàn thành: Chunk map + metadata persistence (remount OK)
+## Giai đoạn hiện tại (Tuần 5 - Sprint 5)
+Sprint 5: Write path + partial overwrite + fsync/checkpoint (đã hoàn thành)
 
 Các tính năng đã triển khai:
-- Thiết kế và định nghĩa cấu trúc myfs_chunk_t, myfs_chunk_map_t, myfs_inode_t
-- Xây dựng cơ chế lưu trữ: mỗi file logic tương ứng với filename.data (dữ liệu) và filename.meta (chunk map dạng binary)
-- Implement load_chunk_map() và save_chunk_map() với cơ chế atomic write (file tạm + rename + fsync)
-- Cập nhật myfs_create, myfs_open, myfs_getattr, myfs_truncate và myfs_utimens
-- readdir tự động ẩn .data và .meta, chỉ hiển thị tên file logic
-- Logical size được quản lý và trả về đúng qua getattr
+- Thiết kế và định nghĩa cấu trúc `myfs_chunk_t`, `myfs_chunk_map_t`, `myfs_inode_t` (chunk 64 KB)
+- Cơ chế lưu trữ: mỗi file logic tương ứng với `filename.data` (dữ liệu) và `filename.meta` (chunk map nhị phân)
+- Read/Write theo chunk, nén Zstd one-shot; bỏ nén nếu không hiệu quả
+- Partial overwrite (RMW): gom các chunk bị chồng lấn, patch dữ liệu, ghi blob mới
+- `load_chunk_map()`/`save_chunk_map()` với atomic write (file tạm + rename + fsync)
+- `open(O_TRUNC)` và `truncate` đồng bộ lại chunk map và logical size
+- Guards kiểm tra metadata/offset/codec khi đọc để tránh lỗi dữ liệu
+- `readdir` ẩn `.data` và `.meta`, chỉ hiển thị tên file logic
 
 Kết quả kiểm tra:
-- Tạo/ghi file → tự động sinh .data và .meta
-- Unmount → remount → file vẫn tồn tại, nội dung và kích thước logic không thay đổi
+- Tạo/ghi/đọc file → tự động sinh `.data` và `.meta`, nội dung trả về đúng
+- Partial overwrite → dữ liệu ghép đúng sau ghi đè giữa file
+- `rm` xoá đồng thời `.data` và `.meta`, `readdir` không lộ file nội bộ
+- Unmount → remount → file vẫn tồn tại, metadata và kích thước logic không thay đổi
 
 ## Cấu trúc thư mục
 ```markdown
