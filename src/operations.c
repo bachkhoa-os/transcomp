@@ -415,7 +415,7 @@ static int write_rmw(const char *path, int fd,
 {
     /* Xác định toàn bộ các chunk bị chồng lấn với vùng ghi mới. */
     LOG("[DEBUG] write_rmw: offset=%ld size=%zu chunk_idx=%u num_chunks=%u\n",
-           offset, size, chunk_idx, inode->chunk_map.num_chunks);
+        offset, size, chunk_idx, inode->chunk_map.num_chunks);
     uint32_t last_idx = chunk_idx;
     off_t write_end = offset + (off_t)size;
     for (uint32_t i = chunk_idx + 1; i < inode->chunk_map.num_chunks; i++)
@@ -465,11 +465,11 @@ static int write_rmw(const char *path, int fd,
 
         ssize_t n = pread(read_fd, raw_buf, c->raw_size, c->physical_offset);
         LOG("[DEBUG] rmw pread: chunk=%u raw_size=%u phys_off=%lu got=%ld\n",
-               i, c->raw_size, c->physical_offset, n);
+            i, c->raw_size, c->physical_offset, n);
         if (n != (ssize_t)c->raw_size)
         {
             LOG("[ERROR] rmw pread failed: expected %u got %ld errno=%d\n",
-                    c->raw_size, n, errno);
+                c->raw_size, n, errno);
             free(raw_buf);
             close(read_fd);
             free(work_buf);
@@ -526,7 +526,7 @@ static int write_rmw(const char *path, int fd,
         write_size = compressed_size;
         new_codec = 1;
         LOG("[DEBUG] rmw: recompressed %zu → %zu bytes\n",
-               region_size, compressed_size);
+            region_size, compressed_size);
     }
     else
     {
@@ -659,7 +659,7 @@ int myfs_write(const char *path, const char *buf, size_t size,
         write_size = compressed_size;
         codec_type = 1;
         LOG("[DEBUG] write: compressed %zu → %zu bytes (%.1f%%)\n",
-               size, compressed_size, 100.0 * compressed_size / size);
+            size, compressed_size, 100.0 * compressed_size / size);
     }
     else
     {
@@ -727,7 +727,7 @@ int myfs_write(const char *path, const char *buf, size_t size,
     free(inode.chunk_map.chunks);
 
     LOG("[DEBUG] write OK: chunks=%u logical_size=%zu codec=%d\n",
-           new_count, (size_t)inode.logical_size, codec_type);
+        new_count, (size_t)inode.logical_size, codec_type);
 
     return (int)size;
 }
@@ -736,7 +736,13 @@ int myfs_write(const char *path, const char *buf, size_t size,
 int myfs_release(const char *path, struct fuse_file_info *fi)
 {
     (void)path;
-    close(fi->fh);
+
+    /* Đồng bộ dữ liệu trước khi đóng để đảm bảo tính toàn vẹn. */
+    if (fi->fh > 0)
+    {
+        fsync(fi->fh);
+        close(fi->fh);
+    }
     return 0;
 }
 
