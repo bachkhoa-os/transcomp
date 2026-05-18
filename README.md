@@ -73,7 +73,7 @@ make clean && make && make run
 ```
 Filesystem sẽ chạy foreground và mount tại thư mục mountpoint/.
 
-### Terminal 2 - Chạy regression test
+### Terminal 2 — Chạy regression test
 
 ```bash
 make test
