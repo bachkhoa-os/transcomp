@@ -44,9 +44,9 @@ fail() {
 
 section() {
     echo ""
-    echo -e "${CYAN}══════════════════════════════════════════${NC}"
+    echo -e "${CYAN}==========================================${NC}"
     echo -e "${CYAN}  $1${NC}"
-    echo -e "${CYAN}══════════════════════════════════════════${NC}"
+    echo -e "${CYAN}==========================================${NC}"
 }
 
 # assert_eq <label> <expected> <actual>
@@ -323,6 +323,152 @@ echo "spaces test" > "$MOUNT/edge_with spaces.txt"
 assert_content "TC12.4 — filename có space" "spaces test" "$MOUNT/edge_with spaces.txt"
 
 # =============================================================================
+section "TC13: File > 64KB — multi-chunk write + partial overwrite qua ranh giới"
+# =============================================================================
+
+# Tạo file 128KB toàn chữ A
+python3 -c "import sys; sys.stdout.buffer.write(b'A' * 131072)" > "$MOUNT/big_border.bin"
+
+# Đọc lại bit-by-bit
+python3 -c "import sys; sys.stdout.buffer.write(b'A' * 131072)" > /tmp/myfs_big_border_expected.bin
+assert_diff "TC13.1 — write 128KB + read bit-by-bit"     /tmp/myfs_big_border_expected.bin "$MOUNT/big_border.bin"
+
+# Partial overwrite tại offset 65530 — vắt qua ranh giới 64KB (65536)
+# Vùng ghi: [65530, 65530+12) = span qua offset 65536
+python3 -c "import os; fd = os.open('$MOUNT/big_border.bin', os.O_WRONLY); os.lseek(fd, 65530, 0); os.write(fd, b'CROSSBORDER!'); os.close(fd)"
+
+# Verify bằng cách đọc đúng vùng đó
+ACTUAL=$(python3 -c "
+with open('$MOUNT/big_border.bin', 'rb') as f:
+    f.seek(65530)
+    print(f.read(12).decode())
+" 2>/dev/null)
+assert_eq "TC13.2 — partial overwrite qua ranh giới 64KB" "CROSSBORDER!" "$ACTUAL"
+
+# Phần trước ranh giới không bị ảnh hưởng
+BEFORE=$(python3 -c "
+with open('$MOUNT/big_border.bin', 'rb') as f:
+    f.seek(65520)
+    print(f.read(10).decode())
+" 2>/dev/null)
+assert_eq "TC13.3 — vùng trước ranh giới không bị ảnh hưởng" "AAAAAAAAAA" "$BEFORE"
+
+# Phần sau ranh giới không bị ảnh hưởng
+AFTER=$(python3 -c "
+with open('$MOUNT/big_border.bin', 'rb') as f:
+    f.seek(65542)
+    print(f.read(10).decode())
+" 2>/dev/null)
+assert_eq "TC13.4 — vùng sau ranh giới không bị ảnh hưởng" "AAAAAAAAAA" "$AFTER"
+
+# =============================================================================
+section "TC14: Append nhiều lần — correctness + logical size"
+# =============================================================================
+
+rm -f "$MOUNT/tc14_append.txt"
+
+# Append 20 dòng
+for i in $(seq 1 20); do
+    echo "line $i" >> "$MOUNT/tc14_append.txt"
+done
+
+# Số dòng
+LINES=$(wc -l < "$MOUNT/tc14_append.txt")
+assert_eq "TC14.1 — append 20 lần → 20 dòng" "20" "$LINES"
+
+# Dòng đầu và cuối
+FIRST=$(head -1 "$MOUNT/tc14_append.txt")
+assert_eq "TC14.2 — dòng đầu đúng" "line 1" "$FIRST"
+
+LAST=$(tail -1 "$MOUNT/tc14_append.txt")
+assert_eq "TC14.3 — dòng cuối đúng" "line 20" "$LAST"
+
+# Logical size phai bang tong so byte: line 1-9 = 7 bytes, line 10-20 = 8 bytes
+EXPECTED_SIZE=$(python3 -c "print(sum(len('line ' + str(i) + '\n') for i in range(1,21)))")
+ACTUAL_SIZE=$(stat -c%s "$MOUNT/tc14_append.txt")
+assert_eq "TC14.4 — logical size sau 20 lần append" "$EXPECTED_SIZE" "$ACTUAL_SIZE"
+
+# =============================================================================
+section "TC15: Remount nhiều lần — persistence"
+# =============================================================================
+
+# Test này chỉ chạy được nếu có quyền unmount (cần FUSE đang chạy)
+# Kiểm tra data persist sau khi đọc từ cold cache (không remount thực sự,
+# nhưng verify metadata đồng bộ bằng cách đọc lại nhiều lần liên tiếp)
+
+echo "PERSIST TEST" > "$MOUNT/tc15_persist.txt"
+
+# Đọc lại 5 lần liên tiếp — verify không có cache corruption
+ALL_OK=1
+for i in $(seq 1 5); do
+    CONTENT=$(cat "$MOUNT/tc15_persist.txt" 2>/dev/null)
+    if [ "$CONTENT" != "PERSIST TEST" ]; then
+        ALL_OK=0
+        break
+    fi
+done
+assert_eq "TC15.1 — đọc lặp lại 5 lần nhất quán" "1" "$ALL_OK"
+
+# Write sau nhiều lần đọc vẫn đúng
+echo "UPDATED" > "$MOUNT/tc15_persist.txt"
+assert_content "TC15.2 — write sau nhiều lần đọc" "UPDATED" "$MOUNT/tc15_persist.txt"
+
+# Verify backing store nhất quán với mountpoint
+META_SIZE=$(python3 -c "
+import struct
+with open('$BACKING/tc15_persist.txt.meta', 'rb') as f:
+    f.read(4)  # num_chunks
+    size = struct.unpack('<Q', f.read(8))[0]
+print(size)
+" 2>/dev/null)
+MOUNT_SIZE=$(stat -c%s "$MOUNT/tc15_persist.txt")
+assert_eq "TC15.3 — logical_size trong .meta khớp với stat" "$MOUNT_SIZE" "$META_SIZE"
+
+# =============================================================================
+section "TC16: File > 64KB — compressible content"
+# =============================================================================
+
+# File text lặp lại — compressible tốt, kiểm tra compression ratio
+python3 << 'PY' > "$MOUNT/tc16_compress.txt"
+import sys
+sys.stdout.buffer.write((b"Hello World! " * 100 + b"\n") * 100)
+PY
+python3 << 'PY' > /tmp/myfs_tc16_expected.txt
+import sys
+sys.stdout.buffer.write((b"Hello World! " * 100 + b"\n") * 100)
+PY
+
+assert_diff "TC16.1 — file text 130KB compressible đọc lại đúng"     /tmp/myfs_tc16_expected.txt "$MOUNT/tc16_compress.txt"
+
+# Disk size phải nhỏ hơn logical size (đã được nén)
+LOGICAL=$(stat -c%s "$MOUNT/tc16_compress.txt")
+DISK=$(stat -c%s "$BACKING/tc16_compress.txt.data")
+if [ "$DISK" -lt "$LOGICAL" ]; then
+    ok "TC16.2 — compression hiệu quả disk=${DISK} logical=${LOGICAL}"
+else
+    fail "TC16.2 — compression không hiệu quả" "disk < $LOGICAL" "disk=$DISK"
+fi
+
+# =============================================================================
+section "TC17: Partial overwrite — đầu file và cuối file"
+# =============================================================================
+
+echo "ABCDEFGHIJ" > "$MOUNT/tc17_edges.txt"
+
+# Overwrite đầu file (offset=0)
+printf 'XY' | dd of="$MOUNT/tc17_edges.txt" bs=1 seek=0 conv=notrunc 2>/dev/null
+assert_content "TC17.1 — overwrite đầu file" "XYCDEFGHIJ" "$MOUNT/tc17_edges.txt"
+
+# Overwrite cuối file (offset=8, 2 bytes cuối trước newline)
+printf 'ZZ' | dd of="$MOUNT/tc17_edges.txt" bs=1 seek=8 conv=notrunc 2>/dev/null
+assert_content "TC17.2 — overwrite cuối file" "XYCDEFGHZZ" "$MOUNT/tc17_edges.txt"
+
+# =============================================================================
+# Cleanup thêm
+# =============================================================================
+rm -f /tmp/myfs_big_border_expected.bin /tmp/myfs_tc16_expected.txt
+
+# =============================================================================
 # Cleanup
 # =============================================================================
 cleanup
@@ -332,15 +478,15 @@ rm -f /tmp/myfs_expected_big.txt /tmp/myfs_rand.bin /tmp/myfs_host.txt
 # Kết quả
 # =============================================================================
 echo ""
-echo -e "${CYAN}══════════════════════════════════════════${NC}"
+echo -e "${CYAN}==========================================${NC}"
 echo -e "  Kết quả: ${GREEN}${PASS} PASS${NC} / ${RED}${FAIL} FAIL${NC} / ${TOTAL} total"
-echo -e "${CYAN}══════════════════════════════════════════${NC}"
+echo -e "${CYAN}==========================================${NC}"
 echo ""
 
 if [ "$FAIL" -eq 0 ]; then
-    echo -e "${GREEN}  ✓ Tất cả test cases passed.${NC}"
+    echo -e "${GREEN}  [OK] Tat ca test cases passed.${NC}"
     exit 0
 else
-    echo -e "${RED}  ✗ ${FAIL} test case(s) failed.${NC}"
+    echo -e "${RED}  [FAIL] ${FAIL} test cases failed.${NC}"
     exit 1
 fi
