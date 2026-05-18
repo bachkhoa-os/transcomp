@@ -13,5 +13,9 @@ run: myfs
 umount:
 	fusermount -u mountpoint
 
+test:
+	@chmod +x test_suite.sh
+	@./test_suite.sh mountpoint backing
+
 clean:
 	rm -f myfs
