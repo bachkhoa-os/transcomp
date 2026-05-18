@@ -229,6 +229,7 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
         free(inode.chunk_map.chunks);
         inode.chunk_map.chunks = NULL;
         inode.chunk_map.num_chunks = 0;
+        inode.chunk_map.logical_size = 0;
         inode.logical_size = 0;
         return save_chunk_map(path, &inode);
     }
@@ -310,11 +311,23 @@ int myfs_read(const char *path, char *buf, size_t size,
 
     while (remaining > 0 && cur_offset < (off_t)inode.logical_size)
     {
-        uint32_t chunk_idx = cur_offset / CHUNK_SIZE;
-        if (chunk_idx >= inode.chunk_map.num_chunks)
-            break;
+        // Linear scan để tìm chunk chứa cur_offset — nhất quán với myfs_write().
+        // Không dùng cur_offset/CHUNK_SIZE vì chunk thực tế không đảm bảo đúng 64KB.
+        int32_t chunk_idx = -1;
+        for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
+        {
+            myfs_chunk_t *c = &inode.chunk_map.chunks[i];
+            off_t c_end = (off_t)c->logical_offset + (off_t)c->stored_size;
+            if ((off_t)c->logical_offset <= cur_offset && cur_offset < c_end)
+            {
+                chunk_idx = (int32_t)i;
+                break;
+            }
+        }
+        if (chunk_idx < 0)
+            break; // cur_offset không nằm trong chunk nào → sparse region, trả zero
 
-        myfs_chunk_t *chunk = &inode.chunk_map.chunks[chunk_idx];
+        myfs_chunk_t *chunk = &inode.chunk_map.chunks[(uint32_t)chunk_idx];
         off_t chunk_logical_start = chunk->logical_offset;
 
         if (guard_chunk_logical_offset(cur_offset, chunk_logical_start) < 0)
