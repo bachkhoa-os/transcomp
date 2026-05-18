@@ -6,30 +6,41 @@ Project môn Hệ điều hành - Adding Transparent Compression Support to the 
 Đây là prototype File System sử dụng FUSE 3 hỗ trợ transparent compression (nén/giải nén trong suốt).  
 Ứng dụng vẫn gọi read/write bình thường; file system tự động nén/giải nén theo chunk 64 KB (Zstd), hỗ trợ ghi đè từng phần và lưu metadata bền vững sau remount.
 
-## Giai đoạn hiện tại (Tuần 5 - Sprint 5)
-Sprint 5: Write path + partial overwrite + fsync/checkpoint (đã hoàn thành)
+## Giai đoạn hiện tại (Tuần 6 - Sprint 6)
+Sprint 6: Heuristic skip compression + test corner cases (đã hoàn thành)
 
-Các tính năng đã triển khai:
+Các tính năng đã triển khai
 - Thiết kế và định nghĩa cấu trúc `myfs_chunk_t`, `myfs_chunk_map_t`, `myfs_inode_t` (chunk 64 KB)
 - Cơ chế lưu trữ: mỗi file logic tương ứng với `filename.data` (dữ liệu) và `filename.meta` (chunk map nhị phân)
-- Read/Write theo chunk, nén Zstd one-shot; bỏ nén nếu không hiệu quả
+- Read/Write theo chunk, nén Zstd one-shot; tự động fallback sang raw nếu dữ liệu không nén hiệu quả
+- Fast-path incompressible detection bằng magic bytes (JPEG, PNG, ZIP, GIF, MP4/MOV, gzip, Zstd...) để bỏ qua compression không cần thiết
 - Partial overwrite (RMW): gom các chunk bị chồng lấn, patch dữ liệu, ghi blob mới
-- `load_chunk_map()`/`save_chunk_map()` với atomic write (file tạm + rename + fsync)
-- `open(O_TRUNC)` và `truncate` đồng bộ lại chunk map và logical size
+- `load_chunk_map()` và `save_chunk_map()` với atomic write (file tạm + rename + fsync)
+- `open(O_TRUNC)` và `truncate()` đồng bộ đầy đủ `chunk_map`, `logical_size` và metadata
+- `myfs_read()` hỗ trợ linear scan chunk map thay vì giả định chunk cố định 64 KB, đọc đúng cả các chunk có kích thước thực khác nhau
 - Guards kiểm tra metadata/offset/codec khi đọc để tránh lỗi dữ liệu
 - `readdir` ẩn `.data` và `.meta`, chỉ hiển thị tên file logic
+- Bổ sung `make test` và `test_suite.sh` để regression test toàn bộ filesystem
 
-Kết quả kiểm tra:
+Kết quả kiểm tra
 - Tạo/ghi/đọc file → tự động sinh `.data` và `.meta`, nội dung trả về đúng
-- Partial overwrite → dữ liệu ghép đúng sau ghi đè giữa file
-- `rm` xoá đồng thời `.data` và `.meta`, `readdir` không lộ file nội bộ
-- Unmount → remount → file vẫn tồn tại, metadata và kích thước logic không thay đổi
+- Partial overwrite → dữ liệu ghép đúng tại mọi vị trí, kể cả overwrite qua ranh giới chunk 64 KB
+- `open(O_TRUNC)` và `truncate -s 0` → reset đúng chunk map và logical size
+- File lớn >64 KB → multi-chunk read/write chính xác, verify bit-by-bit thành công
+- File binary/random và định dạng incompressible → tự động lưu raw, dữ liệu đọc lại khớp hoàn toàn
+- Compression hoạt động hiệu quả với dữ liệu text lặp lại, kích thước `.data` nhỏ hơn logical size
+- Append nhiều lần liên tiếp → logical size và nội dung luôn nhất quán
+- `rm` xóa đồng thời `.data` và `.meta`, `readdir` không lộ file nội bộ
+- Persistence ổn định: đọc nhiều lần liên tiếp và remount không làm thay đổi metadata hoặc logical size
+- Toàn bộ regression test trong `test_suite.sh` PASS
 
 ## Cấu trúc thư mục
+
 ```markdown
 transcomp/
 ├── Makefile
 ├── README.md
+├── test_suite.sh          ← regression test suite
 ├── src/
 │   ├── main.c
 │   ├── myfs.h
@@ -37,37 +48,35 @@ transcomp/
 │   ├── operations.c
 │   └── guards/
 │       ├── guards.h
-│       └── guards.c    ← metadata validation guards
-├── backing/          ← thư mục lưu file thật (.data + .meta)
-├── mountpoint/       ← thư mục mount
-└── myfs              ← file thực thi
+│       └── guards.c       ← metadata validation guards
+├── backing/               ← thư mục lưu file thật (.data + .meta)
+├── mountpoint/            ← thư mục mount
+└── myfs                   ← file thực thi
 ```
 
+Script `test_suite.sh` sẽ tự động kiểm tra:
+
+- Basic read/write
+- Partial overwrite (RMW)
+- Multi-chunk file (>64 KB)
+- Compression / incompressible detection
+- Truncate / unlink / append
+- Cross-boundary overwrite
+- Persistence và metadata consistency
+
 ## Cách build
+
+### Terminal 1 — Build và mount filesystem lên `mountpoint/`
+
 ```bash
-# 1. Write và read basic
-echo "HELLO WORLD" > mountpoint/test.txt
-cat mountpoint/test.txt                             # HELLO WORLD
+make clean && make && make run
+```
+Filesystem sẽ chạy foreground và mount tại thư mục mountpoint/.
 
-# 2. Partial overwrite (RMW)
-printf 'FUSE!' | dd of=mountpoint/test.txt bs=1 seek=6 conv=notrunc
-cat mountpoint/test.txt                             # HELLO FUSE!
+### Terminal 2 - Chạy regression test
 
-# 3. Incompressible data (random binary)
-dd if=/dev/urandom bs=1K count=1 > mountpoint/rand.bin 2>/dev/null
-# log: write: incompressible, storing raw
-
-# 4. Xem metadata binary
-hexdump -C backing/test.txt.meta
-
-# 5. Xóa file
-rm mountpoint/test.txt
-ls mountpoint/                                      # trống
-ls backing/                                         # chỉ còn . và ..
-
-# 6. Persistence (unmount → remount)
-make umount && make run
-cat mountpoint/test.txt                             # vẫn đúng nội dung
+```bash
+make test
 ```
 
 ## Debug
@@ -79,8 +88,10 @@ Log có timestamp `[HH:MM:SS.mmm]` in ra stderr trên terminal chạy FUSE:
 [13:05:01.236] [DEBUG] write OK: chunks=1 logical_size=12 codec=0
 ```
 
-## Kế hoạch tiếp theo (Sprint 6)
+## Kế hoạch tiếp theo (Sprint 7)
 
-- Heuristic skip compression nâng cao (detect magic bytes)
-- Corner case testing toàn diện (file rỗng, truncate nhiều lần, append lớn)
-- Garbage collection: thu hồi orphan blob trong `.data`
+- Đo benchmark hiệu năng đọc/ghi và tỉ lệ nén
+- Tối ưu luồng compression và quản lý chunk
+- Hoàn thiện cơ chế garbage collection cho blob/chunk mồ côi trong `.data`
+- Kiểm thử hồi quy và kiểm thử độ ổn định toàn hệ thống
+- Hoàn thiện báo cáo draft và tổng hợp kết quả đánh giá
