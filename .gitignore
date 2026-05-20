@@ -1,6 +1,6 @@
 myfs
-mountpoint/
-backing/
+mountpoint/*
+backing/*
 .vscode/
 .idea/
 *.swp
