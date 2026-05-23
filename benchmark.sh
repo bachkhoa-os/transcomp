@@ -318,8 +318,8 @@ try:
         num_chunks, logical_size = struct.unpack('<IQ', f.read(12))
         codecs = []
         for _ in range(num_chunks):
-            data = f.read(33)  # sizeof(myfs_chunk_t)
-            if len(data) < 33: break
+            data = f.read(30)  # sizeof(myfs_chunk_t) = 8+4+4+1+1+4+8 = 30
+            if len(data) < 30: break
             # struct layout: logical_offset(8) raw_size(4) stored_size(4) codec_type(1) flags(1) checksum(4) physical_offset(8) = 30? recheck
             # Try offset 16 for codec_type (after logical_offset+raw_size+stored_size)
             codecs.append(data[16])
@@ -548,7 +548,7 @@ log "| $(printf '%-28s| %-17s| %-41s|' "myfs read (text 50MB)"   "${READ_SRC:-N/
 log "| $(printf '%-28s| %-17s| %-41s|' "Zstd decompress only"    "${ZSTD_DECOMPRESS_MBS:-N/A}" "In-memory, no I/O")"
 log "+-----------------------------+------------------+------------------------------------------+"
 log ""
-log "  Phan tich overhead:"
+log "  Phân tích overhead:"
 python3 - "$WRITE_TEXT" "$EXT4_WRITE_TEXT" "$ZSTD_COMPRESS_MBS" \
           "$READ_SRC"   "$EXT4_READ_TEXT"  "$ZSTD_DECOMPRESS_MBS" << 'ANALYZE_EOF'
 import sys
