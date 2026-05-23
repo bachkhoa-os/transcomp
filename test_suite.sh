@@ -274,7 +274,7 @@ LAST=$(tail -1 "$MOUNT/test_append.txt")
 assert_eq "TC09.2 — dòng cuối đúng" "line 5" "$LAST"
 
 # =============================================================================
-section "TC10: cp và diff"
+section "TC10: Sao chép (cp) và so sánh (diff)"
 # =============================================================================
 
 echo "COPY TEST CONTENT" > "$MOUNT/test_cp_src.txt"
@@ -289,7 +289,7 @@ assert_diff "TC10.2 — cp từ host vào mountpoint" \
     /tmp/myfs_host.txt "$MOUNT/test_cp_host.txt"
 
 # =============================================================================
-section "TC11: mkdir + rmdir"
+section "TC11: Tạo và xóa thư mục (mkdir + rmdir)"
 # =============================================================================
 
 mkdir "$MOUNT/test_dir"
@@ -462,6 +462,42 @@ assert_content "TC17.1 — overwrite đầu file" "XYCDEFGHIJ" "$MOUNT/tc17_edge
 # Overwrite cuối file (offset=8, 2 bytes cuối trước newline)
 printf 'ZZ' | dd of="$MOUNT/tc17_edges.txt" bs=1 seek=8 conv=notrunc 2>/dev/null
 assert_content "TC17.2 — overwrite cuối file" "XYCDEFGHZZ" "$MOUNT/tc17_edges.txt"
+
+# =============================================================================
+section "TC18: Garbage collection — compact sau RMW"
+# =============================================================================
+
+# Compact được kiểm tra bằng cách: sau nhiều lần ghi đè lên cùng file,
+# kích thước đĩa không được tăng quá 2x kích thước logic (compact giữ nó ở mức hợp lý).
+# File ngẫu nhiên 512KB là blob không nén được (raw), mỗi RMW tạo orphan ~512KB.
+# Compact chạy trong myfs_release() của mỗi descriptor — nên kích thước đĩa ổn định.
+
+dd if=/dev/urandom bs=512K count=1 of="$MOUNT/tc18_gc.bin" 2>/dev/null
+LOGICAL=$(stat -c%s "$MOUNT/tc18_gc.bin")
+SIZE_INITIAL=$(stat -c%s "$BACKING/tc18_gc.bin.data")
+ 
+# 5 lần ghi đè (mỗi lần là 1 write+release cycle riêng)
+for i in $(seq 1 5); do
+    dd if=/dev/urandom bs=512K count=1 of="$MOUNT/tc18_gc.bin" conv=notrunc 2>/dev/null
+done
+ 
+SIZE_FINAL=$(stat -c%s "$BACKING/tc18_gc.bin.data")
+ 
+# Sau compact chạy liên tục, disk size không được > 2x initial
+# (nếu compact không chạy, size sẽ là 6x initial)
+if [ "$SIZE_FINAL" -le "$((SIZE_INITIAL * 2))" ]; then
+    ok "TC18.1 — compact giữ disk ổn định (initial=${SIZE_INITIAL} final=${SIZE_FINAL})"
+else
+    fail "TC18.1 — disk bloat quá lớn (compact không chạy?)" "<= $((SIZE_INITIAL * 2))" "${SIZE_FINAL}"
+fi
+ 
+# Logical size không đổi
+LOGICAL_AFTER=$(stat -c%s "$MOUNT/tc18_gc.bin")
+assert_eq "TC18.2 — logical size không đổi qua các lần ghi đè" "$LOGICAL" "$LOGICAL_AFTER"
+ 
+# Đọc lại được sau compact (không bị corrupt)
+READ_SIZE=$(cat "$MOUNT/tc18_gc.bin" 2>/dev/null | wc -c)
+assert_eq "TC18.3 — đọc lại đúng số byte sau compact" "$LOGICAL" "$READ_SIZE"
 
 # =============================================================================
 # Cleanup thêm
