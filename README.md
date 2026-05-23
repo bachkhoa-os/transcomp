@@ -6,33 +6,23 @@ Project môn Hệ điều hành - Adding Transparent Compression Support to the 
 Đây là prototype File System sử dụng FUSE 3 hỗ trợ transparent compression (nén/giải nén trong suốt).  
 Ứng dụng vẫn gọi read/write bình thường; file system tự động nén/giải nén theo chunk 64 KB (Zstd), hỗ trợ ghi đè từng phần và lưu metadata bền vững sau remount.
 
-## Giai đoạn hiện tại (Tuần 6 - Sprint 6)
-Sprint 6: Heuristic skip compression + test corner cases (đã hoàn thành)
+## Giai đoạn hiện tại (Tuần 7 - Sprint 7)
+Sprint 7: Benchmark + tuning (đang hoàn thiện báo cáo và chốt số liệu)
 
-Các tính năng đã triển khai
-- Thiết kế và định nghĩa cấu trúc `myfs_chunk_t`, `myfs_chunk_map_t`, `myfs_inode_t` (chunk 64 KB)
-- Cơ chế lưu trữ: mỗi file logic tương ứng với `filename.data` (dữ liệu) và `filename.meta` (chunk map nhị phân)
-- Read/Write theo chunk, nén Zstd one-shot; tự động fallback sang raw nếu dữ liệu không nén hiệu quả
-- Fast-path incompressible detection bằng magic bytes (JPEG, PNG, ZIP, GIF, MP4/MOV, gzip, Zstd...) để bỏ qua compression không cần thiết
-- Partial overwrite (RMW): gom các chunk bị chồng lấn, patch dữ liệu, ghi blob mới
-- `load_chunk_map()` và `save_chunk_map()` với atomic write (file tạm + rename + fsync)
-- `open(O_TRUNC)` và `truncate()` đồng bộ đầy đủ `chunk_map`, `logical_size` và metadata
-- `myfs_read()` hỗ trợ linear scan chunk map thay vì giả định chunk cố định 64 KB, đọc đúng cả các chunk có kích thước thực khác nhau
-- Guards kiểm tra metadata/offset/codec khi đọc để tránh lỗi dữ liệu
-- `readdir` ẩn `.data` và `.meta`, chỉ hiển thị tên file logic
-- Bổ sung `make test` và `test_suite.sh` để regression test toàn bộ filesystem
+Các nội dung đang tập trung
+- Thêm `benchmark.sh` để đo throughput ghi/đọc, compression ratio, latency RMW và so sánh với ext4 baseline
+- Ghi `benchmark_results.txt` để lưu kết quả benchmark theo từng lần chạy
+- Kiểm tra heuristic skip compression bằng các file giả JPEG/ZIP để xác nhận dữ liệu incompressible đi raw path
+- Đo persistence sau remount bằng checksum MD5 và script `verify_remount.sh`
+- Phân tích overhead giữa FUSE và Zstd để phục vụ tuning và báo cáo
 
-Kết quả kiểm tra
-- Tạo/ghi/đọc file → tự động sinh `.data` và `.meta`, nội dung trả về đúng
-- Partial overwrite → dữ liệu ghép đúng tại mọi vị trí, kể cả overwrite qua ranh giới chunk 64 KB
-- `open(O_TRUNC)` và `truncate -s 0` → reset đúng chunk map và logical size
-- File lớn >64 KB → multi-chunk read/write chính xác, verify bit-by-bit thành công
-- File binary/random và định dạng incompressible → tự động lưu raw, dữ liệu đọc lại khớp hoàn toàn
-- Compression hoạt động hiệu quả với dữ liệu text lặp lại, kích thước `.data` nhỏ hơn logical size
-- Append nhiều lần liên tiếp → logical size và nội dung luôn nhất quán
-- `rm` xóa đồng thời `.data` và `.meta`, `readdir` không lộ file nội bộ
-- Persistence ổn định: đọc nhiều lần liên tiếp và remount không làm thay đổi metadata hoặc logical size
-- Toàn bộ regression test trong `test_suite.sh` PASS
+Kết quả benchmark chính
+- Sequential write/read của file text và source-like data cho thấy myfs hoạt động đúng theo chunk 64 KB và compression theo workload
+- File random/incompressible được lưu raw, compression ratio xấp xỉ 1.00x như mong đợi
+- Partial overwrite vẫn giữ đúng nội dung sau RMW
+- Remount verification giữ nguyên checksum, xác nhận metadata persistence ổn định
+- Pattern append nhỏ hơn chunk cho thấy chi phí RMW tăng rõ rệt, phù hợp để đưa vào phần tuning báo cáo
+- Benchmark cũng giúp xác nhận heuristic skip compression đang giảm overhead với payload không nén hiệu quả
 
 ## Cấu trúc thư mục
 
@@ -40,6 +30,8 @@ Kết quả kiểm tra
 transcomp/
 ├── Makefile
 ├── README.md
+├── benchmark.sh           ← benchmark hiệu năng + tuning report
+├── benchmark_results.txt
 ├── test_suite.sh          ← regression test suite
 ├── src/
 │   ├── main.c
@@ -79,6 +71,13 @@ Filesystem sẽ chạy foreground và mount tại thư mục mountpoint/.
 make test
 ```
 
+### Terminal 3 — Chạy benchmark + tuning
+
+```bash
+make bench
+```
+Kết quả benchmark sẽ được ghi vào `benchmark_results.txt`.
+
 ## Debug
 
 Log có timestamp `[HH:MM:SS.mmm]` in ra stderr trên terminal chạy FUSE:
@@ -88,10 +87,10 @@ Log có timestamp `[HH:MM:SS.mmm]` in ra stderr trên terminal chạy FUSE:
 [13:05:01.236] [DEBUG] write OK: chunks=1 logical_size=12 codec=0
 ```
 
-## Kế hoạch tiếp theo (Sprint 7)
 
-- Đo benchmark hiệu năng đọc/ghi và tỉ lệ nén
-- Tối ưu luồng compression và quản lý chunk
-- Hoàn thiện cơ chế garbage collection cho blob/chunk mồ côi trong `.data`
-- Kiểm thử hồi quy và kiểm thử độ ổn định toàn hệ thống
-- Hoàn thiện báo cáo draft và tổng hợp kết quả đánh giá
+## Kế hoạch tiếp theo
+
+- Hoàn thiện phần dọn dẹp blob/chunk mồ côi trong `.data`
+- Tiếp tục tinh chỉnh hiệu năng cho append nhỏ và partial overwrite
+- Tăng độ phủ regression test cho các trường hợp biên còn lại
+- Hoàn thiện báo cáo tổng hợp benchmark + tuning và chốt số liệu cuối

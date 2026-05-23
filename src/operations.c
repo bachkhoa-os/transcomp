@@ -29,7 +29,10 @@ int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi
     /* Cập nhật kích thước logic từ chunk map để phản ánh đúng nội dung file. */
     myfs_inode_t inode = {0};
     if (load_chunk_map(path, &inode) == 0)
+    {
         stbuf->st_size = inode.logical_size;
+        free(inode.chunk_map.chunks);
+    }
 
     return 0;
 }
@@ -296,12 +299,14 @@ int myfs_read(const char *path, char *buf, size_t size,
     char data_path[PATH_MAX];
     build_data_path(data_path, path);
 
-    /* Dùng fd có sẵn nếu file đã được mở; nếu không thì mở tạm để đọc. */
-    int use_fi_fd = (fi != NULL && fi->fh != 0);
-    int fd = use_fi_fd ? (int)fi->fh : open(data_path, O_RDONLY);
+    /* Luôn mở .data với O_RDONLY riêng để đảm bảo pread không bị EBADF.
+     * fi->fh có thể là O_WRONLY (dd conv=notrunc) hoặc O_RDWR — không đảm bảo
+     * read được trên mọi trường hợp. Mở fd riêng an toàn hơn. */
+    int fd = open(data_path, O_RDONLY);
     if (fd == -1)
     {
         perror("[ERROR] open .data for read");
+        free(inode.chunk_map.chunks);
         return -errno;
     }
 
@@ -331,29 +336,29 @@ int myfs_read(const char *path, char *buf, size_t size,
         off_t chunk_logical_start = chunk->logical_offset;
 
         if (guard_chunk_logical_offset(cur_offset, chunk_logical_start) < 0)
-            return cleanup_fd(fd, use_fi_fd, -EIO);
+            return cleanup_fd(fd, 1, -EIO);
 
         if (guard_chunk_metadata(chunk, chunk_idx) < 0)
-            return cleanup_fd(fd, use_fi_fd, -EIO);
+            return cleanup_fd(fd, 1, -EIO);
 
         off_t chunk_offset = cur_offset - chunk_logical_start;
         size_t chunk_size = chunk->stored_size;
 
         if (guard_chunk_bounds((size_t)chunk_offset, chunk_size) < 0)
-            return cleanup_fd(fd, use_fi_fd, -EIO);
+            return cleanup_fd(fd, 1, -EIO);
 
         size_t logical_remaining = (size_t)(inode.logical_size - (size_t)cur_offset);
         size_t bytes_in_chunk = min(remaining, min(chunk_size - chunk_offset, logical_remaining));
 
         char *raw_buf = malloc(chunk->raw_size);
         if (guard_malloc(raw_buf) < 0)
-            return cleanup_fd(fd, use_fi_fd, -ENOMEM);
+            return cleanup_fd(fd, 1, -ENOMEM);
 
         ssize_t n = pread(fd, raw_buf, chunk->raw_size, chunk->physical_offset);
         if (guard_pread_result(n, chunk->raw_size) < 0)
         {
             free(raw_buf);
-            return cleanup_fd(fd, use_fi_fd, -EIO);
+            return cleanup_fd(fd, 1, -EIO);
         }
 
         char *decomp_buf = NULL;
@@ -370,7 +375,7 @@ int myfs_read(const char *path, char *buf, size_t size,
             if (guard_malloc(decomp_buf) < 0)
             {
                 free(raw_buf);
-                return cleanup_fd(fd, use_fi_fd, -ENOMEM);
+                return cleanup_fd(fd, 1, -ENOMEM);
             }
 
             if (zstd_decompress(raw_buf, chunk->raw_size,
@@ -379,14 +384,14 @@ int myfs_read(const char *path, char *buf, size_t size,
             {
                 free(decomp_buf);
                 free(raw_buf);
-                return cleanup_fd(fd, use_fi_fd, -EIO);
+                return cleanup_fd(fd, 1, -EIO);
             }
 
             if (guard_decompress_size(decomp_size, chunk->stored_size) < 0)
             {
                 free(decomp_buf);
                 free(raw_buf);
-                return cleanup_fd(fd, use_fi_fd, -EIO);
+                return cleanup_fd(fd, 1, -EIO);
             }
 
             free(raw_buf);
@@ -395,7 +400,7 @@ int myfs_read(const char *path, char *buf, size_t size,
         else
         {
             free(raw_buf);
-            return cleanup_fd(fd, use_fi_fd, -EIO);
+            return cleanup_fd(fd, 1, -EIO);
         }
 
         memcpy(buf + bytes_read, decomp_buf + chunk_offset, bytes_in_chunk);
@@ -410,8 +415,7 @@ int myfs_read(const char *path, char *buf, size_t size,
             free(decomp_buf);
     }
 
-    if (!use_fi_fd)
-        close(fd);
+    close(fd);
 
     LOG("[DEBUG] myfs_read success: read %zu bytes\n", bytes_read);
     return (int)bytes_read;
@@ -550,15 +554,28 @@ static int write_rmw(const char *path, int fd,
     }
 
     /* Ghi blob mới vào cuối file .data để tránh ghi đè trực tiếp dữ liệu cũ. */
-    off_t new_phys = lseek(fd, 0, SEEK_END);
-    if (new_phys < 0)
+    build_data_path(data_path, path);
+
+    int append_fd = open(data_path, O_WRONLY);
+    if (append_fd == -1)
     {
         free(comp_buf);
         free(work_buf);
         return -errno;
     }
 
-    ssize_t written = pwrite(fd, write_buf_ptr, write_size, new_phys);
+    off_t new_phys = lseek(append_fd, 0, SEEK_END);
+    if (new_phys < 0)
+    {
+        close(append_fd);
+        free(comp_buf);
+        free(work_buf);
+        return -errno;
+    }
+
+    ssize_t written = pwrite(append_fd, write_buf_ptr, write_size, new_phys);
+
+    close(append_fd);
     free(comp_buf);
     free(work_buf);
     if (written != (ssize_t)write_size)
@@ -685,17 +702,23 @@ int myfs_write(const char *path, const char *buf, size_t size,
             LOG("[DEBUG] write: incompressible, storing raw\n");
     }
 
-    /* Ghi blob mới vào cuối file .data. */
-    off_t physical_offset = lseek(fd, 0, SEEK_END);
+    /* Ghi chunk mới vào cuối file .data để tránh ghi đè trực tiếp lên dữ liệu cũ. */
+    char data_path[PATH_MAX];
+    build_data_path(data_path, path);
+    int append_fd = open(data_path, O_WRONLY);
+    off_t physical_offset = lseek(append_fd, 0, SEEK_END);
     if (physical_offset < 0)
     {
+        close(append_fd);
         free(comp_buf);
         free(inode.chunk_map.chunks);
         return -errno;
     }
 
-    ssize_t written = pwrite(fd, write_buf, write_size, physical_offset);
+    /* Ghi dữ liệu mới vào vị trí vật lý vừa xác định. */
+    ssize_t written = pwrite(append_fd, write_buf, write_size, physical_offset);
     free(comp_buf); // không cần nữa sau khi pwrite xong
+    close(append_fd);
     if (written != (ssize_t)write_size)
     {
         free(inode.chunk_map.chunks);
@@ -748,14 +771,19 @@ int myfs_write(const char *path, const char *buf, size_t size,
 /* Giải phóng file descriptor gắn với file đang mở. */
 int myfs_release(const char *path, struct fuse_file_info *fi)
 {
-    (void)path;
-
     /* Đồng bộ dữ liệu trước khi đóng để đảm bảo tính toàn vẹn. */
     if (fi->fh > 0)
     {
         fsync(fi->fh);
         close(fi->fh);
+        fi->fh = 0;
     }
+
+    /* Compaction: thu hồi không gian của orphan blob sinh ra sau RMW.
+     * Chỉ thực hiện khi wasted ratio >= COMPACT_THRESHOLD (25%).
+     * Gọi sau close() để fd không còn giữ lock trên .data. */
+    compact_data_file(path);
+
     return 0;
 }
 

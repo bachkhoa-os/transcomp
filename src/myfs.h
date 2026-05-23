@@ -92,6 +92,7 @@ int myfs_unlink(const char *path);
 
 int load_chunk_map(const char *path, myfs_inode_t *inode);
 int save_chunk_map(const char *path, myfs_inode_t *inode);
+int compact_data_file(const char *path);
 int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi);
 int myfs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi);
 int zstd_compress(const void *src, size_t src_size,
