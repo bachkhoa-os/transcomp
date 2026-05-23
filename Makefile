@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -g -Wno-format-truncation -Isrc/guards
-LIBS = `pkg-config fuse3 --cflags --libs` -lzstd
+LIBS = `pkg-config fuse3 --cflags --libs` -lzstd -lz
 
 all: myfs
 
@@ -16,6 +16,10 @@ umount:
 test:
 	@chmod +x test_suite.sh
 	@./test_suite.sh mountpoint backing
+
+bench:
+	@chmod +x benchmark.sh
+	@./benchmark.sh mountpoint backing
 
 clean:
 	rm -f myfs
