@@ -3,89 +3,6 @@
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
 /*
- * Xử lý truy vấn thuộc tính của một đường dẫn trong filesystem.
- * Hàm này ưu tiên kiểm tra thư mục trước, sau đó mới suy luận tới file dữ liệu
- * tương ứng và cập nhật kích thước logic từ metadata nếu đó là file thường.
- */
-int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi)
-{
-    (void)fi;
-    LOG("[DEBUG] getattr: %s\n", path);
-
-    /* Kiểm tra đường dẫn như một thư mục trên backing store trước. */
-    char real_path[PATH_MAX];
-    build_path(real_path, path);
-
-    if (stat(real_path, stbuf) == 0 && S_ISDIR(stbuf->st_mode))
-        return 0; /* Nếu là thư mục thì trả về ngay. */
-
-    /* Nếu không phải thư mục, thử ánh xạ sang file dữ liệu .data. */
-    char data_path[PATH_MAX];
-    build_data_path(data_path, path);
-
-    if (stat(data_path, stbuf) == -1)
-        return -errno;
-
-    /* Cập nhật kích thước logic từ chunk map để phản ánh đúng nội dung file. */
-    myfs_inode_t inode = {0};
-    if (load_chunk_map(path, &inode) == 0)
-    {
-        stbuf->st_size = inode.logical_size;
-        free(inode.chunk_map.chunks);
-    }
-
-    return 0;
-}
-
-// Hàm đọc thư mục (readdir)
-int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
-                 off_t offset, struct fuse_file_info *fi,
-                 enum fuse_readdir_flags flags)
-{
-    (void)offset;
-    (void)fi;
-    (void)flags;
-    LOG("[DEBUG] readdir: %s\n", path);
-    char realpath[PATH_MAX];
-    build_path(realpath, path);
-
-    DIR *dp = opendir(realpath);
-    if (!dp)
-        return -errno;
-
-    filler(buf, ".", NULL, 0, 0);
-    filler(buf, "..", NULL, 0, 0);
-
-    struct dirent *de;
-    while ((de = readdir(dp)) != NULL)
-    {
-        size_t len = strlen(de->d_name);
-        /* Ẩn các file metadata nội bộ khỏi danh sách thư mục hiển thị. */
-        if (len > 5 && strcmp(de->d_name + len - 5, ".meta") == 0)
-            continue;
-        /* Ẩn luôn file dữ liệu thô để chỉ lộ ra tên file logic cho người dùng. */
-        if (len > 5 && strcmp(de->d_name + len - 5, ".data") == 0)
-            continue;
-
-        filler(buf, de->d_name, NULL, 0, 0);
-    }
-    closedir(dp);
-    return 0;
-}
-
-// Hàm tạo file (mknod)
-int myfs_mknod(const char *path, mode_t mode, dev_t rdev)
-{
-    LOG("[DEBUG] mknod: %s\n", path);
-    char realpath[PATH_MAX];
-    build_path(realpath, path);
-    int res = mknod(realpath, mode, rdev);
-    if (res == -1)
-        return -errno;
-    return 0;
-}
-
-/*
  * Tạo một file thường mới trong filesystem.
  * File dữ liệu thực tế được tạo dưới dạng .data, sau đó metadata .meta được
  * khởi tạo rỗng để bảo đảm đối tượng mới có trạng thái nhất quán ngay từ đầu.
@@ -158,17 +75,6 @@ int myfs_open(const char *path, struct fuse_file_info *fi)
     return 0;
 }
 
-/* Cập nhật timestamp truy cập/sửa đổi của file. Hiện tại thao tác này chưa được ánh xạ. */
-int myfs_utimens(const char *path, const struct timespec tv[2],
-                 struct fuse_file_info *fi)
-{
-    (void)path;
-    (void)tv;
-    (void)fi;
-    LOG("[DEBUG] utimens: %s (stub - ignored)\n", path);
-    return 0;
-}
-
 /*
  * Lấy file descriptor của .data để phục vụ đọc hoặc ghi.
  * Ưu tiên dùng descriptor có sẵn trong fi->fh; nếu không có thì mở tạm và
@@ -232,8 +138,7 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
         free(inode.chunk_map.chunks);
         inode.chunk_map.chunks = NULL;
         inode.chunk_map.num_chunks = 0;
-        inode.chunk_map.logical_size = 0;
-        inode.logical_size = 0;
+        INODE_LSIZE(inode) = 0;
         return save_chunk_map(path, &inode);
     }
 
@@ -242,7 +147,7 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
      * Các chunk nằm hoàn toàn ngoài miền kích thước mới sẽ bị loại bỏ, còn
      * chunk cuối cùng có thể phải giảm stored_size để phản ánh phần còn lại.
      */
-    if (size < (off_t)inode.logical_size)
+    if (size < (off_t)INODE_LSIZE(inode))
     {
         uint32_t keep = 0;
         for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
@@ -262,8 +167,7 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
             }
         }
         inode.chunk_map.num_chunks = keep;
-        inode.logical_size = size;
-        inode.chunk_map.logical_size = size;
+        INODE_LSIZE(inode) = size;
         return save_chunk_map(path, &inode);
     }
 
@@ -272,8 +176,7 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
      * Ở giai đoạn này chỉ cập nhật logical size; vùng mới được xem là khoảng
      * trống và sẽ đọc ra byte 0 cho tới khi có dữ liệu được ghi vào.
      */
-    inode.logical_size = size;
-    inode.chunk_map.logical_size = size;
+    INODE_LSIZE(inode) = size;
     return save_chunk_map(path, &inode);
 }
 
@@ -293,7 +196,7 @@ int myfs_read(const char *path, char *buf, size_t size,
     if (load_chunk_map(path, &inode) != 0)
         return -EIO;
 
-    if (offset >= (off_t)inode.logical_size)
+    if (offset >= (off_t)INODE_LSIZE(inode))
         return 0;
 
     char data_path[PATH_MAX];
@@ -314,7 +217,7 @@ int myfs_read(const char *path, char *buf, size_t size,
     off_t cur_offset = offset;
     size_t remaining = size;
 
-    while (remaining > 0 && cur_offset < (off_t)inode.logical_size)
+    while (remaining > 0 && cur_offset < (off_t)INODE_LSIZE(inode))
     {
         // Linear scan để tìm chunk chứa cur_offset — nhất quán với myfs_write().
         // Không dùng cur_offset/CHUNK_SIZE vì chunk thực tế không đảm bảo đúng 64KB.
@@ -347,7 +250,7 @@ int myfs_read(const char *path, char *buf, size_t size,
         if (guard_chunk_bounds((size_t)chunk_offset, chunk_size) < 0)
             return cleanup_fd(fd, 1, -EIO);
 
-        size_t logical_remaining = (size_t)(inode.logical_size - (size_t)cur_offset);
+        size_t logical_remaining = (size_t)(INODE_LSIZE(inode) - (size_t)cur_offset);
         size_t bytes_in_chunk = min(remaining, min(chunk_size - chunk_offset, logical_remaining));
 
         char *raw_buf = malloc(chunk->raw_size);
@@ -359,6 +262,21 @@ int myfs_read(const char *path, char *buf, size_t size,
         {
             free(raw_buf);
             return cleanup_fd(fd, 1, -EIO);
+        }
+
+        /* Verify CRC32 nếu chunk có checksum hợp lệ (khác 0).
+         * Checksum = 0 nghĩa là chunk được ghi trước khi có CRC32 → bỏ qua.
+         * Phát hiện data corruption im lặng (bit rot, disk error...). */
+        if (chunk->checksum != 0)
+        {
+            uint32_t actual = chunk_crc32(raw_buf, chunk->raw_size);
+            if (actual != chunk->checksum)
+            {
+                LOG("[ERROR] CRC32 mismatch chunk %u: expected=0x%08x got=0x%08x\n",
+                    chunk_idx, chunk->checksum, actual);
+                free(raw_buf);
+                return cleanup_fd(fd, 1, -EIO);
+            }
         }
 
         char *decomp_buf = NULL;
@@ -481,6 +399,20 @@ static int write_rmw(const char *path, int fd,
         }
 
         ssize_t n = pread(read_fd, raw_buf, c->raw_size, c->physical_offset);
+        
+        if (c->checksum != 0)
+        {
+            uint32_t actual = chunk_crc32(raw_buf, c->raw_size);
+            if (actual != c->checksum)
+            {
+                LOG("[ERROR] rmw: CRC32 mismatch chunk %u: expected=0x%08x got=0x%08x\n",
+                    i, c->checksum, actual);
+                free(raw_buf);
+                close(read_fd);
+                free(work_buf);
+                return -EIO;
+            }
+        }
         LOG("[DEBUG] rmw pread: chunk=%u raw_size=%u phys_off=%lu got=%ld\n",
             i, c->raw_size, c->physical_offset, n);
         if (n != (ssize_t)c->raw_size)
@@ -574,6 +506,8 @@ static int write_rmw(const char *path, int fd,
     }
 
     ssize_t written = pwrite(append_fd, write_buf_ptr, write_size, new_phys);
+    /* Tính CRC32 TRƯỚC khi free — khi new_codec=1, write_buf_ptr == comp_buf */
+    uint32_t blob_crc = chunk_crc32(write_buf_ptr, write_size);
 
     close(append_fd);
     free(comp_buf);
@@ -592,6 +526,7 @@ static int write_rmw(const char *path, int fd,
     inode->chunk_map.chunks[chunk_idx].raw_size = (uint32_t)write_size;
     inode->chunk_map.chunks[chunk_idx].codec_type = new_codec;
     inode->chunk_map.chunks[chunk_idx].flags = (new_codec == 1) ? 1 : 0;
+    inode->chunk_map.chunks[chunk_idx].checksum = blob_crc;
 
     /* Dịch các chunk phía sau lên để lấp khoảng trống do hợp nhất. */
     uint32_t removed = last_idx - chunk_idx; /* Số chunk bị gộp và loại bỏ. */
@@ -605,10 +540,9 @@ static int write_rmw(const char *path, int fd,
     }
 
     /* Đồng bộ logical size nếu vùng ghi mới làm file dài hơn trước. */
-    if (write_end > (off_t)inode->logical_size)
+    if (write_end > (off_t)INODE_LSIZE(*inode))
     {
-        inode->logical_size = write_end;
-        inode->chunk_map.logical_size = write_end;
+        INODE_LSIZE(*inode) = write_end;
     }
 
     return save_chunk_map(path, inode);
@@ -706,6 +640,13 @@ int myfs_write(const char *path, const char *buf, size_t size,
     char data_path[PATH_MAX];
     build_data_path(data_path, path);
     int append_fd = open(data_path, O_WRONLY);
+    if (append_fd == -1)
+    {
+        free(comp_buf);
+        free(inode.chunk_map.chunks);
+        return -errno;
+    }
+
     off_t physical_offset = lseek(append_fd, 0, SEEK_END);
     if (physical_offset < 0)
     {
@@ -717,7 +658,10 @@ int myfs_write(const char *path, const char *buf, size_t size,
 
     /* Ghi dữ liệu mới vào vị trí vật lý vừa xác định. */
     ssize_t written = pwrite(append_fd, write_buf, write_size, physical_offset);
-    free(comp_buf); // không cần nữa sau khi pwrite xong
+    /* Tính CRC32 TRƯỚC khi free(comp_buf) — khi codec=1, write_buf == comp_buf.
+     * free() trước rồi dùng write_buf sẽ là use-after-free → segfault. */
+    uint32_t blob_crc = chunk_crc32(write_buf, write_size);
+    free(comp_buf);
     close(append_fd);
     if (written != (ssize_t)write_size)
     {
@@ -743,15 +687,14 @@ int myfs_write(const char *path, const char *buf, size_t size,
     chunk->raw_size = write_size; // kích thước thực tế trên disk
     chunk->codec_type = codec_type;
     chunk->flags = (codec_type == 1) ? 1 : 0;
-    chunk->checksum = 0; /* TODO Sprint 6: CRC32. */
+    chunk->checksum = blob_crc; /* Đã tính trước free(comp_buf) */
 
     inode.chunk_map.num_chunks = new_count;
 
     /* Đồng bộ logical size giữa inode và chunk_map sau khi append dữ liệu mới. */
     off_t end_pos = offset + (off_t)size;
-    if (end_pos > (off_t)inode.logical_size)
-        inode.logical_size = end_pos;
-    inode.chunk_map.logical_size = inode.logical_size;
+    if (end_pos > (off_t)INODE_LSIZE(inode))
+        INODE_LSIZE(inode) = end_pos;
 
     /* Ghi metadata ra đĩa sau khi chunk map đã được cập nhật đầy đủ. */
     if (save_chunk_map(path, &inode) != 0)
@@ -763,7 +706,7 @@ int myfs_write(const char *path, const char *buf, size_t size,
     free(inode.chunk_map.chunks);
 
     LOG("[DEBUG] write OK: chunks=%u logical_size=%zu codec=%d\n",
-        new_count, (size_t)inode.logical_size, codec_type);
+        new_count, (size_t)INODE_LSIZE(inode), codec_type);
 
     return (int)size;
 }
@@ -784,60 +727,5 @@ int myfs_release(const char *path, struct fuse_file_info *fi)
      * Gọi sau close() để fd không còn giữ lock trên .data. */
     compact_data_file(path);
 
-    return 0;
-}
-
-/* Tạo thư mục trên backing store tương ứng với path logic của FUSE. */
-int myfs_mkdir(const char *path, mode_t mode)
-{
-    LOG("[DEBUG] mkdir: %s\n", path);
-    char realpath[PATH_MAX];
-    build_path(realpath, path);
-    int res = mkdir(realpath, mode);
-    if (res == -1)
-        return -errno;
-    return 0;
-}
-
-/*
- * Xoá file logic bằng cách xoá cả dữ liệu .data lẫn metadata .meta.
- * Hàm cố tình bỏ qua ENOENT để thao tác trở thành idempotent, tức là an toàn
- * ngay cả khi một trong hai file đã không còn tồn tại.
- */
-int myfs_unlink(const char *path)
-{
-    LOG("[DEBUG] unlink: %s\n", path);
-
-    char data_path[PATH_MAX];
-    char meta_path[PATH_MAX];
-    build_data_path(data_path, path);
-    build_meta_path(meta_path, path);
-
-    /* Bỏ qua ENOENT để thao tác xoá có thể lặp lại mà không gây lỗi. */
-    LOG("[DEBUG] unlink data: %s\n", data_path);
-    if (unlink(data_path) == -1 && errno != ENOENT)
-    {
-        LOG("[ERROR] unlink data failed: errno=%d (%s)\n", errno, strerror(errno));
-        return -errno;
-    }
-    LOG("[DEBUG] unlink meta: %s\n", meta_path);
-    if (unlink(meta_path) == -1 && errno != ENOENT)
-    {
-        LOG("[ERROR] unlink meta failed: errno=%d (%s)\n", errno, strerror(errno));
-        return -errno;
-    }
-
-    return 0;
-}
-
-/* Xoá thư mục trên backing store tương ứng với path logic của FUSE. */
-int myfs_rmdir(const char *path)
-{
-    LOG("[DEBUG] rmdir: %s\n", path);
-    char realpath[PATH_MAX];
-    build_path(realpath, path);
-    int res = rmdir(realpath);
-    if (res == -1)
-        return -errno;
     return 0;
 }
