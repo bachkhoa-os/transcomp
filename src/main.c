@@ -1,5 +1,29 @@
 #include "myfs.h"
 
+/*
+ * Khởi tạo filesystem và thiết lập các tuỳ chọn runtime cho FUSE.
+ * Hiện tại kernel cache được bật để giảm số lần truy cập không cần thiết
+ * tới lớp user-space trong các thao tác đọc lặp lại.
+ */
+void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
+{
+    (void)conn;
+    cfg->kernel_cache = 1;
+    LOG("[DEBUG] FUSE init called\n");
+    return fuse_get_context()->private_data;
+}
+
+/*
+ * Giải phóng tài nguyên mà filesystem đã cấp phát trong suốt vòng đời hoạt động.
+ * Mọi con trỏ được gắn vào private_data cần được thu hồi tại đây để tránh rò rỉ
+ * bộ nhớ khi mountpoint bị tháo gỡ.
+ */
+void myfs_destroy(void *private_data)
+{
+    free(private_data);
+    LOG("[DEBUG] FUSE destroy called\n");
+}
+
 static struct fuse_operations myfs_oper = {
     .getattr = myfs_getattr,
     .readdir = myfs_readdir,

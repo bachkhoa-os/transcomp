@@ -15,6 +15,14 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <zstd.h>
+#include <zlib.h>
+
+/* Tính CRC32 của blob trên disk (write_buf, write_size).
+ * Dùng để verify data integrity khi đọc lại. */
+static inline uint32_t chunk_crc32(const void *buf, size_t size)
+{
+    return (uint32_t)crc32(0L, (const Bytef *)buf, (uInt)size);
+}
 #include <time.h>
 
 /*
@@ -53,9 +61,12 @@ typedef struct
 
 typedef struct
 {
-    uint64_t logical_size;      /* Trường thuận tiện, luôn đồng bộ với chunk_map.logical_size. */
     myfs_chunk_map_t chunk_map; /* Chunk map hiện hành của file. */
 } myfs_inode_t;                 /* Lớp chứa metadata inode, có thể mở rộng về sau. */
+
+/* Single source of truth cho logical size: luôn dùng macro này,
+ * không truy cập chunk_map.logical_size trực tiếp từ bên ngoài helpers. */
+#define INODE_LSIZE(inode) ((inode).chunk_map.logical_size)
 
 struct myfs_config
 {
