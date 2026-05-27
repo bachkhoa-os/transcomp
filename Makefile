@@ -1,17 +1,24 @@
 CC = gcc
-CFLAGS = -Wall -g -Wno-format-truncation -Isrc/guards
+CFLAGS = -Wall -g -Wno-format-truncation -Isrc -Isrc/guards -Isrc/core -Isrc/fuse_ops
 LIBS = `pkg-config fuse3 --cflags --libs` -lzstd -lz
+
+# Định nghĩa các thư mục mã nguồn
+CORE_SRCS = src/core/path.c src/core/metadata.c src/core/compress.c src/core/compact.c
+OPS_SRCS = src/fuse_ops/file.c src/fuse_ops/dir.c
+GUARD_SRCS = src/guards/guards.c
+
+SRCS = src/main.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS)
 
 all: myfs
 
-myfs: src/main.c src/helpers.c src/operations.c src/guards/guards.c
-	$(CC) $(CFLAGS) -o myfs src/main.c src/helpers.c src/operations.c src/guards/guards.c $(LIBS)
+myfs: $(SRCS)
+	$(CC) $(CFLAGS) -o myfs $(SRCS) $(LIBS)
 
 run: myfs
 	./myfs -f mountpoint ./backing
 
 umount:
-	fusermount -u mountpoint
+	fusermount3 -u mountpoint
 
 test:
 	@chmod +x test_suite.sh
@@ -21,5 +28,9 @@ bench:
 	@chmod +x benchmark.sh
 	@./benchmark.sh mountpoint backing
 
+demo:
+	@chmod +x demo.sh
+	@./demo.sh
+
 clean:
-	rm -f myfs
+	rm -f myfs verify_remount.sh backing/*
