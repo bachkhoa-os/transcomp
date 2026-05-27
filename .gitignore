@@ -12,3 +12,4 @@ Thumbs.db
 *.tmp
 *.o
 *.txt
+verify_remount.sh
