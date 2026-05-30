@@ -116,6 +116,21 @@ int compact_data_file(const char *path)
             break;
         }
 
+        /* Verify CRC32 trước khi copy — nếu blob nguồn đã corrupt thì từ chối
+         * compact ngay lập tức thay vì âm thầm nhân bản dữ liệu hỏng. */
+        if (chunk->checksum != 0)
+        {
+            uint32_t actual = chunk_crc32(buf, blob_size);
+            if (actual != chunk->checksum)
+            {
+                LOG("[ERROR] compact: CRC32 mismatch chunk %u: expected=0x%08x got=0x%08x\n",
+                    i, chunk->checksum, actual);
+                free(buf);
+                ret = -EIO;
+                break;
+            }
+        }
+
         ssize_t w = pwrite(dst_fd, buf, blob_size, new_phys);
         free(buf);
         if (w != (ssize_t)blob_size)
