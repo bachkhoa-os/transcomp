@@ -304,7 +304,7 @@ echo ""
 
 echo "  Dọn dẹp..."
 fusermount3 -u "$MOUNT" 2>/dev/null
-kill $FUSE_PID 2>/dev/null
+wait $FUSE_PID 2>/dev/null
 echo -e "  ${GREEN}Cảm ơn thầy và các bạn đã theo dõi demo của Nhóm 25228!${NC}"
 echo ""
 exit $FAIL

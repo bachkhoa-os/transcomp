@@ -33,4 +33,8 @@ demo:
 	@./demo.sh
 
 clean:
+	@if mountpoint -q mountpoint 2>/dev/null; then \
+		echo "[ERROR] mountpoint dang duoc mount. Chay 'make umount' truoc."; \
+		exit 1; \
+	fi
 	rm -f myfs verify_remount.sh backing/*
