@@ -1,83 +1,217 @@
-# Transparent Compression FUSE
+# myfs — Transparent Compression Filesystem
 
-Project môn Hệ điều hành - Adding Transparent Compression Support to the File System - Nhóm 25228
+**Project No:** 25228 | **Course:** Operating Systems \[Multimedia\] - 20252  
+**Members:** Hoàng Phi Hùng (20223991) · Khúc Văn Đại (20223895) · Nguyễn Đức Toàn (20224164)
+
+---
 
 ## Giới thiệu
-Đây là sản phẩm hoàn chỉnh của File System sử dụng FUSE 3 hỗ trợ transparent compression (nén/giải nén trong suốt).  
-Hệ thống cho phép các ứng dụng gọi read/write bình thường; bên dưới file system tự động nén/giải nén theo chunk 64 KB (sử dụng thuật toán Zstd), xử lý trơn tru ghi đè từng phần (Read-Modify-Write) và đảm bảo lưu metadata bền vững (persistence) kể cả sau khi remount.
 
-## Giai đoạn hiện tại (Tuần 8 - Sprint 8: Hoàn thiện)
-**Trạng thái:** Dự án đã đáp ứng đầy đủ 100% các yêu cầu chức năng và phi chức năng. Tập trung hiện tại là đóng gói codebase, chuẩn bị slide báo cáo, viết final report và script demo.
+myfs là một FUSE-based filesystem hỗ trợ **transparent compression** — ứng dụng gọi `open()`, `read()`, `write()` hoàn toàn bình thường như với ext4 hay NTFS, nhưng bên dưới filesystem tự động nén dữ liệu trước khi lưu xuống disk và giải nén khi đọc ra. Người dùng và ứng dụng không biết dữ liệu đang được nén — đó là nghĩa của **transparent**.
 
-**Thành quả kỹ thuật cốt lõi đạt được:**
-- **Kiến trúc Module hóa (Refactored):** Codebase đã được tách nhỏ từ các file khổng lồ thành mô hình module rõ ràng (`core/`, `fuse_ops/`, `guards/`), rất dễ bảo trì và mở rộng.
-- **Tính toàn vẹn (Data Correctness):** Test suite pass 100% các corner cases (file > 64KB, partial overwrite cắt ngang ranh giới, truncate, append). Metadata đảm bảo checksum khớp 100% sau khi unmount/remount.
-- **Tối ưu hóa (Heuristics & GC):** Hệ thống có khả năng nhận diện định dạng không thể nén (JPEG, ZIP...) để bỏ qua bước nén giúp tiết kiệm CPU. Tích hợp cơ chế Garbage Collection (Compaction) khi đóng tệp (`release`) để dọn dẹp các orphan blobs sinh ra do RMW.
-- **Hiệu năng kiểm chứng (Benchmarked):** Hoạt động đọc/ghi dữ liệu nén đạt hiệu suất cao, xác định rõ overhead phân bổ giữa tiến trình userspace (FUSE) và Zstd. 
+### Điểm khác biệt với zip/RAR
 
-## Cấu trúc thư mục (Đã Refactor)
+| | zip / RAR | myfs |
+|---|---|---|
+| Tầng hoạt động | Application | Filesystem |
+| Ứng dụng có biết không | Có | Không |
+| `cat file` ra gì | Rác binary | Nội dung đúng |
+| `grep` trong file | Không được | Được |
+| Người dùng phải làm gì | Nén/giải nén thủ công | Không làm gì |
+| Random access | O(n) — giải nén từ đầu | O(1) — chỉ decompress chunk cần đọc |
+| Partial overwrite | Không có | Có (Read-Modify-Write) |
 
-```markdown
+---
+
+## Kiến trúc hệ thống
+
+```
+Application (cat, cp, grep, ...)
+        │  open() / read() / write()
+        ▼
+    Kernel VFS
+        │
+        ▼
+    FUSE kernel module
+        │
+        ▼
+┌─────────────────────────────────┐
+│           myfs (userspace)      │
+│                                 │
+│  fuse_ops/file.c                │
+│    myfs_read()  ─► decompress   │
+│    myfs_write() ─► compress     │
+│    write_rmw()  ─► RMW          │
+│                                 │
+│  core/                          │
+│    compress.c   Zstd + heuristic│
+│    metadata.c   chunk map I/O   │
+│    compact.c    garbage collect │
+│    path.c       path mapping    │
+└─────────────────────────────────┘
+        │
+        ▼
+  backing/ (directory trên ext4)
+    file.txt.data   ← compressed blobs
+    file.txt.meta   ← chunk map binary
+```
+
+### Thiết kế chunk-based
+
+Dữ liệu được chia thành các **chunk 64 KB độc lập**. Mỗi chunk được nén riêng bằng Zstd và lưu thành một blob trên `.data`. Metadata ánh xạ `logical_offset → physical_offset + raw_size + codec_type + CRC32` được lưu trong `.meta`.
+
+**Read path:** tra chunk map → `pread` blob → verify CRC32 → decompress → trả buffer đúng offset/size.
+
+**Write path:** thử Zstd compress → nếu tiết kiệm ≥ 12.5% thì lưu compressed (codec=1), ngược lại lưu raw (codec=0) → append blob vào cuối `.data` → cập nhật chunk map.
+
+**Partial overwrite (RMW):** gom tất cả chunk bị overlap → decompress vào working buffer → patch → recompress → append blob mới → merge chunk array → save chunk map.
+
+---
+
+## Cấu trúc thư mục
+
+```
 transcomp/
-├── Makefile               ← Script biên dịch dự án
+├── Makefile
 ├── README.md
-├── benchmark.sh           ← Đo throughput, compression ratio, latency (RMW)
-├── test_suite.sh          ← Chạy regression test (Corner cases, RMW, Data Integrity)
+├── benchmark.sh          ← Đo throughput, compression ratio, RMW latency
+├── benchmark_results.txt ← Kết quả benchmark lần chạy gần nhất
+├── demo.sh               ← Script demo bảo vệ (6 bước, auto mount/unmount)
+├── test_suite.sh         ← Regression test suite (49 test cases)
 ├── src/
-│   ├── main.c             ← Entry point & quản lý vòng đời FUSE (init, destroy)
-│   ├── myfs.h             ← Cấu trúc dữ liệu, constants và header chung
-│   ├── core/              ← Nhóm logic nghiệp vụ lõi (Filesystem Internals)
-│   │   ├── path.c         ← Xử lý ánh xạ đường dẫn logic -> physical
-│   │   ├── metadata.c     ← Load/Save metadata (chunk map) an toàn
-│   │   ├── compress.c     ← Tích hợp nén Zstd và Heuristic nhận diện file ZIP/JPEG
-│   │   └── compact.c      ← Garbage Collection thu hồi dung lượng orphan blobs
-│   ├── fuse_ops/          ← Nhóm xử lý FUSE Callbacks (Giao tiếp Kernel VFS)
-│   │   ├── file.c         ← Thao tác nội dung tệp (read, write, write_rmw, truncate, release)
-│   │   └── dir.c          ← Thao tác namespace (getattr, readdir, mkdir, unlink...)
-│   └── guards/            ← Nhóm validate dữ liệu & memory safety
+│   ├── myfs.h            ← Structs, constants, prototypes, LOG macro, CRC32 helper
+│   ├── main.c            ← Entry point, FUSE init/destroy, fuse_operations table
+│   ├── core/
+│   │   ├── path.c        ← build_path(), build_data_path(), build_meta_path()
+│   │   ├── metadata.c    ← load_chunk_map(), save_chunk_map() với atomic write
+│   │   ├── compress.c    ← zstd_compress(), zstd_decompress(), is_incompressible()
+│   │   └── compact.c     ← compact_data_file(): GC thu hồi orphan blobs sau RMW
+│   ├── fuse_ops/
+│   │   ├── file.c        ← myfs_read, myfs_write, write_rmw, myfs_truncate,
+│   │   │                    myfs_create, myfs_open, myfs_release
+│   │   └── dir.c         ← myfs_getattr, myfs_readdir, myfs_mkdir,
+│   │                        myfs_rmdir, myfs_unlink, myfs_utimens
+│   └── guards/
 │       ├── guards.h
-│       └── guards.c       
-├── backing/               ← Thư mục backing store lưu dữ liệu thật (.data và .meta)
-└── mountpoint/            ← Thư mục mount (Giao diện logic cho người dùng)
+│       └── guards.c      ← Validation functions: chunk metadata, bounds, pread result
+├── backing/              ← Backing store (.data + .meta cho mỗi file)
+└── mountpoint/           ← Mount point (giao diện logic cho user)
 ```
 
-Script `test_suite.sh` sẽ tự động kiểm tra:
+---
 
-- Basic read/write
-- Partial overwrite (RMW)
-- Multi-chunk file (>64 KB)
-- Compression / incompressible detection
-- Truncate / unlink / append
-- Cross-boundary overwrite
-- Persistence và metadata consistency
+## Cách build và chạy
 
-## Cách build
-
-### Terminal 1 — Build và mount filesystem lên `mountpoint/`
+### Yêu cầu
 
 ```bash
-make clean && make && make run
+sudo apt install libfuse3-dev libzstd-dev zlib1g-dev pkg-config gcc
 ```
-Filesystem sẽ chạy foreground và mount tại thư mục mountpoint/.
 
-### Terminal 2 — Chạy regression test
+### Build
 
 ```bash
+make          # compile
+make clean    # xóa binary + backing store (chỉ khi đã unmount)
+```
+
+### Chạy
+
+```bash
+# Terminal 1 — mount filesystem
+make run
+# hoặc: ./myfs -f mountpoint ./backing
+
+# Terminal 2 — sử dụng bình thường
+echo "Hello World" > mountpoint/test.txt
+cat mountpoint/test.txt
+ls -la mountpoint/
+
+# Unmount
+make umount
+```
+
+### Regression test
+
+```bash
+# Cần FUSE đang chạy ở terminal khác
 make test
 ```
 
-### Terminal 3 — Chạy benchmark + tuning
+49 test cases cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate, unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection.
+
+### Benchmark
 
 ```bash
 make bench
+# Kết quả lưu vào benchmark_results.txt
 ```
-Kết quả benchmark sẽ được ghi vào `benchmark_results.txt`.
+
+10 benchmark sections: sequential write/read throughput, compression ratio theo workload, RMW latency, so sánh với ext4 baseline, heuristic skip throughput, FUSE overhead vs Zstd overhead breakdown, append pattern analysis.
+
+### Demo bảo vệ
+
+```bash
+make demo
+# Tự động: build → mount → 6 bước demo → unmount
+```
+
+---
+
+## Các quyết định kỹ thuật quan trọng
+
+| Quyết định | Lý do |
+|---|---|
+| FUSE thay vì kernel module | Debug nhanh, không kernel panic, đủ để học semantics |
+| Chunk size 64 KB | Cân bằng compression ratio vs chi phí partial overwrite |
+| Zstd thay vì zlib/LZ4 | Ratio cao nhất trong nhóm fast codec, decompress 1550 MB/s |
+| Directory + `.data`/`.meta` | Dễ debug (hexdump trực tiếp), dễ implement atomic write |
+| Append-only blob | Tránh in-place rewrite, đơn giản, atomic với rename |
+| Checkpoint + atomic rename | Tránh journaling phức tạp, đủ cho prototype 8 tuần |
+
+---
+
+## Kết quả benchmark (tóm tắt)
+
+| Metric | myfs | ext4 baseline |
+|---|---|---|
+| Write text 100MB | ~166–298 MB/s | ~1220 MB/s |
+| Write random 100MB | ~120–246 MB/s | ~1190 MB/s |
+| Read text 50MB | ~109–248 MB/s | ~1205 MB/s |
+| Compression (text lặp lại) | 9000–20000x | 1.00x |
+| Compression (source code) | 1.27x | 1.00x |
+| Compression (random binary) | 1.00x | 1.00x |
+| RMW avg latency | ~64–110 ms | N/A |
+| Zstd compress (in-memory) | ~4600 MB/s | — |
+
+> **Ghi chú:** Overhead chính là FUSE context switch (~7x so với ext4), không phải Zstd (~30x nhanh hơn throughput của myfs khi đo in-memory).
+
+---
+
+## Known limitations
+
+- **Chunk packing chưa thực sự 64 KB:** mỗi `write()` call tạo 1 chunk riêng. File nhỏ nhiều write call sẽ có nhiều chunk nhỏ → compression ratio thấp hơn lý thuyết.
+- **Orphan blob GC synchronous:** compact chạy trong `release()`, không có background thread.
+- **Single source of truth cho `logical_size`:** hai field `inode.logical_size` và `chunk_map.logical_size` phải được sync thủ công — technical debt đã được document.
+- **No crash recovery:** atomic rename bảo vệ metadata, nhưng không có journaling đầy đủ.
+
+---
 
 ## Debug
 
-Log có timestamp `[HH:MM:SS.mmm]` in ra stderr trên terminal chạy FUSE:
+Log in ra stderr với timestamp millisecond:
+
 ```
 [13:05:01.234] [DEBUG] write: /test.txt offset=0 size=12
-[13:05:01.235] [DEBUG] write: incompressible, storing raw
-[13:05:01.236] [DEBUG] write OK: chunks=1 logical_size=12 codec=0
+[13:05:01.235] [DEBUG] write: compressed 12 → 8 bytes (66.7%)
+[13:05:01.236] [DEBUG] write OK: chunks=1 logical_size=12 codec=1
+[13:05:01.240] [DEBUG] myfs_read: /test.txt offset=0 size=4096
+[13:05:01.241] [DEBUG] myfs_read success: read 12 bytes
+```
+
+Xem backing store trực tiếp:
+
+```bash
+ls -la backing/          # thấy .data và .meta cho mỗi file
+hexdump -C backing/test.txt.meta   # xem chunk map binary
 ```
