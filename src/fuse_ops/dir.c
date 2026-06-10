@@ -55,16 +55,50 @@ int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     filler(buf, "..", NULL, 0, 0);
 
     struct dirent *de;
+
+    /* Dedup set: mỗi file logic chỉ được emit 1 lần dù có cả .data lẫn .meta */
+    #define MAX_SEEN 2048
+    char seen[MAX_SEEN][256];
+    int seen_count = 0;
+
     while ((de = readdir(dp)) != NULL)
     {
         size_t len = strlen(de->d_name);
-        /* Ẩn các file metadata nội bộ khỏi danh sách thư mục hiển thị. */
-        if (len > 5 && strcmp(de->d_name + len - 5, ".meta") == 0)
-            continue;
-        /* Ẩn luôn file dữ liệu thô để chỉ lộ ra tên file logic cho người dùng. */
-        if (len > 5 && strcmp(de->d_name + len - 5, ".data") == 0)
-            continue;
 
+        if (len > 5 &&
+            (strcmp(de->d_name + len - 5, ".meta") == 0 ||
+             strcmp(de->d_name + len - 5, ".data") == 0))
+        {
+            /* Ẩn file metadata, thay vào đó emit tên logic (bỏ .data/.meta) */
+            size_t blen = len - 5;
+            if (blen >= sizeof(seen[0]))
+                blen = sizeof(seen[0]) - 1;
+
+            char base[256];
+            memcpy(base, de->d_name, blen);
+            base[blen] = '\0';
+
+            /* Dedup: tránh emit trùng khi cả .data và .meta cùng tồn tại */
+            int already = 0;
+            for (int i = 0; i < seen_count; i++)
+            {
+                if (strcmp(seen[i], base) == 0)
+                {
+                    already = 1;
+                    break;
+                }
+            }
+            if (!already && seen_count < MAX_SEEN)
+            {
+                strncpy(seen[seen_count], base, sizeof(seen[0]) - 1);
+                seen[seen_count][sizeof(seen[0]) - 1] = '\0';
+                seen_count++;
+                filler(buf, base, NULL, 0, 0);
+            }
+            continue;
+        }
+
+        /* Thư mục thật (và các entry không phải .data/.meta) hiện nguyên tên */
         filler(buf, de->d_name, NULL, 0, 0);
     }
     closedir(dp);
