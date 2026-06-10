@@ -292,7 +292,7 @@ assert_diff "TC10.2 — cp từ host vào mountpoint" \
 section "TC11: Tạo và xóa thư mục (mkdir + rmdir)"
 # =============================================================================
 
-mkdir "$MOUNT/test_dir"
+mkdir "$MOUNT/test_dir" 2>/dev/null
 assert_exists "TC11.1 — mkdir tạo thư mục" "$MOUNT/test_dir"
 
 echo "in subdir" > "$MOUNT/test_dir/sub.txt"

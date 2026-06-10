@@ -243,7 +243,7 @@ MD5_RMW_PRE=$(md5sum  "$MOUNT/demo_rmw.txt"  | awk '{print $1}')
 LSIZE_PRE=$(size_bytes "$MOUNT/demo_text.txt")
 
 echo "  Unmount..."
-fusermount3 -u "$MOUNT"
+fusermount3 -u "$MOUNT" 2>/dev/null
 sleep 1
 
 echo "  Remount..."
