@@ -1,5 +1,8 @@
 CC = gcc
-CFLAGS = -Wall -g -Wno-format-truncation -Isrc -Isrc/guards -Isrc/core -Isrc/fuse_ops
+COMMON_CFLAGS = -Wall -Wno-format-truncation -pthread -Isrc -Isrc/guards -Isrc/core -Isrc/fuse_ops
+DEBUG_CFLAGS = $(COMMON_CFLAGS) -g
+RELEASE_CFLAGS = $(COMMON_CFLAGS) -O2 -DNDEBUG
+CFLAGS ?= $(DEBUG_CFLAGS)
 LIBS = `pkg-config fuse3 --cflags --libs` -lzstd -lz
 
 # Định nghĩa các thư mục mã nguồn
@@ -9,10 +12,15 @@ GUARD_SRCS = src/guards/guards.c
 
 SRCS = src/main.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS)
 
+.PHONY: all release run umount test bench demo clean
+
 all: myfs
 
 myfs: $(SRCS)
 	$(CC) $(CFLAGS) -o myfs $(SRCS) $(LIBS)
+
+release:
+	$(CC) $(RELEASE_CFLAGS) -o myfs $(SRCS) $(LIBS)
 
 run: myfs
 	./myfs -f mountpoint ./backing
@@ -24,7 +32,7 @@ test:
 	@chmod +x test_suite.sh
 	@./test_suite.sh mountpoint backing
 
-bench:
+bench: release
 	@chmod +x benchmark.sh
 	@./benchmark.sh mountpoint backing
 
@@ -37,4 +45,5 @@ clean:
 		echo "[ERROR] mountpoint dang duoc mount. Chay 'make umount' truoc."; \
 		exit 1; \
 	fi
-	rm -f myfs verify_remount.sh backing/*
+	rm -f myfs verify_remount.sh
+	rm -rf backing/* .myfs_bench.*
