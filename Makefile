@@ -12,7 +12,7 @@ GUARD_SRCS = src/guards/guards.c
 
 SRCS = src/main.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS)
 
-.PHONY: all release run umount test bench demo clean
+.PHONY: all release run umount test bench clean
 
 all: myfs
 
@@ -35,10 +35,6 @@ test:
 bench: release
 	@chmod +x benchmark.sh
 	@./benchmark.sh mountpoint backing
-
-demo:
-	@chmod +x demo.sh
-	@./demo.sh
 
 clean:
 	@if mountpoint -q mountpoint 2>/dev/null; then \

@@ -75,7 +75,6 @@ transcomp/
 ├── README.md
 ├── benchmark.sh          ← Đo throughput, compression ratio, RMW latency
 ├── benchmark_results.txt ← Kết quả benchmark lần chạy gần nhất
-├── demo.sh               ← Script demo bảo vệ (6 bước, auto mount/unmount)
 ├── test_suite.sh         ← Regression test suite (49 test cases)
 ├── src/
 │   ├── myfs.h            ← Structs, constants, prototypes, LOG macro, CRC32 helper
@@ -147,13 +146,6 @@ make bench
 ```
 
 10 benchmark sections: sequential write/read throughput, compression ratio theo workload, RMW latency, so sánh với ext4 baseline, heuristic skip throughput, FUSE overhead vs Zstd overhead breakdown, append pattern analysis.
-
-### Demo bảo vệ
-
-```bash
-make demo
-# Tự động: build → mount → 6 bước demo → unmount
-```
 
 ---
 
