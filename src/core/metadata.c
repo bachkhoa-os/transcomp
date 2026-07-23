@@ -44,6 +44,25 @@ static int write_full(int fd, const void *buf, size_t size)
     return 0;
 }
 
+/* Bất biến: mảng chunk luôn sắp theo logical_offset tăng dần. Meta cũ có thể
+ * chưa sắp (sparse write ở offset giảm dần append vào cuối mảng); sắp lại tại
+ * điểm nạp duy nhất này để mọi đường ghi/đọc dựa được vào bất biến.
+ * Insertion sort ổn định — O(n) khi mảng đã sắp, là trường hợp thường gặp. */
+static void sort_chunks_by_logical_offset(myfs_chunk_t *chunks, uint32_t n)
+{
+    for (uint32_t i = 1; i < n; i++)
+    {
+        myfs_chunk_t key = chunks[i];
+        uint32_t j = i;
+        while (j > 0 && chunks[j - 1].logical_offset > key.logical_offset)
+        {
+            chunks[j] = chunks[j - 1];
+            j--;
+        }
+        chunks[j] = key;
+    }
+}
+
 int load_chunk_map_from_fd(int meta_fd, myfs_inode_t *inode)
 {
     uint32_t num_chunks = 0;
@@ -77,10 +96,15 @@ int load_chunk_map_from_fd(int meta_fd, myfs_inode_t *inode)
         }
     }
 
+    sort_chunks_by_logical_offset(chunks, num_chunks);
+
     free(inode->chunk_map.chunks);
     inode->chunk_map.chunks = chunks;
     inode->chunk_map.num_chunks = num_chunks;
     inode->chunk_map.logical_size = logical_size;
+    /* Derive tại load — không persist: flag stale sau crash tự lành, và file
+     * cũ tình cờ thoả bất biến cũng được hưởng fast path. */
+    inode->chunk_map.fully_packed = chunk_map_is_packed(&inode->chunk_map);
     return 0;
 }
 
@@ -116,6 +140,7 @@ int load_chunk_map(const char *path, myfs_inode_t *inode)
         inode->chunk_map.chunks = NULL;
         inode->chunk_map.num_chunks = 0;
         inode->chunk_map.logical_size = 0;
+        inode->chunk_map.fully_packed = true;
         return 0;
     }
     return ret;

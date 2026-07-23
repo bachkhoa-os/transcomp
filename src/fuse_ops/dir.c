@@ -78,7 +78,15 @@ static bool has_hex_generation_suffix(const char *name)
     if (!marker)
         return false;
     const char *id = marker + 3;
-    if (strlen(id) != MYFS_GENERATION_HEX_LEN)
+    size_t id_len = strlen(id);
+    /* Chấp nhận cả owner marker "<base>.g.<hex>.owner" — cũng là artifact
+     * nội bộ của generation storage, không được lộ ra listing. */
+    if (id_len == MYFS_GENERATION_HEX_LEN + sizeof(".owner") - 1)
+    {
+        if (strcmp(id + MYFS_GENERATION_HEX_LEN, ".owner") != 0)
+            return false;
+    }
+    else if (id_len != MYFS_GENERATION_HEX_LEN)
         return false;
     for (size_t i = 0; i < MYFS_GENERATION_HEX_LEN; i++)
     {
@@ -87,6 +95,49 @@ static bool has_hex_generation_suffix(const char *name)
             return false;
     }
     return true;
+}
+
+/* Tập tên logic đã emit — mỗi file có thể có đủ .data/.meta/.current nên phải
+ * dedup. Cấp phát trên heap và tự giãn để thư mục lớn không bị mất entry
+ * (bảng cố định trước đây ngừng emit khi đầy) và không chiếm 512KB stack. */
+struct seen_set
+{
+    char **names;
+    size_t count;
+    size_t cap;
+};
+
+/* Trả 1 nếu base mới (đã thêm), 0 nếu đã có, -1 nếu hết bộ nhớ. */
+static int seen_add(struct seen_set *set, const char *base)
+{
+    for (size_t i = 0; i < set->count; i++)
+    {
+        if (strcmp(set->names[i], base) == 0)
+            return 0;
+    }
+
+    if (set->count == set->cap)
+    {
+        size_t new_cap = set->cap ? set->cap * 2 : 64;
+        char **grown = realloc(set->names, new_cap * sizeof(*grown));
+        if (!grown)
+            return -1;
+        set->names = grown;
+        set->cap = new_cap;
+    }
+
+    char *copy = strdup(base);
+    if (!copy)
+        return -1;
+    set->names[set->count++] = copy;
+    return 1;
+}
+
+static void seen_free(struct seen_set *set)
+{
+    for (size_t i = 0; i < set->count; i++)
+        free(set->names[i]);
+    free(set->names);
 }
 
 // Hàm đọc thư mục (readdir)
@@ -109,11 +160,8 @@ int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     filler(buf, "..", NULL, 0, 0);
 
     struct dirent *de;
-
-    /* Dedup set: mỗi file logic chỉ được emit 1 lần dù có cả .data lẫn .meta */
-    #define MAX_SEEN 2048
-    char seen[MAX_SEEN][256];
-    int seen_count = 0;
+    struct seen_set seen = {0};
+    int ret = 0;
 
     while ((de = readdir(dp)) != NULL)
     {
@@ -125,72 +173,41 @@ int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             strstr(de->d_name, ".meta.alias.") != NULL)
             continue;
 
+        /* Entry vật lý của một file logic: ẩn hậu tố, emit tên logic. */
+        size_t suffix_len = 0;
         if (len > 5 &&
             (strcmp(de->d_name + len - 5, ".meta") == 0 ||
              strcmp(de->d_name + len - 5, ".data") == 0))
+            suffix_len = 5;
+        else if (len > 8 && strcmp(de->d_name + len - 8, ".current") == 0)
+            suffix_len = 8;
+
+        if (suffix_len == 0)
         {
-            /* Ẩn file metadata, thay vào đó emit tên logic (bỏ .data/.meta) */
-            size_t blen = len - 5;
-            if (blen >= sizeof(seen[0]))
-                blen = sizeof(seen[0]) - 1;
-
-            char base[256];
-            memcpy(base, de->d_name, blen);
-            base[blen] = '\0';
-
-            /* Dedup: tránh emit trùng khi cả .data và .meta cùng tồn tại */
-            int already = 0;
-            for (int i = 0; i < seen_count; i++)
-            {
-                if (strcmp(seen[i], base) == 0)
-                {
-                    already = 1;
-                    break;
-                }
-            }
-            if (!already && seen_count < MAX_SEEN)
-            {
-                strncpy(seen[seen_count], base, sizeof(seen[0]) - 1);
-                seen[seen_count][sizeof(seen[0]) - 1] = '\0';
-                seen_count++;
-                filler(buf, base, NULL, 0, 0);
-            }
+            /* Thư mục thật (và các entry không phải artifact) hiện nguyên tên */
+            filler(buf, de->d_name, NULL, 0, 0);
             continue;
         }
 
-        if (len > 8 && strcmp(de->d_name + len - 8, ".current") == 0)
+        char base[NAME_MAX + 1];
+        size_t blen = len - suffix_len;
+        if (blen > NAME_MAX)
+            blen = NAME_MAX;
+        memcpy(base, de->d_name, blen);
+        base[blen] = '\0';
+
+        int add = seen_add(&seen, base);
+        if (add < 0)
         {
-            size_t blen = len - 8;
-            if (blen >= sizeof(seen[0]))
-                blen = sizeof(seen[0]) - 1;
-
-            char base[256];
-            memcpy(base, de->d_name, blen);
-            base[blen] = '\0';
-            int already = 0;
-            for (int i = 0; i < seen_count; i++)
-            {
-                if (strcmp(seen[i], base) == 0)
-                {
-                    already = 1;
-                    break;
-                }
-            }
-            if (!already && seen_count < MAX_SEEN)
-            {
-                strncpy(seen[seen_count], base, sizeof(seen[0]) - 1);
-                seen[seen_count][sizeof(seen[0]) - 1] = '\0';
-                seen_count++;
-                filler(buf, base, NULL, 0, 0);
-            }
-            continue;
+            ret = -ENOMEM;
+            break;
         }
-
-        /* Thư mục thật (và các entry không phải .data/.meta) hiện nguyên tên */
-        filler(buf, de->d_name, NULL, 0, 0);
+        if (add == 1)
+            filler(buf, base, NULL, 0, 0);
     }
     closedir(dp);
-    return 0;
+    seen_free(&seen);
+    return ret;
 }
 
 // Hàm tạo file (mknod)

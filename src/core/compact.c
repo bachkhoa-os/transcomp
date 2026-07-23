@@ -470,7 +470,10 @@ static int compact_data_file_locked(const char *path)
     uint64_t wasted_bytes = (uint64_t)data_file_size - live_bytes;
     double wasted = data_file_size > 0
         ? (double)wasted_bytes / (double)data_file_size : 0.0;
-    if (wasted < COMPACT_THRESHOLD || wasted_bytes < CHUNK_SIZE)
+    /* File chưa packed luôn được compact bất kể waste — migration một lần
+     * sang bất biến cửa sổ 64KB; sau đó trigger phụ này tự im lặng. */
+    if ((wasted < COMPACT_THRESHOLD || wasted_bytes < CHUNK_SIZE) &&
+        inode.chunk_map.fully_packed)
     {
         LOG("[DEBUG] compact: skip (wasted=%.1f%% wasted_bytes=%llu)\n",
             wasted * 100, (unsigned long long)wasted_bytes);
@@ -510,28 +513,61 @@ static int compact_data_file_locked(const char *path)
     }
 
     off_t new_phys = 0;
-    for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
+    if (inode.chunk_map.fully_packed)
     {
-        myfs_chunk_t *chunk = &inode.chunk_map.chunks[i];
-        char *buf = malloc(chunk->raw_size);
-        if (!buf)
+        /* File đã packed: copy verbatim từng blob — không tốn recompress. */
+        for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
         {
-            ret = -ENOMEM;
-            break;
-        }
-        ret = pread_full_at(src_fd, buf, chunk->raw_size,
-                            chunk->physical_offset);
-        if (ret == 0 && chunk->checksum != 0 &&
-            chunk_crc32(buf, chunk->raw_size) != chunk->checksum)
-            ret = -EIO;
-        if (ret == 0)
-            ret = pwrite_full_at(dst_fd, buf, chunk->raw_size, new_phys);
-        free(buf);
-        if (ret != 0)
-            break;
+            myfs_chunk_t *chunk = &inode.chunk_map.chunks[i];
+            char *buf = malloc(chunk->raw_size);
+            if (!buf)
+            {
+                ret = -ENOMEM;
+                break;
+            }
+            ret = pread_full_at(src_fd, buf, chunk->raw_size,
+                                chunk->physical_offset);
+            if (ret == 0 && chunk->checksum != 0 &&
+                chunk_crc32(buf, chunk->raw_size) != chunk->checksum)
+                ret = -EIO;
+            if (ret == 0)
+                ret = pwrite_full_at(dst_fd, buf, chunk->raw_size, new_phys);
+            free(buf);
+            if (ret != 0)
+                break;
 
-        chunk->physical_offset = new_phys;
-        new_phys += chunk->raw_size;
+            chunk->physical_offset = new_phys;
+            new_phys += chunk->raw_size;
+        }
+    }
+    else
+    {
+        /* File legacy chưa packed: repack toàn bộ nội dung vào cửa sổ 64KB —
+         * migration một lần; sau lần compact này file thoả bất biến packed
+         * và các lần đọc sau dùng được lookup theo cửa sổ. */
+        off_t max_end = 0;
+        for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
+        {
+            myfs_chunk_t *c = &inode.chunk_map.chunks[i];
+            off_t c_end = (off_t)c->logical_offset + (off_t)c->stored_size;
+            if (c_end > max_end)
+                max_end = c_end;
+        }
+        myfs_chunk_t *entries = NULL;
+        uint32_t entry_count = 0;
+        ret = myfs_repack_windows(src_fd, dst_fd, &new_phys, &inode.chunk_map,
+                                  0, inode.chunk_map.num_chunks,
+                                  0, (off_t)WINDOW_CEIL(max_end),
+                                  NULL, 0, 0, &entries, &entry_count);
+        if (ret == 0)
+        {
+            free(inode.chunk_map.chunks);
+            inode.chunk_map.chunks = entries;
+            inode.chunk_map.num_chunks = entry_count;
+            inode.chunk_map.fully_packed = true;
+            LOG("[DEBUG] compact: repacked legacy file into %u windows\n",
+                entry_count);
+        }
     }
 
     if (close(src_fd) != 0 && ret == 0)

@@ -116,7 +116,10 @@ static int myfs_open_locked(const char *path, struct fuse_file_info *fi)
     if (recovery_ret != 0)
         LOG("[WARN] open: generation recovery returned %d\n", recovery_ret);
 
-    int fd = open(storage.data_path, fi->flags | O_CLOEXEC);
+    /* O_DIRECT là chỉ thị cho kernel FUSE (bypass page cache phía user),
+     * KHÔNG được chuyển xuống backing store: pread nội bộ dùng buffer thường,
+     * không thoả ràng buộc alignment của O_DIRECT trên ext4 → EINVAL. */
+    int fd = open(storage.data_path, (fi->flags & ~O_DIRECT) | O_CLOEXEC);
     if (fd == -1)
     {
         perror("[ERROR] open .data");
@@ -159,6 +162,52 @@ int myfs_open(const char *path, struct fuse_file_info *fi)
     if (unlock_ret != 0)
         return -unlock_ret;
 
+    return ret;
+}
+
+/*
+ * Truncate cắt vào giữa một chunk NÉN: không thể chỉ shrink stored_size trong
+ * metadata — blob cũ giải nén ra nhiều hơn stored_size mới nên mọi lần đọc sau
+ * sẽ fail (frame không vừa buffer). Ghi lại phần còn giữ thành blob mới: đọc +
+ * verify CRC, giải nén, cắt, nén lại (raw fallback như write path), append vào
+ * cuối .data, fdatasync rồi cập nhật entry. Blob cũ thành orphan chờ compact.
+ */
+static int rewrite_truncated_chunk(const myfs_storage_t *storage,
+                                   myfs_chunk_t *chunk, uint32_t new_stored)
+{
+    int fd = open(storage->data_path, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return -errno;
+
+    char *plain_buf = malloc(chunk->stored_size);
+    if (!plain_buf)
+    {
+        close(fd);
+        return -ENOMEM;
+    }
+
+    int ret = myfs_chunk_payload_load(fd, chunk, plain_buf);
+    if (ret == 0)
+    {
+        off_t eof = lseek(fd, 0, SEEK_END);
+        if (eof < 0)
+            ret = -errno;
+        else
+        {
+            /* Blob mới phải bền trên disk trước khi meta trỏ tới nó. */
+            myfs_chunk_t out;
+            ret = myfs_blob_append(fd, &eof, plain_buf, new_stored,
+                                   chunk->logical_offset, &out);
+            if (ret == 0 && fdatasync(fd) != 0)
+                ret = -errno;
+            if (ret == 0)
+                *chunk = out;
+        }
+    }
+    if (ret != 0)
+        LOG("[ERROR] truncate: chunk rewrite failed (%d)\n", ret);
+    free(plain_buf);
+    close(fd);
     return ret;
 }
 
@@ -244,8 +293,24 @@ static int myfs_truncate_locked(const char *path, off_t size,
             off_t chunk_end = (off_t)c->logical_offset + (off_t)c->stored_size;
             if (chunk_end > size)
             {
-                c->stored_size = (uint32_t)(size - (off_t)c->logical_offset);
-                /* raw_size vẫn giữ nguyên vì blob trên disk chưa được ghi lại. */
+                uint32_t new_stored = (uint32_t)(size - (off_t)c->logical_offset);
+                if (c->codec_type == 1)
+                {
+                    /* Chunk nén phải được ghi lại — chỉ shrink metadata sẽ làm
+                     * mọi lần decompress sau fail vì frame lớn hơn buffer. */
+                    ret = rewrite_truncated_chunk(&storage, c, new_stored);
+                    if (ret != 0)
+                    {
+                        free(inode.chunk_map.chunks);
+                        return ret;
+                    }
+                }
+                else
+                {
+                    /* Blob raw: đọc chỉ copy stored_size byte đầu nên shrink
+                     * metadata là đủ; blob trên disk giữ nguyên, CRC vẫn khớp. */
+                    c->stored_size = new_stored;
+                }
             }
         }
         inode.chunk_map.num_chunks = keep;
@@ -351,21 +416,70 @@ int myfs_read(const char *path, char *buf, size_t size,
 
     while (remaining > 0 && cur_offset < (off_t)INODE_LSIZE(inode))
     {
-        // Linear scan để tìm chunk chứa cur_offset — nhất quán với myfs_write().
-        // Không dùng cur_offset/CHUNK_SIZE vì chunk thực tế không đảm bảo đúng 64KB.
         int32_t chunk_idx = -1;
-        for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
+        if (inode.chunk_map.fully_packed)
         {
-            myfs_chunk_t *c = &inode.chunk_map.chunks[i];
-            off_t c_end = (off_t)c->logical_offset + (off_t)c->stored_size;
-            if ((off_t)c->logical_offset <= cur_offset && cur_offset < c_end)
+            /* Packed: chunk chứa cur_offset chỉ có thể là chunk bắt đầu đúng
+             * tại WINDOW_BASE(cur_offset) — binary search thay vì linear. */
+            uint64_t want = WINDOW_BASE(cur_offset);
+            uint32_t lo = 0;
+            uint32_t hi = inode.chunk_map.num_chunks;
+            while (lo < hi)
             {
-                chunk_idx = (int32_t)i;
-                break;
+                uint32_t mid = lo + (hi - lo) / 2;
+                if (inode.chunk_map.chunks[mid].logical_offset < want)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
+            if (lo < inode.chunk_map.num_chunks &&
+                inode.chunk_map.chunks[lo].logical_offset == want &&
+                cur_offset < (off_t)want +
+                             (off_t)inode.chunk_map.chunks[lo].stored_size)
+                chunk_idx = (int32_t)lo;
+        }
+        else
+        {
+            /* File legacy chưa packed: linear scan chịu được chunk kích thước
+             * bất kỳ — tầng fallback vĩnh viễn. */
+            for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
+            {
+                myfs_chunk_t *c = &inode.chunk_map.chunks[i];
+                off_t c_end = (off_t)c->logical_offset + (off_t)c->stored_size;
+                if ((off_t)c->logical_offset <= cur_offset && cur_offset < c_end)
+                {
+                    chunk_idx = (int32_t)i;
+                    break;
+                }
             }
         }
         if (chunk_idx < 0)
-            break; // cur_offset không nằm trong chunk nào → sparse region, trả zero
+        {
+            /* cur_offset nằm trong hole. Lấp zero tới chunk kế tiếp (mảng đã
+             * sắp nên là chunk đầu tiên có logical_offset > cur_offset) hoặc
+             * tới EOF logic — break sớm sẽ trả thiếu byte và kernel hiểu là
+             * EOF, làm hole đọc ra rỗng thay vì byte 0. */
+            off_t next_start = (off_t)INODE_LSIZE(inode);
+            for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
+            {
+                off_t c_start = (off_t)inode.chunk_map.chunks[i].logical_offset;
+                if (c_start > cur_offset)
+                {
+                    next_start = c_start;
+                    break;
+                }
+            }
+            size_t hole_remaining = (size_t)(INODE_LSIZE(inode) - (size_t)cur_offset);
+            size_t gap = (size_t)(next_start - cur_offset);
+            size_t zero_len = min(remaining, min(gap, hole_remaining));
+            if (zero_len == 0)
+                break;
+            memset(buf + bytes_read, 0, zero_len);
+            bytes_read += zero_len;
+            cur_offset += zero_len;
+            remaining -= zero_len;
+            continue;
+        }
 
         myfs_chunk_t *chunk = &inode.chunk_map.chunks[(uint32_t)chunk_idx];
         off_t chunk_logical_start = chunk->logical_offset;
@@ -385,84 +499,25 @@ int myfs_read(const char *path, char *buf, size_t size,
         size_t logical_remaining = (size_t)(INODE_LSIZE(inode) - (size_t)cur_offset);
         size_t bytes_in_chunk = min(remaining, min(chunk_size - chunk_offset, logical_remaining));
 
-        char *raw_buf = malloc(chunk->raw_size);
-        if (guard_malloc(raw_buf) < 0)
+        /* pread + verify CRC32 + decompress-or-copy — dùng chung engine với
+         * write/truncate/compact; chịu được frame dài hơn stored_size (meta
+         * cũ bị truncate shrink trước khi có cơ chế rewrite). */
+        char *payload = malloc(chunk->stored_size);
+        if (guard_malloc(payload) < 0)
             return cleanup_fd(fd, 1, -ENOMEM);
 
-        ssize_t n = pread(fd, raw_buf, chunk->raw_size, chunk->physical_offset);
-        if (guard_pread_result(n, chunk->raw_size) < 0)
+        if (myfs_chunk_payload_load(fd, chunk, payload) != 0)
         {
-            free(raw_buf);
+            free(payload);
             return cleanup_fd(fd, 1, -EIO);
         }
 
-        /* Verify CRC32 nếu chunk có checksum hợp lệ (khác 0).
-         * Checksum = 0 nghĩa là chunk được ghi trước khi có CRC32 → bỏ qua.
-         * Phát hiện data corruption im lặng (bit rot, disk error...). */
-        if (chunk->checksum != 0)
-        {
-            uint32_t actual = chunk_crc32(raw_buf, chunk->raw_size);
-            if (actual != chunk->checksum)
-            {
-                LOG("[ERROR] CRC32 mismatch chunk %u: expected=0x%08x got=0x%08x\n",
-                    chunk_idx, chunk->checksum, actual);
-                free(raw_buf);
-                return cleanup_fd(fd, 1, -EIO);
-            }
-        }
-
-        char *decomp_buf = NULL;
-        size_t decomp_size = 0;
-
-        if (chunk->codec_type == 0)
-        {
-            decomp_buf = raw_buf;
-            decomp_size = chunk->stored_size;
-        }
-        else if (chunk->codec_type == 1)
-        {
-            decomp_buf = malloc(chunk->stored_size);
-            if (guard_malloc(decomp_buf) < 0)
-            {
-                free(raw_buf);
-                return cleanup_fd(fd, 1, -ENOMEM);
-            }
-
-            if (zstd_decompress(raw_buf, chunk->raw_size,
-                                decomp_buf, chunk->stored_size,
-                                &decomp_size) != 0)
-            {
-                free(decomp_buf);
-                free(raw_buf);
-                return cleanup_fd(fd, 1, -EIO);
-            }
-
-            if (guard_decompress_size(decomp_size, chunk->stored_size) < 0)
-            {
-                free(decomp_buf);
-                free(raw_buf);
-                return cleanup_fd(fd, 1, -EIO);
-            }
-
-            free(raw_buf);
-            raw_buf = NULL;
-        }
-        else
-        {
-            free(raw_buf);
-            return cleanup_fd(fd, 1, -EIO);
-        }
-
-        memcpy(buf + bytes_read, decomp_buf + chunk_offset, bytes_in_chunk);
+        memcpy(buf + bytes_read, payload + chunk_offset, bytes_in_chunk);
+        free(payload);
 
         bytes_read += bytes_in_chunk;
         cur_offset += bytes_in_chunk;
         remaining -= bytes_in_chunk;
-
-        if (chunk->codec_type == 0)
-            free(raw_buf);
-        else
-            free(decomp_buf);
     }
 
     close(fd);
@@ -473,214 +528,10 @@ int myfs_read(const char *path, char *buf, size_t size,
 }
 
 /*
- * Cơ chế read-modify-write cho trường hợp ghi đè một phần lên vùng dữ liệu đã tồn tại.
- * Thay vì ghi đè trực tiếp lên blob cũ, hàm gom các chunk bị chồng lấn vào một
- * vùng làm việc, áp patch dữ liệu mới, rồi ghi lại thành một blob mới ở cuối file.
- */
-static int write_rmw(const myfs_storage_t *storage,
-                     const char *buf, size_t size, off_t offset,
-                     myfs_inode_t *inode, uint32_t chunk_idx)
-{
-    /* Xác định toàn bộ các chunk bị chồng lấn với vùng ghi mới. */
-    LOG("[DEBUG] write_rmw: offset=%ld size=%zu chunk_idx=%u num_chunks=%u\n",
-        offset, size, chunk_idx, inode->chunk_map.num_chunks);
-    uint32_t last_idx = chunk_idx;
-    off_t write_end = offset + (off_t)size;
-    for (uint32_t i = chunk_idx + 1; i < inode->chunk_map.num_chunks; i++)
-    {
-        myfs_chunk_t *c = &inode->chunk_map.chunks[i];
-        if ((off_t)c->logical_offset < write_end)
-            last_idx = i;
-        else
-            break;
-    }
-
-    /* Tính miền logical cần gom lại, từ chunk đầu đến chunk cuối bị ảnh hưởng. */
-    myfs_chunk_t *first = &inode->chunk_map.chunks[chunk_idx];
-    myfs_chunk_t *last = &inode->chunk_map.chunks[last_idx];
-    off_t region_start = (off_t)first->logical_offset;
-    off_t region_end = (off_t)last->logical_offset + (off_t)last->stored_size;
-    /* Nếu dữ liệu ghi vượt qua chunk cuối, mở rộng vùng cần xử lý tương ứng. */
-    if (write_end > region_end)
-        region_end = write_end;
-    size_t region_size = (size_t)(region_end - region_start);
-
-    /* Cấp phát buffer làm việc cho toàn bộ miền cần xử lý và khởi tạo bằng 0. */
-    char *work_buf = calloc(region_size, 1);
-    if (!work_buf)
-        return -ENOMEM;
-
-    /* Đọc và giải nén từng chunk vào đúng vị trí tương ứng trong work buffer. */
-    int read_fd = open(storage->data_path, O_RDONLY | O_CLOEXEC);
-    if (read_fd == -1)
-    {
-        free(work_buf);
-        return -errno;
-    }
-
-    for (uint32_t i = chunk_idx; i <= last_idx; i++)
-    {
-        myfs_chunk_t *c = &inode->chunk_map.chunks[i];
-        char *raw_buf = malloc(c->raw_size);
-        if (!raw_buf)
-        {
-            close(read_fd);
-            free(work_buf);
-            return -ENOMEM;
-        }
-
-        ssize_t n = pread(read_fd, raw_buf, c->raw_size, c->physical_offset);
-        
-        if (c->checksum != 0)
-        {
-            uint32_t actual = chunk_crc32(raw_buf, c->raw_size);
-            if (actual != c->checksum)
-            {
-                LOG("[ERROR] rmw: CRC32 mismatch chunk %u: expected=0x%08x got=0x%08x\n",
-                    i, c->checksum, actual);
-                free(raw_buf);
-                close(read_fd);
-                free(work_buf);
-                return -EIO;
-            }
-        }
-        LOG("[DEBUG] rmw pread: chunk=%u raw_size=%u phys_off=%lu got=%ld\n",
-            i, c->raw_size, c->physical_offset, n);
-        if (n != (ssize_t)c->raw_size)
-        {
-            LOG("[ERROR] rmw pread failed: expected %u got %ld errno=%d\n",
-                c->raw_size, n, errno);
-            free(raw_buf);
-            close(read_fd);
-            free(work_buf);
-            return -EIO;
-        }
-
-        /* Vị trí ghi của chunk hiện tại bên trong work buffer. */
-        size_t woff = (size_t)((off_t)c->logical_offset - region_start);
-
-        if (c->codec_type == 1)
-        {
-            size_t decomp_size = 0;
-            if (zstd_decompress(raw_buf, c->raw_size,
-                                work_buf + woff, c->stored_size,
-                                &decomp_size) != 0)
-            {
-                free(raw_buf);
-                close(read_fd);
-                free(work_buf);
-                return -EIO;
-            }
-        }
-        else
-            memcpy(work_buf + woff, raw_buf, c->stored_size);
-
-        free(raw_buf);
-    }
-    close(read_fd);
-
-    /* Đắp dữ liệu mới vào đúng vùng người dùng yêu cầu. */
-    size_t patch_off = (size_t)(offset - region_start);
-    memcpy(work_buf + patch_off, buf, size);
-
-    /* Nén lại toàn bộ miền sau khi đã ghép dữ liệu mới. */
-    size_t compress_bound = ZSTD_compressBound(region_size);
-    char *comp_buf = malloc(compress_bound);
-    if (!comp_buf)
-    {
-        free(work_buf);
-        return -ENOMEM;
-    }
-
-    size_t compressed_size = 0;
-    int compress_ret = zstd_compress(work_buf, region_size,
-                                     comp_buf, compress_bound,
-                                     &compressed_size);
-    const char *write_buf_ptr;
-    size_t write_size;
-    uint8_t new_codec;
-
-    if (compress_ret == 0)
-    {
-        write_buf_ptr = comp_buf;
-        write_size = compressed_size;
-        new_codec = 1;
-        LOG("[DEBUG] rmw: recompressed %zu → %zu bytes\n",
-            region_size, compressed_size);
-    }
-    else
-    {
-        write_buf_ptr = work_buf;
-        write_size = region_size;
-        new_codec = 0;
-        LOG("[DEBUG] rmw: storing raw %zu bytes\n", region_size);
-    }
-
-    /* Ghi blob mới vào cuối file .data để tránh ghi đè trực tiếp dữ liệu cũ. */
-    int append_fd = open(storage->data_path, O_WRONLY | O_CLOEXEC);
-    if (append_fd == -1)
-    {
-        free(comp_buf);
-        free(work_buf);
-        return -errno;
-    }
-
-    off_t new_phys = lseek(append_fd, 0, SEEK_END);
-    if (new_phys < 0)
-    {
-        close(append_fd);
-        free(comp_buf);
-        free(work_buf);
-        return -errno;
-    }
-
-    ssize_t written = pwrite(append_fd, write_buf_ptr, write_size, new_phys);
-    /* Tính CRC32 TRƯỚC khi free — khi new_codec=1, write_buf_ptr == comp_buf */
-    uint32_t blob_crc = chunk_crc32(write_buf_ptr, write_size);
-
-    close(append_fd);
-    free(comp_buf);
-    free(work_buf);
-    if (written != (ssize_t)write_size)
-        return -EIO;
-
-    /*
-     * Thay thế toàn bộ dải chunk bị ảnh hưởng bằng một chunk mới duy nhất.
-     * Chunk đầu tiên giữ vai trò đại diện cho miền đã được hợp nhất, các chunk
-     * còn lại sẽ bị loại bỏ khỏi chunk map.
-     */
-    inode->chunk_map.chunks[chunk_idx].logical_offset = (uint64_t)region_start;
-    inode->chunk_map.chunks[chunk_idx].physical_offset = new_phys;
-    inode->chunk_map.chunks[chunk_idx].stored_size = (uint32_t)region_size;
-    inode->chunk_map.chunks[chunk_idx].raw_size = (uint32_t)write_size;
-    inode->chunk_map.chunks[chunk_idx].codec_type = new_codec;
-    inode->chunk_map.chunks[chunk_idx].flags = (new_codec == 1) ? 1 : 0;
-    inode->chunk_map.chunks[chunk_idx].checksum = blob_crc;
-
-    /* Dịch các chunk phía sau lên để lấp khoảng trống do hợp nhất. */
-    uint32_t removed = last_idx - chunk_idx; /* Số chunk bị gộp và loại bỏ. */
-    if (removed > 0)
-    {
-        uint32_t total = inode->chunk_map.num_chunks;
-        memmove(&inode->chunk_map.chunks[chunk_idx + 1],
-                &inode->chunk_map.chunks[last_idx + 1],
-                (total - last_idx - 1) * sizeof(myfs_chunk_t));
-        inode->chunk_map.num_chunks -= removed;
-    }
-
-    /* Đồng bộ logical size nếu vùng ghi mới làm file dài hơn trước. */
-    if (write_end > (off_t)INODE_LSIZE(*inode))
-    {
-        INODE_LSIZE(*inode) = write_end;
-    }
-
-    return save_chunk_map_for_storage(storage, inode);
-}
-
-/*
- * Ghi dữ liệu vào file logic, bao gồm cả trường hợp append mới lẫn ghi đè
- * một phần dữ liệu đã tồn tại. Hàm này quyết định nhánh xử lý dựa trên
- * metadata hiện hành và chỉ trả về số byte đã ghi khi thao tác thành công.
+ * Ghi dữ liệu vào file logic theo bất biến cửa sổ 64KB: vùng ghi được chia
+ * theo các cửa sổ chứa nó, mỗi cửa sổ bị chạm được repack (merge dữ liệu cũ +
+ * patch mới) thành đúng một chunk head-aligned. Append thuần, overwrite một
+ * phần và write vào hole đều đi chung một đường — không còn nhánh RMW riêng.
  */
 static int myfs_write_locked(const char *path, const char *buf, size_t size,
                              off_t offset, struct fuse_file_info *fi)
@@ -707,128 +558,127 @@ static int myfs_write_locked(const char *path, const char *buf, size_t size,
     if (ret != 0)
         return ret;
 
-    int32_t chunk_idx = -1;
-    for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
-    {
-        myfs_chunk_t *c = &inode.chunk_map.chunks[i];
-        if ((off_t)c->logical_offset <= offset &&
-            offset < (off_t)c->logical_offset + (off_t)c->stored_size)
-        {
-            chunk_idx = (int32_t)i;
-            break;
-        }
-    }
-
-    if (chunk_idx >= 0)
-    {
-        /*
-         * Nhánh RMW: dữ liệu ghi chồng lên một chunk đã tồn tại.
-         * FUSE kỳ vọng số byte đã ghi khi thành công, vì vậy cần chuyển mã
-         * kết quả từ write_rmw sang đúng giá trị trả về cho kernel.
-         */
-        int rmw_ret = write_rmw(&active_storage, buf, size, offset,
-                                &inode, (uint32_t)chunk_idx);
-        free(inode.chunk_map.chunks);
-        return (rmw_ret == 0) ? (int)size : rmw_ret;
-    }
-    /* Thử nén chunk mới trước khi ghi để tiết kiệm dung lượng nếu có lợi. */
-    size_t compress_bound = ZSTD_compressBound(size);
-    char *comp_buf = malloc(compress_bound);
-    if (!comp_buf)
-    {
-        free(inode.chunk_map.chunks);
-        return -ENOMEM;
-    }
-
-    size_t compressed_size = 0;
-    int compress_ret = zstd_compress(buf, size, comp_buf, compress_bound, &compressed_size);
+    off_t write_end = offset + (off_t)size;
 
     /*
-     * Quyết định lưu dưới dạng nén hay raw:
-     * - compress_ret == 0      : nén thành công và đủ hiệu quả.
-     * - compress_ret == -EFBIG : dữ liệu khó nén, lưu raw cho hợp lý hơn.
-     * - compress_ret == -EIO   : lỗi Zstd, vẫn fallback sang raw để tránh mất dữ liệu.
+     * Xác định dải chunk bị tiêu thụ và miền cửa sổ cần repack.
+     * Miền khởi đầu là các cửa sổ 64KB phủ vùng ghi; chunk legacy có thể vắt
+     * qua ranh giới cửa sổ nên miền mở rộng theo fixpoint cho tới khi không
+     * kéo thêm chunk nào nữa (file đã packed: hội tụ ngay vòng đầu).
      */
-    const char *write_buf;
-    size_t write_size;
-    uint8_t codec_type;
+    off_t region_lo = (off_t)WINDOW_BASE(offset);
+    off_t region_hi = (off_t)WINDOW_CEIL(write_end);
+    uint32_t first_idx = 0;
+    uint32_t end_idx = 0;
+    bool changed = true;
+    uint32_t guard_iter = 0;
+    while (changed)
+    {
+        if (guard_iter++ > inode.chunk_map.num_chunks + 1)
+        {
+            /* Miền đơn điệu tăng nên không thể lặp mãi — chặn phòng hờ. */
+            free(inode.chunk_map.chunks);
+            return -EIO;
+        }
+        changed = false;
 
-    if (compress_ret == 0)
-    {
-        write_buf = comp_buf;
-        write_size = compressed_size;
-        codec_type = 1;
-        LOG("[DEBUG] write: compressed %zu → %zu bytes (%.1f%%)\n",
-            size, compressed_size, 100.0 * compressed_size / size);
-    }
-    else
-    {
-        write_buf = buf;
-        write_size = size;
-        codec_type = 0;
-        if (compress_ret == -EIO)
-            LOG("[WARN] write: zstd error, fallback to raw\n");
-        else
-            LOG("[DEBUG] write: incompressible, storing raw\n");
-    }
+        first_idx = 0;
+        while (first_idx < inode.chunk_map.num_chunks)
+        {
+            myfs_chunk_t *c = &inode.chunk_map.chunks[first_idx];
+            if ((off_t)c->logical_offset + (off_t)c->stored_size > region_lo)
+                break;
+            first_idx++;
+        }
 
-    /* Ghi chunk mới vào cuối file .data để tránh ghi đè trực tiếp lên dữ liệu cũ. */
-    int append_fd = open(active_storage.data_path, O_WRONLY | O_CLOEXEC);
-    if (append_fd == -1)
+        off_t min_start = region_lo;
+        off_t max_end = region_hi;
+        end_idx = first_idx;
+        while (end_idx < inode.chunk_map.num_chunks)
+        {
+            myfs_chunk_t *c = &inode.chunk_map.chunks[end_idx];
+            if ((off_t)c->logical_offset >= region_hi)
+                break;
+            off_t c_end = (off_t)c->logical_offset + (off_t)c->stored_size;
+            if ((off_t)c->logical_offset < min_start)
+                min_start = (off_t)c->logical_offset;
+            if (c_end > max_end)
+                max_end = c_end;
+            end_idx++;
+        }
+
+        off_t new_lo = (off_t)WINDOW_BASE(min_start);
+        off_t new_hi = (off_t)WINDOW_CEIL(max_end);
+        if (new_lo < region_lo || new_hi > region_hi)
+        {
+            region_lo = new_lo;
+            region_hi = new_hi;
+            changed = true;
+        }
+    }
+    uint32_t consumed = end_idx - first_idx;
+
+    /*
+     * Một fd O_RDWR duy nhất: engine đọc chunk cũ và append blob mới trên cùng
+     * .data; một fdatasync cho cả batch TRƯỚC khi publish metadata — crash
+     * không thể để .meta tham chiếu blob chưa persist.
+     */
+    int fd = open(active_storage.data_path, O_RDWR | O_CLOEXEC);
+    if (fd == -1)
     {
-        free(comp_buf);
+        free(inode.chunk_map.chunks);
+        return -errno;
+    }
+    off_t eof = lseek(fd, 0, SEEK_END);
+    if (eof < 0)
+    {
+        close(fd);
         free(inode.chunk_map.chunks);
         return -errno;
     }
 
-    off_t physical_offset = lseek(append_fd, 0, SEEK_END);
-    if (physical_offset < 0)
+    myfs_chunk_t *entries = NULL;
+    uint32_t entry_count = 0;
+    ret = myfs_repack_windows(fd, fd, &eof, &inode.chunk_map,
+                              first_idx, consumed, region_lo, region_hi,
+                              buf, offset, size, &entries, &entry_count);
+    if (ret == 0 && fdatasync(fd) != 0)
+        ret = -errno;
+    close(fd);
+    if (ret != 0)
     {
-        close(append_fd);
-        free(comp_buf);
+        free(entries);
         free(inode.chunk_map.chunks);
-        return -errno;
+        return ret;
     }
 
-    /* Ghi dữ liệu mới vào vị trí vật lý vừa xác định. */
-    ssize_t written = pwrite(append_fd, write_buf, write_size, physical_offset);
-    /* Tính CRC32 TRƯỚC khi free(comp_buf) — khi codec=1, write_buf == comp_buf.
-     * free() trước rồi dùng write_buf sẽ là use-after-free → segfault. */
-    uint32_t blob_crc = chunk_crc32(write_buf, write_size);
-    free(comp_buf);
-    close(append_fd);
-    if (written != (ssize_t)write_size)
+    /* Splice mảng chunk: thay dải [first_idx, first_idx+consumed) bằng các
+     * entry cửa sổ mới — giữ nguyên thứ tự sắp xếp theo logical_offset. */
+    uint32_t old_count = inode.chunk_map.num_chunks;
+    uint32_t new_count = old_count - consumed + entry_count;
+    if (entry_count > consumed)
     {
-        free(inode.chunk_map.chunks);
-        return -EIO;
+        myfs_chunk_t *grown = realloc(inode.chunk_map.chunks,
+                                      new_count * sizeof(myfs_chunk_t));
+        if (!grown)
+        {
+            free(entries);
+            free(inode.chunk_map.chunks);
+            return -ENOMEM;
+        }
+        inode.chunk_map.chunks = grown;
     }
-
-    /* Mở rộng mảng chunk metadata và ghi nhận chunk mới vừa được append. */
-    uint32_t new_count = inode.chunk_map.num_chunks + 1;
-    myfs_chunk_t *new_chunks = realloc(inode.chunk_map.chunks,
-                                       new_count * sizeof(myfs_chunk_t));
-    if (!new_chunks)
-    {
-        free(inode.chunk_map.chunks);
-        return -ENOMEM;
-    }
-    inode.chunk_map.chunks = new_chunks;
-
-    myfs_chunk_t *chunk = &inode.chunk_map.chunks[inode.chunk_map.num_chunks];
-    chunk->logical_offset = offset;
-    chunk->physical_offset = physical_offset;
-    chunk->stored_size = size;    // kích thước logical (sau decompress)
-    chunk->raw_size = write_size; // kích thước thực tế trên disk
-    chunk->codec_type = codec_type;
-    chunk->flags = (codec_type == 1) ? 1 : 0;
-    chunk->checksum = blob_crc; /* Đã tính trước free(comp_buf) */
-
+    memmove(&inode.chunk_map.chunks[first_idx + entry_count],
+            &inode.chunk_map.chunks[first_idx + consumed],
+            (old_count - first_idx - consumed) * sizeof(myfs_chunk_t));
+    if (entry_count > 0)
+        memcpy(&inode.chunk_map.chunks[first_idx], entries,
+               entry_count * sizeof(myfs_chunk_t));
     inode.chunk_map.num_chunks = new_count;
+    free(entries);
 
-    /* Đồng bộ logical size giữa inode và chunk_map sau khi append dữ liệu mới. */
-    off_t end_pos = offset + (off_t)size;
-    if (end_pos > (off_t)INODE_LSIZE(inode))
-        INODE_LSIZE(inode) = end_pos;
+    if (write_end > (off_t)INODE_LSIZE(inode))
+        INODE_LSIZE(inode) = write_end;
 
     /* Ghi metadata ra đĩa sau khi chunk map đã được cập nhật đầy đủ. */
     if (save_chunk_map_for_storage(&active_storage, &inode) != 0)
@@ -839,8 +689,8 @@ static int myfs_write_locked(const char *path, const char *buf, size_t size,
 
     free(inode.chunk_map.chunks);
 
-    LOG("[DEBUG] write OK: chunks=%u logical_size=%zu codec=%d\n",
-        new_count, (size_t)INODE_LSIZE(inode), codec_type);
+    LOG("[DEBUG] write OK: consumed=%u windows=%u chunks=%u logical_size=%zu\n",
+        consumed, entry_count, new_count, (size_t)INODE_LSIZE(inode));
 
     return (int)size;
 }

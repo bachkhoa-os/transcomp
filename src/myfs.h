@@ -1,6 +1,9 @@
 #ifndef MYFS_H
 #define MYFS_H
 
+/* Cần cho O_DIRECT (glibc); phải đứng trước mọi include hệ thống. */
+#define _GNU_SOURCE 1
+
 #define FUSE_USE_VERSION 31
 
 #include <fuse.h>
@@ -44,6 +47,11 @@ static inline uint32_t chunk_crc32(const void *buf, size_t size)
 
 #define CHUNK_SIZE (64 * 1024ULL) /* 64 KB */
 
+/* Cửa sổ logic 64KB — bất biến packing: mỗi chunk nằm gọn trong đúng một cửa
+ * sổ và bắt đầu tại k*CHUNK_SIZE (head-aligned). */
+#define WINDOW_BASE(off) ((uint64_t)(off) & ~(CHUNK_SIZE - 1))
+#define WINDOW_CEIL(off) WINDOW_BASE((uint64_t)(off) + CHUNK_SIZE - 1)
+
 typedef struct
 {
     uint64_t logical_offset;  /* Vị trí của chunk trong không gian logic của file. */
@@ -60,6 +68,10 @@ typedef struct
     uint32_t num_chunks;   /* Tổng số chunk hiện có trong file. */
     uint64_t logical_size; /* Kích thước logic tổng cộng của file. */
     myfs_chunk_t *chunks;  /* Mảng metadata cho từng chunk. */
+    bool fully_packed;     /* Derive khi load, KHÔNG serialize xuống disk:
+                            * true nếu mọi chunk thoả bất biến cửa sổ 64KB.
+                            * Cho phép read dùng lookup theo cửa sổ; file
+                            * legacy/không packed rơi về linear scan. */
 } myfs_chunk_map_t;        /* Cấu trúc chunk map của một file. */
 
 typedef struct
@@ -183,6 +195,20 @@ int zstd_compress(const void *src, size_t src_size,
 int zstd_decompress(const void *src, size_t src_size,
                     void *dst, size_t dst_capacity,
                     size_t *decompressed_size);
+int zstd_decompress_prefix(const void *src, size_t src_size,
+                           void *dst, size_t want_size);
+
+/* Engine chunk I/O dùng chung cho write path, truncate, read và compaction. */
+bool chunk_map_is_packed(const myfs_chunk_map_t *map);
+int myfs_chunk_payload_load(int fd, const myfs_chunk_t *chunk, char *dst);
+int myfs_blob_append(int fd, off_t *eof, const char *payload, size_t len,
+                     uint64_t logical_offset, myfs_chunk_t *out);
+int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
+                        const myfs_chunk_map_t *map,
+                        uint32_t first_idx, uint32_t consumed,
+                        off_t region_lo, off_t region_hi,
+                        const char *patch, off_t patch_off, size_t patch_len,
+                        myfs_chunk_t **out_entries, uint32_t *out_count);
 ZSTD_DCtx *zstd_create_dctx(void);
 
 #endif

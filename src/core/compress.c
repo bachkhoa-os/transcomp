@@ -104,6 +104,50 @@ int zstd_decompress(const void *src, size_t src_size,
 }
 
 /*
+ * Giải nén một blob mà frame có thể chứa NHIỀU hơn want_size byte hợp lệ.
+ * Xảy ra với meta cũ bị truncate shrink stored_size trước khi có cơ chế
+ * rewrite chunk: frame trên disk vẫn giữ nội dung đầy đủ, chỉ want_size byte
+ * đầu còn hợp lệ. Ghi đúng want_size byte đầu của frame vào dst.
+ */
+int zstd_decompress_prefix(const void *src, size_t src_size,
+                           void *dst, size_t want_size)
+{
+    unsigned long long content = ZSTD_getFrameContentSize(src, src_size);
+    if (content == ZSTD_CONTENTSIZE_ERROR || content == ZSTD_CONTENTSIZE_UNKNOWN)
+    {
+        LOG("[ERROR] zstd_decompress_prefix: cannot determine frame size\n");
+        return -EIO;
+    }
+    if (content < (unsigned long long)want_size)
+    {
+        LOG("[ERROR] zstd_decompress_prefix: frame=%llu < want=%zu\n",
+            content, want_size);
+        return -EIO;
+    }
+
+    size_t decomp_size = 0;
+    if (content == (unsigned long long)want_size)
+    {
+        int ret = zstd_decompress(src, src_size, dst, want_size, &decomp_size);
+        if (ret != 0)
+            return ret;
+        return (decomp_size == want_size) ? 0 : -EIO;
+    }
+
+    /* Frame dài hơn phần hợp lệ: giải nén ra scratch rồi copy prefix. */
+    char *scratch = malloc((size_t)content);
+    if (!scratch)
+        return -ENOMEM;
+    int ret = zstd_decompress(src, src_size, scratch, (size_t)content, &decomp_size);
+    if (ret == 0 && decomp_size != (size_t)content)
+        ret = -EIO;
+    if (ret == 0)
+        memcpy(dst, scratch, want_size);
+    free(scratch);
+    return ret;
+}
+
+/*
  * Tạo một ZSTD_DCtx có thể tái sử dụng cho các lần giải nén sau.
  * Việc giữ context ở dạng reusable có thể giảm chi phí khởi tạo nếu luồng xử lý
  * thực hiện nhiều thao tác giải nén liên tiếp.

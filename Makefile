@@ -6,7 +6,7 @@ CFLAGS ?= $(DEBUG_CFLAGS)
 LIBS = `pkg-config fuse3 --cflags --libs` -lzstd -lz
 
 # Định nghĩa các thư mục mã nguồn
-CORE_SRCS = src/core/path.c src/core/metadata.c src/core/compress.c src/core/compact.c
+CORE_SRCS = src/core/path.c src/core/metadata.c src/core/compress.c src/core/compact.c src/core/chunkio.c
 OPS_SRCS = src/fuse_ops/file.c src/fuse_ops/dir.c
 GUARD_SRCS = src/guards/guards.c
 

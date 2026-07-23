@@ -342,10 +342,10 @@ try:
         num_chunks, logical_size = struct.unpack('<IQ', f.read(12))
         codecs = []
         for _ in range(num_chunks):
-            data = f.read(30)  # sizeof(myfs_chunk_t) = 8+4+4+1+1+4+8 = 30
-            if len(data) < 30: break
-            # struct layout: logical_offset(8) raw_size(4) stored_size(4) codec_type(1) flags(1) checksum(4) physical_offset(8) = 30? recheck
-            # Try offset 16 for codec_type (after logical_offset+raw_size+stored_size)
+            # sizeof(myfs_chunk_t) = 32 (2 byte padding sau flags);
+            # codec_type nằm tại offset 16 trong record.
+            data = f.read(32)
+            if len(data) < 32: break
             codecs.append(data[16])
     all_raw = all(c == 0 for c in codecs)
     print(f'raw={sum(1 for c in codecs if c==0)}/{len(codecs)} → {\"SKIP OK\" if all_raw else \"COMPRESSED\"}')
@@ -705,8 +705,22 @@ ELAPSED_MS_1KB=$(( (END_NS - START_NS) / 1000000 ))
 SIZE_1KB_MB=1  # ~1024 * 1KB = 1MB
 WRITE_1KB=$(python3 -c "print(f'{$SIZE_1KB_MB * 1000 / $ELAPSED_MS_1KB:.1f} MB/s')")
 AVG_RMW_MS=$(python3 -c "print(f'{$ELAPSED_MS_1KB / 1024:.2f}')")
+sleep 0.5  # đợi release/compact xử lý xong để đọc meta ổn định
+PACK_STATS=$(python3 -c "
+import struct, os
+try:
+    d = open('$BACKING/bm_append_1kb.bin.meta','rb').read()
+    n = struct.unpack_from('<I', d, 0)[0]
+    lsize = struct.unpack_from('<Q', d, 4)[0]
+    disk = os.path.getsize('$BACKING/bm_append_1kb.bin.data')
+    print(f'{n} chunks | logical {lsize/1024:.0f}KB | disk {disk/1024:.0f}KB | ratio {lsize/max(disk,1):.2f}x')
+except Exception as e:
+    print(f'N/A ({e})')
+")
 rm -f "$MOUNT/bm_append_1kb.bin"
 log "  Append 1024x1KB:      ${WRITE_1KB:-N/A}  (avg ${AVG_RMW_MS} ms/write)"
+log "  Chunk packing:        ${PACK_STATS}"
+log "                        (trước 64KB packing: ~1025 chunk nhỏ, ratio kém hơn đáng kể)"
 
 log ""
 log "+--------------------------------+------------------+------------------------------------------+"
