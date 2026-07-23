@@ -20,6 +20,7 @@ void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
  */
 void myfs_destroy(void *private_data)
 {
+    destroy_generation_registry();
     free(private_data);
     LOG("[DEBUG] FUSE destroy called\n");
 }

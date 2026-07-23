@@ -2,12 +2,51 @@
 #include "guards.h"
 #define min(a, b) ((a) < (b) ? (a) : (b))
 
+static myfs_file_handle_t *get_file_handle(struct fuse_file_info *fi)
+{
+    if (!fi || fi->fh == 0)
+        return NULL;
+    return (myfs_file_handle_t *)(uintptr_t)fi->fh;
+}
+
+/* Caller holds myfs_metadata_mutex so the resolved generation cannot be
+ * superseded between opening its descriptors and registering the reference. */
+static int attach_file_handle_locked(const myfs_storage_t *storage, int data_fd,
+                                     int flags, struct fuse_file_info *fi)
+{
+    int meta_fd = open(storage->meta_path, O_RDONLY | O_CLOEXEC);
+    if (meta_fd < 0)
+        return -errno;
+
+    myfs_file_handle_t *handle = calloc(1, sizeof(*handle));
+    if (!handle)
+    {
+        close(meta_fd);
+        return -ENOMEM;
+    }
+    handle->data_fd = data_fd;
+    handle->meta_fd = meta_fd;
+    handle->flags = flags;
+    handle->storage = *storage;
+
+    int ret = register_generation_handle_locked(handle);
+    if (ret != 0)
+    {
+        close(meta_fd);
+        free(handle);
+        return ret;
+    }
+    fi->fh = (uint64_t)(uintptr_t)handle;
+    return 0;
+}
+
 /*
  * Tạo một file thường mới trong filesystem.
  * File dữ liệu thực tế được tạo dưới dạng .data, sau đó metadata .meta được
  * khởi tạo rỗng để bảo đảm đối tượng mới có trạng thái nhất quán ngay từ đầu.
  */
-int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+static int myfs_create_locked(const char *path, mode_t mode,
+                              struct fuse_file_info *fi)
 {
     LOG("[DEBUG] create: %s\n", path);
 
@@ -19,19 +58,44 @@ int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     if (fd == -1)
         return -errno;
 
-    fi->fh = fd;
-
     /* Khởi tạo metadata rỗng tương ứng với file mới tạo. */
-    myfs_inode_t inode = {0};
-    int ret = save_chunk_map(path, &inode);
+    myfs_storage_t storage;
+    int ret = resolve_storage(path, &storage);
     if (ret != 0)
     {
         close(fd);
-        fi->fh = 0;
+        return ret;
+    }
+    myfs_inode_t inode = {0};
+    ret = save_chunk_map_for_storage(&storage, &inode);
+    if (ret != 0)
+    {
+        close(fd);
+        return ret;
+    }
+
+    ret = attach_file_handle_locked(&storage, fd, fi->flags, fi);
+    if (ret != 0)
+    {
+        close(fd);
         return ret;
     }
 
     return 0;
+}
+
+int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
+    if (lock_ret != 0)
+        return -lock_ret;
+
+    int ret = myfs_create_locked(path, mode, fi);
+    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
+    if (unlock_ret != 0)
+        return -unlock_ret;
+
+    return ret;
 }
 
 /*
@@ -39,21 +103,25 @@ int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
  * Nếu kernel yêu cầu mở với O_TRUNC, metadata cũng phải được reset tương ứng
  * để tránh ghép dữ liệu mới lên chunk map cũ.
  */
-int myfs_open(const char *path, struct fuse_file_info *fi)
+static int myfs_open_locked(const char *path, struct fuse_file_info *fi)
 {
     LOG("[DEBUG] open: %s flags=0x%x\n", path, fi->flags);
 
-    char data_path[PATH_MAX];
-    build_data_path(data_path, path);
+    myfs_storage_t storage;
+    int ret = resolve_storage(path, &storage);
+    if (ret != 0)
+        return ret;
 
-    int fd = open(data_path, fi->flags);
+    int recovery_ret = recover_generations_for_path_locked(path, &storage);
+    if (recovery_ret != 0)
+        LOG("[WARN] open: generation recovery returned %d\n", recovery_ret);
+
+    int fd = open(storage.data_path, fi->flags | O_CLOEXEC);
     if (fd == -1)
     {
         perror("[ERROR] open .data");
         return -errno;
     }
-    fi->fh = fd;
-
     /*
      * Khi shell redirect như `echo > file`, kernel thường đi qua open(O_TRUNC)
      * thay vì gọi truncate() tách biệt. Vì vậy cần xoá sạch chunk map tại đây
@@ -64,34 +132,34 @@ int myfs_open(const char *path, struct fuse_file_info *fi)
         LOG("[DEBUG] open: O_TRUNC detected, clearing chunk map\n");
         myfs_inode_t inode = {0};
         /* Chunk map rỗng và logical size bằng 0. */
-        if (save_chunk_map(path, &inode) != 0)
+        if (save_chunk_map_for_storage(&storage, &inode) != 0)
         {
             close(fd);
-            fi->fh = 0;
             return -EIO;
         }
     }
 
-    return 0;
+    ret = attach_file_handle_locked(&storage, fd, fi->flags, fi);
+    if (ret != 0)
+    {
+        close(fd);
+        return ret;
+    }
+    return ret;
 }
 
-/*
- * Lấy file descriptor của .data để phục vụ đọc hoặc ghi.
- * Ưu tiên dùng descriptor có sẵn trong fi->fh; nếu không có thì mở tạm và
- * trả thêm cờ opened để caller biết có cần tự đóng sau khi dùng xong hay không.
- */
-static int open_data_fd(const char *path, struct fuse_file_info *fi, int *opened)
+int myfs_open(const char *path, struct fuse_file_info *fi)
 {
-    *opened = 0;
-    if (fi != NULL && fi->fh != 0)
-        return (int)fi->fh;
+    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
+    if (lock_ret != 0)
+        return -lock_ret;
 
-    char data_path[PATH_MAX];
-    build_data_path(data_path, path);
-    int fd = open(data_path, O_RDWR);
-    if (fd != -1)
-        *opened = 1;
-    return fd;
+    int ret = myfs_open_locked(path, fi);
+    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
+    if (unlock_ret != 0)
+        return -unlock_ret;
+
+    return ret;
 }
 
 /*
@@ -99,13 +167,24 @@ static int open_data_fd(const char *path, struct fuse_file_info *fi, int *opened
  * Hàm xử lý ba trường hợp chính: thu nhỏ về 0, cắt ngắn file, hoặc kéo dài
  * kích thước logic mà chưa tạo thêm chunk mới.
  */
-int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
+static int myfs_truncate_locked(const char *path, off_t size,
+                                struct fuse_file_info *fi)
 {
     LOG("[DEBUG] truncate: %s to %ld bytes\n", path, size);
 
+    myfs_storage_t storage;
+    int ret = resolve_storage(path, &storage);
+    if (ret != 0)
+        return ret;
+
+    myfs_file_handle_t *handle = get_file_handle(fi);
+    if (handle && !storage_generation_equal(&handle->storage, &storage))
+        return -ESTALE;
+
     myfs_inode_t inode = {0};
-    if (load_chunk_map(path, &inode) != 0)
-        return -EIO;
+    ret = load_chunk_map_from_path(storage.meta_path, &inode);
+    if (ret != 0)
+        return ret;
 
     /*
      * Trường hợp 1: truncate về 0.
@@ -114,8 +193,11 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
      */
     if (size == 0)
     {
-        int opened = 0;
-        int fd = open_data_fd(path, fi, &opened);
+        bool opened = false;
+        int fd = handle ? handle->data_fd
+                        : open(storage.data_path, O_RDWR | O_CLOEXEC);
+        if (!handle && fd >= 0)
+            opened = true;
         if (fd == -1)
         {
             perror("[ERROR] truncate: open .data");
@@ -139,7 +221,7 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
         inode.chunk_map.chunks = NULL;
         inode.chunk_map.num_chunks = 0;
         INODE_LSIZE(inode) = 0;
-        return save_chunk_map(path, &inode);
+        return save_chunk_map_for_storage(&storage, &inode);
     }
 
     /*
@@ -168,7 +250,9 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
         }
         inode.chunk_map.num_chunks = keep;
         INODE_LSIZE(inode) = size;
-        return save_chunk_map(path, &inode);
+        ret = save_chunk_map_for_storage(&storage, &inode);
+        free(inode.chunk_map.chunks);
+        return ret;
     }
 
     /*
@@ -177,7 +261,23 @@ int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
      * trống và sẽ đọc ra byte 0 cho tới khi có dữ liệu được ghi vào.
      */
     INODE_LSIZE(inode) = size;
-    return save_chunk_map(path, &inode);
+    ret = save_chunk_map_for_storage(&storage, &inode);
+    free(inode.chunk_map.chunks);
+    return ret;
+}
+
+int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
+{
+    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
+    if (lock_ret != 0)
+        return -lock_ret;
+
+    int ret = myfs_truncate_locked(path, size, fi);
+    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
+    if (unlock_ret != 0)
+        return -unlock_ret;
+
+    return ret;
 }
 
 /*
@@ -190,27 +290,59 @@ int myfs_read(const char *path, char *buf, size_t size,
 {
     LOG("[DEBUG] myfs_read: %s offset=%ld size=%zu\n", path, offset, size);
 
-    /* Nạp chunk map để xác định cấu trúc lưu trữ và logical size hiện tại. */
     myfs_inode_t inode = {0};
+    myfs_file_handle_t *handle = get_file_handle(fi);
+    int fd = -1;
+    int ret;
 
-    if (load_chunk_map(path, &inode) != 0)
-        return -EIO;
+    if (handle)
+    {
+        /* The generation pathname is retained until this handle is released.
+         * The pinned metadata descriptor is a fallback if a backing pathname
+         * disappears because of external interference. */
+        ret = load_chunk_map_from_path(handle->storage.meta_path, &inode);
+        if (ret == -ENOENT)
+            ret = load_chunk_map_from_fd(handle->meta_fd, &inode);
+        if (ret != 0)
+            return ret;
+        fd = dup(handle->data_fd);
+        if (fd < 0)
+        {
+            free(inode.chunk_map.chunks);
+            return -errno;
+        }
+    }
+    else
+    {
+        int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
+        if (lock_ret != 0)
+            return -lock_ret;
+
+        myfs_storage_t storage;
+        ret = resolve_storage(path, &storage);
+        if (ret == 0)
+            ret = load_chunk_map_from_path(storage.meta_path, &inode);
+        if (ret == 0)
+        {
+            fd = open(storage.data_path, O_RDONLY | O_CLOEXEC);
+            if (fd < 0)
+                ret = -errno;
+        }
+        int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
+        if (unlock_ret != 0 && ret == 0)
+            ret = -unlock_ret;
+        if (ret != 0)
+        {
+            free(inode.chunk_map.chunks);
+            return ret;
+        }
+    }
 
     if (offset >= (off_t)INODE_LSIZE(inode))
-        return 0;
-
-    char data_path[PATH_MAX];
-    build_data_path(data_path, path);
-
-    /* Luôn mở .data với O_RDONLY riêng để đảm bảo pread không bị EBADF.
-     * fi->fh có thể là O_WRONLY (dd conv=notrunc) hoặc O_RDWR — không đảm bảo
-     * read được trên mọi trường hợp. Mở fd riêng an toàn hơn. */
-    int fd = open(data_path, O_RDONLY);
-    if (fd == -1)
     {
-        perror("[ERROR] open .data for read");
+        close(fd);
         free(inode.chunk_map.chunks);
-        return -errno;
+        return 0;
     }
 
     size_t bytes_read = 0;
@@ -334,6 +466,7 @@ int myfs_read(const char *path, char *buf, size_t size,
     }
 
     close(fd);
+    free(inode.chunk_map.chunks);
 
     LOG("[DEBUG] myfs_read success: read %zu bytes\n", bytes_read);
     return (int)bytes_read;
@@ -344,7 +477,7 @@ int myfs_read(const char *path, char *buf, size_t size,
  * Thay vì ghi đè trực tiếp lên blob cũ, hàm gom các chunk bị chồng lấn vào một
  * vùng làm việc, áp patch dữ liệu mới, rồi ghi lại thành một blob mới ở cuối file.
  */
-static int write_rmw(const char *path, int fd,
+static int write_rmw(const myfs_storage_t *storage,
                      const char *buf, size_t size, off_t offset,
                      myfs_inode_t *inode, uint32_t chunk_idx)
 {
@@ -378,9 +511,7 @@ static int write_rmw(const char *path, int fd,
         return -ENOMEM;
 
     /* Đọc và giải nén từng chunk vào đúng vị trí tương ứng trong work buffer. */
-    char data_path[PATH_MAX];
-    build_data_path(data_path, path);
-    int read_fd = open(data_path, O_RDONLY);
+    int read_fd = open(storage->data_path, O_RDONLY | O_CLOEXEC);
     if (read_fd == -1)
     {
         free(work_buf);
@@ -486,9 +617,7 @@ static int write_rmw(const char *path, int fd,
     }
 
     /* Ghi blob mới vào cuối file .data để tránh ghi đè trực tiếp dữ liệu cũ. */
-    build_data_path(data_path, path);
-
-    int append_fd = open(data_path, O_WRONLY);
+    int append_fd = open(storage->data_path, O_WRONLY | O_CLOEXEC);
     if (append_fd == -1)
     {
         free(comp_buf);
@@ -545,7 +674,7 @@ static int write_rmw(const char *path, int fd,
         INODE_LSIZE(*inode) = write_end;
     }
 
-    return save_chunk_map(path, inode);
+    return save_chunk_map_for_storage(storage, inode);
 }
 
 /*
@@ -553,23 +682,30 @@ static int write_rmw(const char *path, int fd,
  * một phần dữ liệu đã tồn tại. Hàm này quyết định nhánh xử lý dựa trên
  * metadata hiện hành và chỉ trả về số byte đã ghi khi thao tác thành công.
  */
-int myfs_write(const char *path, const char *buf, size_t size,
-               off_t offset, struct fuse_file_info *fi)
+static int myfs_write_locked(const char *path, const char *buf, size_t size,
+                             off_t offset, struct fuse_file_info *fi)
 {
     LOG("[DEBUG] write: %s offset=%ld size=%zu\n", path, offset, size);
 
     if (size == 0)
         return 0;
 
-    if (!fi || fi->fh <= 0)
+    myfs_file_handle_t *handle = get_file_handle(fi);
+    if (!handle)
         return -EIO;
 
-    int fd = (int)fi->fh;
+    myfs_storage_t active_storage;
+    int ret = resolve_storage(path, &active_storage);
+    if (ret != 0)
+        return ret;
+    if (!storage_generation_equal(&handle->storage, &active_storage))
+        return -ESTALE;
 
     /* Nạp metadata để biết cấu trúc chunk hiện tại trước khi ghi. */
     myfs_inode_t inode = {0};
-    if (load_chunk_map(path, &inode) != 0)
-        return -EIO;
+    ret = load_chunk_map_from_path(active_storage.meta_path, &inode);
+    if (ret != 0)
+        return ret;
 
     int32_t chunk_idx = -1;
     for (uint32_t i = 0; i < inode.chunk_map.num_chunks; i++)
@@ -590,7 +726,7 @@ int myfs_write(const char *path, const char *buf, size_t size,
          * FUSE kỳ vọng số byte đã ghi khi thành công, vì vậy cần chuyển mã
          * kết quả từ write_rmw sang đúng giá trị trả về cho kernel.
          */
-        int rmw_ret = write_rmw(path, fd, buf, size, offset,
+        int rmw_ret = write_rmw(&active_storage, buf, size, offset,
                                 &inode, (uint32_t)chunk_idx);
         free(inode.chunk_map.chunks);
         return (rmw_ret == 0) ? (int)size : rmw_ret;
@@ -637,9 +773,7 @@ int myfs_write(const char *path, const char *buf, size_t size,
     }
 
     /* Ghi chunk mới vào cuối file .data để tránh ghi đè trực tiếp lên dữ liệu cũ. */
-    char data_path[PATH_MAX];
-    build_data_path(data_path, path);
-    int append_fd = open(data_path, O_WRONLY);
+    int append_fd = open(active_storage.data_path, O_WRONLY | O_CLOEXEC);
     if (append_fd == -1)
     {
         free(comp_buf);
@@ -697,7 +831,7 @@ int myfs_write(const char *path, const char *buf, size_t size,
         INODE_LSIZE(inode) = end_pos;
 
     /* Ghi metadata ra đĩa sau khi chunk map đã được cập nhật đầy đủ. */
-    if (save_chunk_map(path, &inode) != 0)
+    if (save_chunk_map_for_storage(&active_storage, &inode) != 0)
     {
         free(inode.chunk_map.chunks);
         return -EIO;
@@ -711,21 +845,54 @@ int myfs_write(const char *path, const char *buf, size_t size,
     return (int)size;
 }
 
+int myfs_write(const char *path, const char *buf, size_t size,
+               off_t offset, struct fuse_file_info *fi)
+{
+    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
+    if (lock_ret != 0)
+        return -lock_ret;
+
+    int ret = myfs_write_locked(path, buf, size, offset, fi);
+    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
+    if (unlock_ret != 0)
+        return -unlock_ret;
+
+    return ret;
+}
+
 /* Giải phóng file descriptor gắn với file đang mở. */
 int myfs_release(const char *path, struct fuse_file_info *fi)
 {
-    /* Đồng bộ dữ liệu trước khi đóng để đảm bảo tính toàn vẹn. */
-    if (fi->fh > 0)
+    myfs_file_handle_t *handle = get_file_handle(fi);
+    if (handle)
     {
-        fsync(fi->fh);
-        close(fi->fh);
+        int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
+        if (lock_ret != 0)
+            return -lock_ret;
+
+        /* Removing the registry reference before retrying GC is the exact point
+         * at which this generation can become deletion-eligible. */
+        unregister_generation_handle_locked(handle);
+        fsync(handle->data_fd);
+        close(handle->data_fd);
+        close(handle->meta_fd);
         fi->fh = 0;
+
+        int gc_ret = run_generation_gc_locked();
+        int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
+        free(handle);
+        if (unlock_ret != 0)
+            return -unlock_ret;
+        if (gc_ret != 0)
+            LOG("[WARN] release: deferred GC returned %d\n", gc_ret);
     }
 
     /* Compaction: thu hồi không gian của orphan blob sinh ra sau RMW.
      * Chỉ thực hiện khi wasted ratio >= COMPACT_THRESHOLD (25%).
-     * Gọi sau close() để fd không còn giữ lock trên .data. */
-    compact_data_file(path);
+     * Gọi sau khi handle writer đã rời registry. */
+    int compact_ret = compact_data_file(path);
+    if (compact_ret != 0)
+        LOG("[WARN] release: compact returned %d\n", compact_ret);
 
     return 0;
 }
