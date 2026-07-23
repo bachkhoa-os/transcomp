@@ -13,9 +13,26 @@
 MOUNT="${1:-mountpoint}"
 BACKING="${2:-backing}"
 RESULT_FILE="benchmark_results.txt"
-TMP_DIR="/tmp/myfs_bench"
 
-mkdir -p "$TMP_DIR"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+TMP_PARENT="${MYFS_BENCH_TMP_PARENT:-$SCRIPT_DIR}"
+TMP_PARENT="$(realpath -e -- "$TMP_PARENT")" || {
+    echo "ERROR: benchmark temp parent does not exist: '$TMP_PARENT'" >&2
+    exit 1
+}
+
+BASELINE_FS_TYPE="$(stat -f -c %T -- "$TMP_PARENT" 2>/dev/null)" || {
+    echo "ERROR: cannot determine filesystem type for '$TMP_PARENT'." >&2
+    exit 1
+}
+
+case "$BASELINE_FS_TYPE" in
+    tmpfs|ramfs)
+        echo "ERROR: benchmark temp parent '$TMP_PARENT' is $BASELINE_FS_TYPE, not disk-backed." >&2
+        echo "       Set MYFS_BENCH_TMP_PARENT to a real disk-backed directory." >&2
+        exit 1
+        ;;
+esac
 
 # ── màu sắc ──────────────────────────────────────────────────────────────────
 CYAN='\033[0;36m'
@@ -92,16 +109,23 @@ if ! mountpoint -q "$MOUNT" 2>/dev/null; then
     fi
 fi
 
+TMP_DIR="$(mktemp -d "$TMP_PARENT/.myfs_bench.XXXXXX")" || {
+    echo "ERROR: cannot create benchmark temp directory under '$TMP_PARENT'." >&2
+    exit 1
+}
+
 # ── header ───────────────────────────────────────────────────────────────────
 echo "" > "$RESULT_FILE"
 echo "myfs Benchmark Report" >> "$RESULT_FILE"
 echo "Date: $(date '+%Y-%m-%d %H:%M:%S')" >> "$RESULT_FILE"
 echo "Host: $(uname -n) | Kernel: $(uname -r)" >> "$RESULT_FILE"
+echo "Baseline temp: $TMP_DIR | Filesystem: $BASELINE_FS_TYPE" >> "$RESULT_FILE"
 echo "" >> "$RESULT_FILE"
 
 echo ""
 echo -e "${CYAN}myfs Benchmark — $(date '+%Y-%m-%d %H:%M:%S')${NC}"
 echo -e "mountpoint: ${MOUNT}  backing: ${BACKING}"
+echo -e "baseline: ${TMP_DIR} (${BASELINE_FS_TYPE})"
 echo ""
 
 # =============================================================================
@@ -735,7 +759,7 @@ ANALYZE_EOF
 # =============================================================================
 # Cleanup
 # =============================================================================
-rm -rf "$TMP_DIR"
+rm -rf -- "$TMP_DIR"
 rm -f "$MOUNT"/bm_*.bin 2>/dev/null
 
 echo ""

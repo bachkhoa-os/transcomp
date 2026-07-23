@@ -1,10 +1,5 @@
 # myfs — Transparent Compression Filesystem
 
-**Project No:** 25228 | **Course:** Operating Systems \[Multimedia\] - 20252  
-**Members:** Hoàng Phi Hùng (20223991) · Khúc Văn Đại (20223895) · Nguyễn Đức Toàn (20224164)
-
----
-
 ## Giới thiệu
 
 myfs là một FUSE-based filesystem hỗ trợ **transparent compression** — ứng dụng gọi `open()`, `read()`, `write()` hoàn toàn bình thường như với ext4 hay NTFS, nhưng bên dưới filesystem tự động nén dữ liệu trước khi lưu xuống disk và giải nén khi đọc ra. Người dùng và ứng dụng không biết dữ liệu đang được nén.
@@ -52,9 +47,13 @@ Application (cat, cp, grep, ...)
         │
         ▼
   backing/ (directory trên ext4)
-    file.txt.data   ← compressed blobs
-    file.txt.meta   ← chunk map binary
+    file.txt.data      ← compressed blobs
+    file.txt.meta      ← chunk map binary
+    file.txt.current   ← symlink → generation active (xuất hiện sau compaction)
+    file.txt.g.<hex>/  ← generation directory (data + meta)
 ```
+
+Sau lần compaction đầu tiên, storage của file chuyển sang **generation model**: mỗi lần compact tạo một generation directory mới, publish bằng atomic symlink rename (`.current`), còn `.data`/`.meta` được giữ dưới dạng hard-link alias để debug/benchmark vẫn quan sát được file vật lý đang active. Generation cũ được GC thu hồi khi không còn handle nào mở.
 
 ### Thiết kế chunk-based
 
@@ -85,7 +84,7 @@ transcomp/
 │   │   ├── path.c        ← build_path(), build_data_path(), build_meta_path()
 │   │   ├── metadata.c    ← load_chunk_map(), save_chunk_map() với atomic write
 │   │   ├── compress.c    ← zstd_compress(), zstd_decompress(), is_incompressible()
-│   │   └── compact.c     ← compact_data_file(): GC thu hồi orphan blobs sau RMW
+│   │   └── compact.c     ← Compaction sang generation mới + generation GC registry
 │   ├── fuse_ops/
 │   │   ├── file.c        ← myfs_read, myfs_write, write_rmw, myfs_truncate,
 │   │   │                    myfs_create, myfs_open, myfs_release
@@ -94,7 +93,7 @@ transcomp/
 │   └── guards/
 │       ├── guards.h
 │       └── guards.c      ← Validation functions: chunk metadata, bounds, pread result
-├── backing/              ← Backing store (.data + .meta cho mỗi file)
+├── backing/              ← Backing store (.data/.meta + generation dirs sau compaction)
 └── mountpoint/           ← Mount point (giao diện logic cho user)
 ```
 
@@ -190,10 +189,13 @@ make demo
 
 ## Known limitations
 
-- **Chunk packing chưa thực sự 64 KB:** mỗi `write()` call tạo 1 chunk riêng. File nhỏ nhiều write call sẽ có nhiều chunk nhỏ → compression ratio thấp hơn lý thuyết.
-- **Orphan blob GC synchronous:** compact chạy trong `release()`, không có background thread.
-- **Single source of truth cho `logical_size`:** hai field `inode.logical_size` và `chunk_map.logical_size` phải được sync thủ công — technical debt đã được document.
-- **No crash recovery:** atomic rename bảo vệ metadata, nhưng không có journaling đầy đủ.
+- **Chunk packing chưa thực sự 64 KB:** mỗi `write()` call tạo 1 chunk riêng. File nhỏ nhiều write call sẽ có nhiều chunk nhỏ → compression ratio thấp hơn lý thuyết. `CHUNK_SIZE` hiện chỉ dùng làm ngưỡng cho compaction.
+- **GC/compaction synchronous:** generation GC và compaction chạy trong `release()` dưới global mutex, không có background thread.
+- **Global mutex:** mọi thao tác mutate serialize qua một mutex toàn cục (per-file locking là bước cải tiến sau, không đổi on-disk format).
+- **Crash recovery một phần:** metadata và compaction đã crash-safe (generation + owner marker + fsync parent dir + lazy recovery khi open/getattr), nhưng data blob chỉ được fsync khi `release()` — crash trước đó có thể để `.meta` trỏ tới blob chưa persist. CRC32 phát hiện trường hợp này và trả `-EIO` thay vì đọc sai dữ liệu.
+- **Truncate vào giữa chunk nén làm hỏng chunk:** truncate về size nằm giữa một chunk `codec_type=1` chỉ giảm `stored_size` mà không ghi lại blob → lần đọc sau decompress vào buffer nhỏ hơn frame thật → `-EIO`.
+- **Write vào sparse hole chồng lên chunk sau → stale read:** write bắt đầu trong hole nhưng kéo dài qua chunk hiện có sẽ append chunk mới chồng lấn dải logic; read scan tuyến tính gặp chunk cũ trước nên vùng chồng lấn đọc ra dữ liệu cũ.
+- **`readdir` giới hạn 2048 entry:** bảng dedup cố định trên stack; entry logic vượt quá 2048 không được emit (biến mất khỏi `ls`).
 
 ---
 

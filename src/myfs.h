@@ -5,6 +5,7 @@
 
 #include <fuse.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +15,8 @@
 #include <dirent.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <stdbool.h>
+#include <pthread.h>
 #include <zstd.h>
 #include <zlib.h>
 
@@ -73,10 +76,62 @@ struct myfs_config
     char root[PATH_MAX];
 };
 
+#define MYFS_GENERATION_HEX_LEN 32
+
+/* A resolved, immutable identity for one physical data/metadata pair.  Files
+ * without a .current pointer use the legacy .data/.meta pair.  Compaction is
+ * the only operation allowed to create a non-legacy storage generation. */
+typedef struct
+{
+    char logical_path[PATH_MAX];
+    char generation_id[MYFS_GENERATION_HEX_LEN + 1];
+    char generation_dir[PATH_MAX];
+    char marker_path[PATH_MAX];
+    char data_path[PATH_MAX];
+    char meta_path[PATH_MAX];
+    dev_t data_dev;
+    ino_t data_ino;
+    bool is_legacy;
+} myfs_storage_t;
+
+struct myfs_generation_record;
+
+/* fi->fh stores a pointer to this structure, rather than a bare descriptor.
+ * Both descriptors pin the selected generation for the complete FUSE handle
+ * lifetime; the registry record supplies the GC open-reference count. */
+typedef struct
+{
+    int data_fd;
+    int meta_fd;
+    int flags;
+    myfs_storage_t storage;
+    struct myfs_generation_record *generation_record;
+} myfs_file_handle_t;
+
+/* Coarse-grained serialization for operations that mutate a logical file's
+ * data/chunk-map pair. This is intentionally global for the first correctness
+ * pass; it can later be replaced with per-file locks without changing the
+ * on-disk format. */
+extern pthread_mutex_t myfs_metadata_mutex;
+
 /* Dựng các đường dẫn vật lý từ path logic của FUSE. */
 void build_path(char *dest, const char *path);
 void build_data_path(char *dest, const char *path);
 void build_meta_path(char *dest, const char *path);
+void build_current_path(char *dest, const char *path);
+int resolve_storage(const char *path, myfs_storage_t *storage);
+int build_generation_storage(const char *path, const char *generation_id,
+                             myfs_storage_t *storage);
+int validate_generation_marker(const myfs_storage_t *storage);
+int create_generation_storage(const char *path, mode_t data_mode,
+                              myfs_storage_t *storage);
+int publish_generation(const char *path, const myfs_storage_t *storage);
+int fsync_parent_path(const char *path);
+int install_generation_aliases(const char *path,
+                               const myfs_storage_t *storage);
+int remove_generation_storage(const myfs_storage_t *storage);
+bool storage_generation_equal(const myfs_storage_t *a,
+                              const myfs_storage_t *b);
 
 /* Khởi tạo filesystem, thiết lập cấu hình runtime và bật các tuỳ chọn cần thiết. */
 void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg);
@@ -103,6 +158,22 @@ int myfs_unlink(const char *path);
 
 int load_chunk_map(const char *path, myfs_inode_t *inode);
 int save_chunk_map(const char *path, myfs_inode_t *inode);
+int load_chunk_map_from_path(const char *meta_path, myfs_inode_t *inode);
+int load_chunk_map_from_fd(int meta_fd, myfs_inode_t *inode);
+int save_chunk_map_to_path(const char *meta_path, myfs_inode_t *inode);
+int save_chunk_map_for_storage(const myfs_storage_t *storage,
+                               myfs_inode_t *inode);
+
+int register_generation_handle_locked(myfs_file_handle_t *handle);
+void unregister_generation_handle_locked(myfs_file_handle_t *handle);
+unsigned generation_writer_refs_locked(const myfs_storage_t *storage);
+unsigned generation_open_refs_locked(const myfs_storage_t *storage);
+int mark_generation_for_gc_locked(const myfs_storage_t *storage,
+                                  bool install_aliases);
+int run_generation_gc_locked(void);
+int recover_generations_for_path_locked(const char *path,
+                                        const myfs_storage_t *active);
+void destroy_generation_registry(void);
 int compact_data_file(const char *path);
 int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi);
 int myfs_utimens(const char *path, const struct timespec tv[2], struct fuse_file_info *fi);
