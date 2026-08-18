@@ -16,9 +16,9 @@ int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi
     if (stat(real_path, stbuf) == 0 && S_ISDIR(stbuf->st_mode))
         return 0; /* Nếu là thư mục thì trả về ngay. */
 
-    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-    if (lock_ret != 0)
-        return -lock_ret;
+    myfs_file_lock_t *lk = myfs_lock_file(path);
+    if (!lk)
+        return -ENOMEM;
 
     myfs_file_handle_t *handle = (fi && fi->fh != 0)
         ? (myfs_file_handle_t *)(uintptr_t)fi->fh : NULL;
@@ -59,10 +59,7 @@ int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi
     }
     free(inode.chunk_map.chunks);
 
-    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
-    if (unlock_ret != 0 && ret == 0)
-        ret = -unlock_ret;
-
+    myfs_unlock_file(lk);
     return ret;
 }
 
@@ -289,7 +286,7 @@ static int myfs_unlink_locked(const char *path)
         ret = mark_generation_for_gc_locked(&storage, false);
         if (ret != 0)
             return ret;
-        return run_generation_gc_locked();
+        return run_generation_gc_locked(path);
     }
 
     char data_path[PATH_MAX];
@@ -316,15 +313,12 @@ static int myfs_unlink_locked(const char *path)
 
 int myfs_unlink(const char *path)
 {
-    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-    if (lock_ret != 0)
-        return -lock_ret;
+    myfs_file_lock_t *lk = myfs_lock_file(path);
+    if (!lk)
+        return -ENOMEM;
 
     int ret = myfs_unlink_locked(path);
-    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
-    if (unlock_ret != 0)
-        return -unlock_ret;
-
+    myfs_unlock_file(lk);
     return ret;
 }
 

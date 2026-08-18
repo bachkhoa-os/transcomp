@@ -120,11 +120,23 @@ typedef struct
     struct myfs_generation_record *generation_record;
 } myfs_file_handle_t;
 
-/* Coarse-grained serialization for operations that mutate a logical file's
- * data/chunk-map pair. This is intentionally global for the first correctness
- * pass; it can later be replaced with per-file locks without changing the
- * on-disk format. */
-extern pthread_mutex_t myfs_metadata_mutex;
+/* Per-file locking: mọi thao tác mutate trên một file logic serialize qua
+ * lock của path đó (hàm *_locked = caller đang giữ file lock); thao tác trên
+ * các file khác nhau chạy song song. Registry generation và compaction queue
+ * có mutex riêng (leaf lock — luôn lấy SAU file lock, không bao giờ ngược). */
+typedef struct myfs_file_lock myfs_file_lock_t;
+myfs_file_lock_t *myfs_lock_file(const char *path);
+void myfs_unlock_file(myfs_file_lock_t *lk);
+void destroy_lock_table(void);
+
+/* Cấu hình mount toàn cục (set trong main) — cho worker thread ngoài FUSE ctx. */
+extern struct myfs_config *myfs_conf;
+
+/* Background compaction worker: release() chỉ enqueue, worker thread chạy
+ * compact dưới file lock của path tương ứng. */
+int start_compaction_worker(void);
+void stop_compaction_worker(void);
+int schedule_compaction(const char *path);
 
 /* Dựng các đường dẫn vật lý từ path logic của FUSE. */
 void build_path(char *dest, const char *path);
@@ -182,7 +194,9 @@ unsigned generation_writer_refs_locked(const myfs_storage_t *storage);
 unsigned generation_open_refs_locked(const myfs_storage_t *storage);
 int mark_generation_for_gc_locked(const myfs_storage_t *storage,
                                   bool install_aliases);
-int run_generation_gc_locked(void);
+/* GC các generation pending của một path (caller giữ file lock của path đó);
+ * path == NULL = quét tất cả (chỉ dùng lúc destroy, single-thread). */
+int run_generation_gc_locked(const char *path);
 int recover_generations_for_path_locked(const char *path,
                                         const myfs_storage_t *active);
 void destroy_generation_registry(void);

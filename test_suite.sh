@@ -480,7 +480,9 @@ SIZE_INITIAL=$(stat -c%s "$BACKING/tc18_gc.bin.data")
 for i in $(seq 1 5); do
     dd if=/dev/urandom bs=512K count=1 of="$MOUNT/tc18_gc.bin" conv=notrunc 2>/dev/null
 done
- 
+
+# Compaction giờ chạy trên background worker — chờ worker xử lý xong queue
+sleep 2
 SIZE_FINAL=$(stat -c%s "$BACKING/tc18_gc.bin.data")
  
 # Sau compact chạy liên tục, disk size không được > 2x initial
@@ -918,6 +920,64 @@ with open('$MOUNT/tc27_unsorted.bin','rb') as f:
 print('OK' if data == b'X'*100 + b'Y'*100 else 'BAD %r' % data[:10])
 ")
 assert_eq "TC27.4 — meta chưa sắp xếp: sort-on-load, đọc đúng nội dung" "OK" "$UNSORTED_OK"
+
+# =============================================================================
+section "TC28: Per-file locking — ghi song song nhiều file"
+# =============================================================================
+
+# 4 writer song song trên 4 file khác nhau — với per-file locking chúng chạy
+# đồng thời; kiểm tra không có corruption chéo giữa các file.
+rm -f "$MOUNT"/tc28_par_*.bin
+for i in 1 2 3 4; do
+    python3 -c "
+import os
+fd = os.open('$MOUNT/tc28_par_$i.bin', os.O_CREAT | os.O_WRONLY, 0o644)
+for j in range(64):
+    os.write(fd, bytes([($i * 16 + j) % 256]) * 8192)
+os.close(fd)
+" &
+done
+wait
+
+PAR_OK="ALL"
+for i in 1 2 3 4; do
+    ONE=$(python3 -c "
+data = open('$MOUNT/tc28_par_$i.bin','rb').read()
+expect = b''.join(bytes([($i * 16 + j) % 256]) * 8192 for j in range(64))
+print('OK' if data == expect else 'BAD')
+" 2>/dev/null)
+    [ "$ONE" = "OK" ] || PAR_OK="BAD file $i"
+done
+assert_eq "TC28.1 — 4 writer song song: nội dung cả 4 file đúng" "ALL" "$PAR_OK"
+
+SIZES_OK=$(python3 -c "
+import os
+sizes = [os.path.getsize('$MOUNT/tc28_par_%d.bin' % i) for i in (1,2,3,4)]
+print('OK' if all(s == 64*8192 for s in sizes) else 'BAD %r' % sizes)
+")
+assert_eq "TC28.2 — logical size cả 4 file = 512KB" "OK" "$SIZES_OK"
+
+# =============================================================================
+section "TC29: Background compaction — thu hồi waste không chặn release"
+# =============================================================================
+
+# Ghi đè nhiều lần tạo orphan blob; release chỉ enqueue, worker thu hồi sau.
+rm -f "$MOUNT/tc29_bg.bin"
+dd if=/dev/urandom bs=256K count=1 of="$MOUNT/tc29_bg.bin" 2>/dev/null
+for i in 1 2 3; do
+    dd if=/dev/urandom bs=256K count=1 of="$MOUNT/tc29_bg.bin" conv=notrunc 2>/dev/null
+done
+sleep 2   # chờ worker xử lý queue
+LOGICAL=$(stat -c%s "$MOUNT/tc29_bg.bin")
+DISK=$(stat -c%s "$BACKING/tc29_bg.bin.data")
+if [ "$DISK" -le "$((LOGICAL * 2))" ]; then
+    ok "TC29.1 — worker thu hồi waste (logical=${LOGICAL} disk=${DISK})"
+else
+    fail "TC29.1 — waste không được thu hồi" "<= $((LOGICAL * 2))" "$DISK"
+fi
+
+READ_OK=$(cat "$MOUNT/tc29_bg.bin" 2>/dev/null | wc -c)
+assert_eq "TC29.2 — đọc lại đúng số byte sau background compact" "$LOGICAL" "$READ_OK"
 
 # =============================================================================
 # Cleanup thêm

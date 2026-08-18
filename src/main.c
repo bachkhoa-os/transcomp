@@ -9,6 +9,9 @@ void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
     (void)conn;
     cfg->kernel_cache = 1;
+    /* Compaction/GC chạy trên worker thread riêng — release() chỉ enqueue.
+     * Nếu start fail, schedule_compaction tự fallback về chạy đồng bộ. */
+    start_compaction_worker();
     LOG("[DEBUG] FUSE init called\n");
     return fuse_get_context()->private_data;
 }
@@ -20,7 +23,12 @@ void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
  */
 void myfs_destroy(void *private_data)
 {
+    /* Worker phải dừng (drain hết queue) trước khi giải phóng registry,
+     * lock table và config mà nó còn dùng. */
+    stop_compaction_worker();
     destroy_generation_registry();
+    destroy_lock_table();
+    myfs_conf = NULL;
     free(private_data);
     LOG("[DEBUG] FUSE destroy called\n");
 }
@@ -83,6 +91,9 @@ int main(int argc, char *argv[])
         return 1;
     }
     printf("[DEBUG] backing dir = %s\n", conf->root);
+    /* Expose config toàn cục để build_path hoạt động cả trên worker thread
+     * (ngoài FUSE callback không có fuse_context hợp lệ). */
+    myfs_conf = conf;
 
     /*
      * Fuse nhận cấu hình qua private_data, vì vậy loại bỏ backing_dir khỏi argv

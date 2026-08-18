@@ -86,15 +86,12 @@ static int myfs_create_locked(const char *path, mode_t mode,
 
 int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
-    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-    if (lock_ret != 0)
-        return -lock_ret;
+    myfs_file_lock_t *lk = myfs_lock_file(path);
+    if (!lk)
+        return -ENOMEM;
 
     int ret = myfs_create_locked(path, mode, fi);
-    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
-    if (unlock_ret != 0)
-        return -unlock_ret;
-
+    myfs_unlock_file(lk);
     return ret;
 }
 
@@ -153,15 +150,12 @@ static int myfs_open_locked(const char *path, struct fuse_file_info *fi)
 
 int myfs_open(const char *path, struct fuse_file_info *fi)
 {
-    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-    if (lock_ret != 0)
-        return -lock_ret;
+    myfs_file_lock_t *lk = myfs_lock_file(path);
+    if (!lk)
+        return -ENOMEM;
 
     int ret = myfs_open_locked(path, fi);
-    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
-    if (unlock_ret != 0)
-        return -unlock_ret;
-
+    myfs_unlock_file(lk);
     return ret;
 }
 
@@ -333,15 +327,12 @@ static int myfs_truncate_locked(const char *path, off_t size,
 
 int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
 {
-    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-    if (lock_ret != 0)
-        return -lock_ret;
+    myfs_file_lock_t *lk = myfs_lock_file(path);
+    if (!lk)
+        return -ENOMEM;
 
     int ret = myfs_truncate_locked(path, size, fi);
-    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
-    if (unlock_ret != 0)
-        return -unlock_ret;
-
+    myfs_unlock_file(lk);
     return ret;
 }
 
@@ -379,9 +370,9 @@ int myfs_read(const char *path, char *buf, size_t size,
     }
     else
     {
-        int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-        if (lock_ret != 0)
-            return -lock_ret;
+        myfs_file_lock_t *lk = myfs_lock_file(path);
+        if (!lk)
+            return -ENOMEM;
 
         myfs_storage_t storage;
         ret = resolve_storage(path, &storage);
@@ -393,9 +384,7 @@ int myfs_read(const char *path, char *buf, size_t size,
             if (fd < 0)
                 ret = -errno;
         }
-        int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
-        if (unlock_ret != 0 && ret == 0)
-            ret = -unlock_ret;
+        myfs_unlock_file(lk);
         if (ret != 0)
         {
             free(inode.chunk_map.chunks);
@@ -698,15 +687,12 @@ static int myfs_write_locked(const char *path, const char *buf, size_t size,
 int myfs_write(const char *path, const char *buf, size_t size,
                off_t offset, struct fuse_file_info *fi)
 {
-    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-    if (lock_ret != 0)
-        return -lock_ret;
+    myfs_file_lock_t *lk = myfs_lock_file(path);
+    if (!lk)
+        return -ENOMEM;
 
     int ret = myfs_write_locked(path, buf, size, offset, fi);
-    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
-    if (unlock_ret != 0)
-        return -unlock_ret;
-
+    myfs_unlock_file(lk);
     return ret;
 }
 
@@ -716,9 +702,9 @@ int myfs_release(const char *path, struct fuse_file_info *fi)
     myfs_file_handle_t *handle = get_file_handle(fi);
     if (handle)
     {
-        int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-        if (lock_ret != 0)
-            return -lock_ret;
+        myfs_file_lock_t *lk = myfs_lock_file(path);
+        if (!lk)
+            return -ENOMEM;
 
         /* Removing the registry reference before retrying GC is the exact point
          * at which this generation can become deletion-eligible. */
@@ -728,21 +714,19 @@ int myfs_release(const char *path, struct fuse_file_info *fi)
         close(handle->meta_fd);
         fi->fh = 0;
 
-        int gc_ret = run_generation_gc_locked();
-        int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
+        int gc_ret = run_generation_gc_locked(path);
+        myfs_unlock_file(lk);
         free(handle);
-        if (unlock_ret != 0)
-            return -unlock_ret;
         if (gc_ret != 0)
             LOG("[WARN] release: deferred GC returned %d\n", gc_ret);
     }
 
-    /* Compaction: thu hồi không gian của orphan blob sinh ra sau RMW.
-     * Chỉ thực hiện khi wasted ratio >= COMPACT_THRESHOLD (25%).
-     * Gọi sau khi handle writer đã rời registry. */
-    int compact_ret = compact_data_file(path);
+    /* Compaction chạy trên background worker — release chỉ enqueue path,
+     * không còn trả tiền compact/GC đồng bộ trong FUSE op. Worker sẽ lấy
+     * file lock của path khi xử lý. */
+    int compact_ret = schedule_compaction(path);
     if (compact_ret != 0)
-        LOG("[WARN] release: compact returned %d\n", compact_ret);
+        LOG("[WARN] release: compact scheduling returned %d\n", compact_ret);
 
     return 0;
 }

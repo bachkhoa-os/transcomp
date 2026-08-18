@@ -5,10 +5,17 @@
 
 #define MYFS_GENERATION_MARKER_PREFIX "MYFS_GENERATION_V1 "
 
-/* Access the mount configuration through the active FUSE request context. */
+/* Cấu hình mount toàn cục — set một lần trong main() trước fuse_main().
+ * Cho phép build_path hoạt động cả ngoài FUSE callback (background worker
+ * thread không có fuse_context hợp lệ). */
+struct myfs_config *myfs_conf = NULL;
+
 static inline struct myfs_config *get_conf(void)
 {
-    return (struct myfs_config *)fuse_get_context()->private_data;
+    if (myfs_conf)
+        return myfs_conf;
+    struct fuse_context *ctx = fuse_get_context();
+    return ctx ? (struct myfs_config *)ctx->private_data : NULL;
 }
 
 void build_path(char *dest, const char *path)

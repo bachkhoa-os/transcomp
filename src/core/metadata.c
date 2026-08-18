@@ -2,8 +2,6 @@
 
 #include <inttypes.h>
 
-pthread_mutex_t myfs_metadata_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static int pread_full(int fd, void *buf, size_t size, off_t offset)
 {
     char *cursor = buf;
