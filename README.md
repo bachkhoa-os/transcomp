@@ -85,7 +85,8 @@ transcomp/
 │   │   ├── metadata.c    ← load_chunk_map(), save_chunk_map() với atomic write
 │   │   ├── compress.c    ← zstd_compress(), zstd_decompress(), is_incompressible()
 │   │   ├── chunkio.c     ← Engine chung: payload load, blob append, repack cửa sổ 64KB
-│   │   └── compact.c     ← Compaction sang generation mới + GC registry + migration repack
+│   │   ├── lock.c        ← Per-file lock table (mutex theo path, refcount)
+│   │   └── compact.c     ← Compaction generation + GC registry + background worker
 │   ├── fuse_ops/
 │   │   ├── file.c        ← myfs_read, myfs_write, write_rmw, myfs_truncate,
 │   │   │                    myfs_create, myfs_open, myfs_release
@@ -138,7 +139,7 @@ make umount
 make test
 ```
 
-80 test cases cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing 64KB, migration file legacy.
+84 test cases cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing 64KB, migration file legacy, ghi song song per-file locking, background compaction.
 
 ### Benchmark
 
@@ -161,6 +162,8 @@ make bench
 | Directory + `.data`/`.meta` | Dễ debug (hexdump trực tiếp), dễ implement atomic write |
 | Append-only blob | Tránh in-place rewrite, đơn giản, atomic với rename |
 | Checkpoint + atomic rename | Tránh journaling phức tạp, đủ cho prototype 8 tuần |
+| Per-file lock + leaf mutex | File khác nhau chạy song song; thứ tự lock cố định → không deadlock |
+| Background compaction thread | `release()` không trả tiền GC/compact; queue dedupe, drain khi unmount |
 
 ---
 
@@ -185,11 +188,10 @@ make bench
 
 ## Known limitations
 
-- **GC/compaction synchronous:** generation GC và compaction chạy trong `release()` dưới global mutex, không có background thread. *(kế hoạch: upscale phase)*
-- **Global mutex:** mọi thao tác mutate serialize qua một mutex toàn cục (per-file locking là bước cải tiến sau, không đổi on-disk format). *(kế hoạch: upscale phase)*
 - **Chunk legacy cực lớn decompress nguyên khối:** file từ format cũ có chunk đã merge rất lớn sẽ được giải nén nguyên khối vào RAM ở lần chạm đầu (migration); streaming Zstd là follow-up nếu thành vấn đề.
+- **Một worker compaction duy nhất:** queue FIFO một thread — đủ cho tải hiện tại; nhiều worker là bước mở rộng sau.
 
-Các hạng mục đã hoàn thành (regression test TC19–TC27): sparse-hole write chồng lấn → stale read; hole đọc ra EOF thay vì byte 0; truncate vào giữa chunk nén làm hỏng chunk; `readdir` mất entry sau 2048 file; `fdatasync` blob trước khi publish metadata (crash-safe ordering); **chunk packing 64 KB thực sự** — bất biến cửa sổ head-aligned, append merge vào chunk đuôi, read lookup theo cửa sổ, migration tự động cho file legacy qua compaction.
+Các hạng mục đã hoàn thành (regression test TC19–TC29): sparse-hole write chồng lấn → stale read; hole đọc ra EOF thay vì byte 0; truncate vào giữa chunk nén làm hỏng chunk; `readdir` mất entry sau 2048 file; `fdatasync` blob trước khi publish metadata (crash-safe ordering); **chunk packing 64 KB thực sự** — bất biến cửa sổ head-aligned, append merge vào chunk đuôi, read lookup theo cửa sổ, migration tự động cho file legacy; **per-file locking** — thao tác trên các file khác nhau chạy song song, registry/queue dùng leaf mutex riêng (thứ tự lock cố định: file lock → leaf, không thể deadlock); **background compaction** — `release()` chỉ enqueue, worker thread compact dưới file lock của path, drain sạch queue khi unmount.
 
 ---
 

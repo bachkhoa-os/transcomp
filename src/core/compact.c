@@ -16,6 +16,11 @@ struct myfs_generation_record
 
 static struct myfs_generation_record *generation_registry;
 
+/* Leaf mutex bảo vệ danh sách registry và các field của record. Luôn được
+ * lấy SAU file lock (không bao giờ lấy file lock khi đang giữ registry_mu),
+ * và không giữ mutex nào khác bên trong — không thể deadlock. */
+static pthread_mutex_t registry_mu = PTHREAD_MUTEX_INITIALIZER;
+
 #ifdef MYFS_TEST_FAILPOINTS
 static void compact_test_failpoint(const char *path, const char *name,
                                    const myfs_storage_t *storage)
@@ -79,14 +84,19 @@ int register_generation_handle_locked(myfs_file_handle_t *handle)
         handle->storage.data_ino = st.st_ino;
     }
 
+    pthread_mutex_lock(&registry_mu);
     struct myfs_generation_record *record = get_generation_record(&handle->storage);
     if (!record)
+    {
+        pthread_mutex_unlock(&registry_mu);
         return -ENOMEM;
+    }
 
     record->open_refs++;
     if ((handle->flags & O_ACCMODE) != O_RDONLY)
         record->writer_refs++;
     handle->generation_record = record;
+    pthread_mutex_unlock(&registry_mu);
     return 0;
 }
 
@@ -96,6 +106,7 @@ void unregister_generation_handle_locked(myfs_file_handle_t *handle)
     if (!record)
         return;
 
+    pthread_mutex_lock(&registry_mu);
     if (record->open_refs > 0)
         record->open_refs--;
     if ((handle->flags & O_ACCMODE) != O_RDONLY && record->writer_refs > 0)
@@ -113,31 +124,44 @@ void unregister_generation_handle_locked(myfs_file_handle_t *handle)
             free(record);
         }
     }
+    pthread_mutex_unlock(&registry_mu);
 }
 
 unsigned generation_writer_refs_locked(const myfs_storage_t *storage)
 {
+    pthread_mutex_lock(&registry_mu);
     struct myfs_generation_record *record = find_generation_record(storage);
-    return record ? record->writer_refs : 0;
+    unsigned refs = record ? record->writer_refs : 0;
+    pthread_mutex_unlock(&registry_mu);
+    return refs;
 }
 
 unsigned generation_open_refs_locked(const myfs_storage_t *storage)
 {
+    pthread_mutex_lock(&registry_mu);
     struct myfs_generation_record *record = find_generation_record(storage);
-    return record ? record->open_refs : 0;
+    unsigned refs = record ? record->open_refs : 0;
+    pthread_mutex_unlock(&registry_mu);
+    return refs;
 }
 
 int mark_generation_for_gc_locked(const myfs_storage_t *storage,
                                   bool install_aliases)
 {
+    pthread_mutex_lock(&registry_mu);
     struct myfs_generation_record *record = get_generation_record(storage);
     if (!record)
+    {
+        pthread_mutex_unlock(&registry_mu);
         return -ENOMEM;
+    }
     record->gc_pending = true;
     record->install_aliases = record->install_aliases || install_aliases;
+    pthread_mutex_unlock(&registry_mu);
     return 0;
 }
 
+/* Gọi khi ĐANG giữ registry_mu (từ vòng GC). */
 static unsigned legacy_refs_for_path(const char *path)
 {
     unsigned refs = 0;
@@ -151,17 +175,21 @@ static unsigned legacy_refs_for_path(const char *path)
     return refs;
 }
 
-/* Run only while myfs_metadata_mutex is held.  A record enters this list only
- * after the pointer rename and its parent-directory fsync have succeeded. */
-int run_generation_gc_locked(void)
+/* Caller giữ file lock của `path` (hoặc path == NULL lúc destroy). Chỉ xử lý
+ * record của path đó — record của path khác thuộc quyền file lock khác.
+ * A record enters this list only after the pointer rename and its
+ * parent-directory fsync have succeeded. */
+int run_generation_gc_locked(const char *path)
 {
     int first_error = 0;
+    pthread_mutex_lock(&registry_mu);
     struct myfs_generation_record **cursor = &generation_registry;
 
     while (*cursor)
     {
         struct myfs_generation_record *record = *cursor;
-        if (!record->gc_pending)
+        if (!record->gc_pending ||
+            (path && strcmp(record->storage.logical_path, path) != 0))
         {
             cursor = &record->next;
             continue;
@@ -238,6 +266,7 @@ int run_generation_gc_locked(void)
         *cursor = record->next;
         free(record);
     }
+    pthread_mutex_unlock(&registry_mu);
     return first_error;
 }
 
@@ -362,7 +391,7 @@ int recover_generations_for_path_locked(const char *path,
     }
     closedir(dir);
 
-    int gc_ret = run_generation_gc_locked();
+    int gc_ret = run_generation_gc_locked(path);
     if (gc_ret != 0 && ret == 0)
         ret = gc_ret;
     return ret;
@@ -370,6 +399,7 @@ int recover_generations_for_path_locked(const char *path,
 
 void destroy_generation_registry(void)
 {
+    pthread_mutex_lock(&registry_mu);
     struct myfs_generation_record *record = generation_registry;
     while (record)
     {
@@ -378,6 +408,7 @@ void destroy_generation_registry(void)
         record = next;
     }
     generation_registry = NULL;
+    pthread_mutex_unlock(&registry_mu);
 }
 
 static int pread_full_at(int fd, void *buf, size_t size, off_t offset)
@@ -603,7 +634,7 @@ static int compact_data_file_locked(const char *path)
 
     ret = mark_generation_for_gc_locked(&old_storage, true);
     if (ret == 0)
-        ret = run_generation_gc_locked();
+        ret = run_generation_gc_locked(path);
 
     free(inode.chunk_map.chunks);
     LOG("[DEBUG] compact: committed generation=%s new_data_size=%lld (was %lld)\n",
@@ -614,13 +645,139 @@ static int compact_data_file_locked(const char *path)
 
 int compact_data_file(const char *path)
 {
-    int lock_ret = pthread_mutex_lock(&myfs_metadata_mutex);
-    if (lock_ret != 0)
-        return -lock_ret;
+    myfs_file_lock_t *lk = myfs_lock_file(path);
+    if (!lk)
+        return -ENOMEM;
 
     int ret = compact_data_file_locked(path);
-    int unlock_ret = pthread_mutex_unlock(&myfs_metadata_mutex);
-    if (unlock_ret != 0)
-        return -unlock_ret;
+    myfs_unlock_file(lk);
     return ret;
+}
+
+/* =========================================================================
+ * Background compaction worker.
+ * release() chỉ enqueue path; worker thread lấy file lock của path và chạy
+ * compact — FUSE op không còn trả tiền compact/GC đồng bộ. Queue dedupe
+ * theo path; destroy drain hết queue trước khi thoát.
+ * ========================================================================= */
+
+struct compact_request
+{
+    char *path;
+    struct compact_request *next;
+};
+
+static pthread_mutex_t compact_queue_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t compact_queue_cv = PTHREAD_COND_INITIALIZER;
+static struct compact_request *compact_queue_head;
+static struct compact_request *compact_queue_tail;
+static pthread_t compact_worker_thread;
+static bool compact_worker_running;
+static bool compact_worker_stop;
+
+int schedule_compaction(const char *path)
+{
+    pthread_mutex_lock(&compact_queue_mu);
+    if (!compact_worker_running)
+    {
+        /* Worker chưa chạy (init fail hoặc đang shutdown): fallback đồng bộ
+         * như hành vi cũ để không bỏ sót việc thu hồi. */
+        pthread_mutex_unlock(&compact_queue_mu);
+        return compact_data_file(path);
+    }
+    for (struct compact_request *r = compact_queue_head; r; r = r->next)
+    {
+        if (strcmp(r->path, path) == 0)
+        {
+            pthread_mutex_unlock(&compact_queue_mu);
+            return 0; /* đã có trong hàng đợi */
+        }
+    }
+    struct compact_request *req = malloc(sizeof(*req));
+    char *copy = req ? strdup(path) : NULL;
+    if (!req || !copy)
+    {
+        free(req);
+        free(copy);
+        pthread_mutex_unlock(&compact_queue_mu);
+        return -ENOMEM;
+    }
+    req->path = copy;
+    req->next = NULL;
+    if (compact_queue_tail)
+        compact_queue_tail->next = req;
+    else
+        compact_queue_head = req;
+    compact_queue_tail = req;
+    pthread_cond_signal(&compact_queue_cv);
+    pthread_mutex_unlock(&compact_queue_mu);
+    return 0;
+}
+
+static void *compact_worker(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&compact_queue_mu);
+    for (;;)
+    {
+        while (!compact_queue_head && !compact_worker_stop)
+            pthread_cond_wait(&compact_queue_cv, &compact_queue_mu);
+        if (!compact_queue_head)
+            break; /* stop được bật và queue đã drain sạch */
+
+        struct compact_request *req = compact_queue_head;
+        compact_queue_head = req->next;
+        if (!compact_queue_head)
+            compact_queue_tail = NULL;
+        pthread_mutex_unlock(&compact_queue_mu);
+
+        int ret = compact_data_file(req->path);
+        if (ret != 0)
+            LOG("[WARN] background compact %s returned %d\n", req->path, ret);
+        free(req->path);
+        free(req);
+
+        pthread_mutex_lock(&compact_queue_mu);
+    }
+    pthread_mutex_unlock(&compact_queue_mu);
+    return NULL;
+}
+
+int start_compaction_worker(void)
+{
+    pthread_mutex_lock(&compact_queue_mu);
+    if (compact_worker_running)
+    {
+        pthread_mutex_unlock(&compact_queue_mu);
+        return 0;
+    }
+    compact_worker_stop = false;
+    int ret = pthread_create(&compact_worker_thread, NULL, compact_worker, NULL);
+    if (ret == 0)
+        compact_worker_running = true;
+    pthread_mutex_unlock(&compact_queue_mu);
+    if (ret != 0)
+        LOG("[WARN] compaction worker start failed (%d), compact chạy đồng bộ\n",
+            ret);
+    return -ret;
+}
+
+void stop_compaction_worker(void)
+{
+    pthread_mutex_lock(&compact_queue_mu);
+    if (!compact_worker_running)
+    {
+        pthread_mutex_unlock(&compact_queue_mu);
+        return;
+    }
+    compact_worker_stop = true;
+    pthread_cond_broadcast(&compact_queue_cv);
+    pthread_mutex_unlock(&compact_queue_mu);
+
+    pthread_join(compact_worker_thread, NULL);
+
+    pthread_mutex_lock(&compact_queue_mu);
+    compact_worker_running = false;
+    compact_worker_stop = false;
+    pthread_mutex_unlock(&compact_queue_mu);
 }
