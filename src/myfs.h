@@ -39,18 +39,21 @@ static inline uint32_t chunk_crc32(const void *buf, size_t size)
 #define LOG(fmt, ...) do { \
     struct timespec _ts; \
     clock_gettime(CLOCK_REALTIME, &_ts); \
-    struct tm *_tm = localtime(&_ts.tv_sec); \
+    struct tm _tm_storage; \
+    struct tm *_tm = localtime_r(&_ts.tv_sec, &_tm_storage); \
     fprintf(stderr, "[%02d:%02d:%02d.%03ld] " fmt, \
             _tm->tm_hour, _tm->tm_min, _tm->tm_sec, \
             _ts.tv_nsec / 1000000, ##__VA_ARGS__); \
 } while(0)
 
-#define CHUNK_SIZE (64 * 1024ULL) /* 64 KB */
+#define CHUNK_SIZE (64 * 1024ULL) /* legacy/default: 64 KiB */
+#define MYFS_MIN_WINDOW_SIZE (16U * 1024U)
+#define MYFS_DEFAULT_WINDOW_SIZE ((uint32_t)CHUNK_SIZE)
+#define MYFS_MAX_WINDOW_SIZE (1024U * 1024U)
 
-/* Cửa sổ logic 64KB — bất biến packing: mỗi chunk nằm gọn trong đúng một cửa
- * sổ và bắt đầu tại k*CHUNK_SIZE (head-aligned). */
-#define WINDOW_BASE(off) ((uint64_t)(off) & ~(CHUNK_SIZE - 1))
-#define WINDOW_CEIL(off) WINDOW_BASE((uint64_t)(off) + CHUNK_SIZE - 1)
+#define MYFS_META_VERSION_LEGACY 0U
+#define MYFS_META_VERSION_V1 1U
+#define MYFS_META_VERSION_V2 2U
 
 typedef struct
 {
@@ -69,7 +72,7 @@ typedef struct
     uint64_t logical_size; /* Kích thước logic tổng cộng của file. */
     myfs_chunk_t *chunks;  /* Mảng metadata cho từng chunk. */
     bool fully_packed;     /* Derive khi load, KHÔNG serialize xuống disk:
-                            * true nếu mọi chunk thoả bất biến cửa sổ 64KB.
+                            * true nếu mọi chunk thoả window_size của inode.
                             * Cho phép read dùng lookup theo cửa sổ; file
                             * legacy/không packed rơi về linear scan. */
 } myfs_chunk_map_t;        /* Cấu trúc chunk map của một file. */
@@ -77,6 +80,12 @@ typedef struct
 typedef struct
 {
     myfs_chunk_map_t chunk_map; /* Chunk map hiện hành của file. */
+    uint32_t window_size;       /* Fixed window size for this generation. */
+    uint16_t metadata_version;  /* Decoded on-disk metadata version. */
+    uint64_t metadata_sequence; /* Last committed base/delta sequence. */
+    uint32_t metadata_delta_count;
+    uint64_t metadata_journal_bytes;
+    off_t metadata_valid_end;   /* End of last committed metadata record. */
 } myfs_inode_t;                 /* Lớp chứa metadata inode, có thể mở rộng về sau. */
 
 /* Single source of truth cho logical size: luôn dùng macro này,
@@ -108,16 +117,36 @@ typedef struct
 
 struct myfs_generation_record;
 
+typedef struct
+{
+    uint64_t full_windows;
+    uint64_t partial_rmw;
+} myfs_window_stats_t;
+
+typedef struct
+{
+    bool valid;
+    myfs_storage_t source_storage;
+    myfs_window_stats_t stats_snapshot;
+    uint64_t evaluation_id;
+} myfs_adaptive_ticket_t;
+
 /* fi->fh stores a pointer to this structure, rather than a bare descriptor.
  * Both descriptors pin the selected generation for the complete FUSE handle
  * lifetime; the registry record supplies the GC open-reference count. */
-typedef struct
+typedef struct myfs_file_handle
 {
     int data_fd;
     int meta_fd;
     int flags;
     myfs_storage_t storage;
+    pthread_rwlock_t cache_lock;
+    myfs_inode_t cached_inode;
+    uint64_t seen_metadata_epoch;
+    bool cache_valid;
     struct myfs_generation_record *generation_record;
+    struct myfs_file_handle *registry_prev;
+    struct myfs_file_handle *registry_next;
 } myfs_file_handle_t;
 
 /* Per-file locking: mọi thao tác mutate trên một file logic serialize qua
@@ -137,6 +166,16 @@ extern struct myfs_config *myfs_conf;
 int start_compaction_worker(void);
 void stop_compaction_worker(void);
 int schedule_compaction(const char *path);
+int schedule_adaptive_compaction(const char *path,
+                                 const myfs_adaptive_ticket_t *ticket);
+int schedule_release_compaction(const char *path,
+                                const myfs_adaptive_ticket_t *ticket);
+int myfs_choose_resize_target(uint32_t current_window, uint64_t live_bytes,
+                              myfs_window_stats_t stats, bool in_cooldown,
+                              uint32_t *target_window);
+/* Caller holds the logical file lock; this function serializes the handle
+ * cache with live generation handoff through cache_lock. */
+int myfs_refresh_handle_cache_locked(myfs_file_handle_t *handle);
 
 /* Dựng các đường dẫn vật lý từ path logic của FUSE. */
 void build_path(char *dest, const char *path);
@@ -187,9 +226,24 @@ int load_chunk_map_from_fd(int meta_fd, myfs_inode_t *inode);
 int save_chunk_map_to_path(const char *meta_path, myfs_inode_t *inode);
 int save_chunk_map_for_storage(const myfs_storage_t *storage,
                                myfs_inode_t *inode);
+int append_chunk_map_delta_to_fd(int meta_fd, myfs_inode_t *inode,
+                                 uint32_t first_idx, uint32_t removed_count,
+                                 uint32_t added_count);
 
 int register_generation_handle_locked(myfs_file_handle_t *handle);
 void unregister_generation_handle_locked(myfs_file_handle_t *handle);
+void generation_state_snapshot(myfs_file_handle_t *handle,
+                               uint64_t *metadata_epoch, bool *superseded);
+uint64_t generation_bump_metadata_epoch_locked(myfs_file_handle_t *handle);
+void generation_bump_storage_epoch_locked(const myfs_storage_t *storage);
+bool generation_observe_write_locked(myfs_file_handle_t *handle,
+                                     uint64_t full_windows,
+                                     uint64_t partial_rmw,
+                                     myfs_adaptive_ticket_t *ticket);
+bool generation_claim_release_locked(myfs_file_handle_t *handle,
+                                     myfs_adaptive_ticket_t *ticket);
+void generation_adaptive_schedule_failed(
+    const myfs_adaptive_ticket_t *ticket);
 unsigned generation_writer_refs_locked(const myfs_storage_t *storage);
 unsigned generation_open_refs_locked(const myfs_storage_t *storage);
 int mark_generation_for_gc_locked(const myfs_storage_t *storage,
@@ -213,16 +267,18 @@ int zstd_decompress_prefix(const void *src, size_t src_size,
                            void *dst, size_t want_size);
 
 /* Engine chunk I/O dùng chung cho write path, truncate, read và compaction. */
-bool chunk_map_is_packed(const myfs_chunk_map_t *map);
+bool myfs_window_size_valid(uint32_t window_size);
+uint64_t myfs_window_base(uint64_t offset, uint32_t window_size);
+int myfs_window_ceil(uint64_t offset, uint32_t window_size, uint64_t *result);
+bool chunk_map_is_packed(const myfs_chunk_map_t *map, uint32_t window_size);
 int myfs_chunk_payload_load(int fd, const myfs_chunk_t *chunk, char *dst);
 int myfs_blob_append(int fd, off_t *eof, const char *payload, size_t len,
                      uint64_t logical_offset, myfs_chunk_t *out);
 int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
                         const myfs_chunk_map_t *map,
+                        uint32_t window_size,
                         uint32_t first_idx, uint32_t consumed,
                         off_t region_lo, off_t region_hi,
                         const char *patch, off_t patch_off, size_t patch_len,
                         myfs_chunk_t **out_entries, uint32_t *out_count);
-ZSTD_DCtx *zstd_create_dctx(void);
-
 #endif

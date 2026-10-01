@@ -53,13 +53,38 @@ static int pwrite_all(int fd, const void *buf, size_t size, off_t offset)
  * (⇒ không chồng lấn, không vắt qua cửa sổ). Derive tại thời điểm load thay
  * vì persist một flag — flag có thể stale sau crash, còn derive tự lành.
  */
-bool chunk_map_is_packed(const myfs_chunk_map_t *map)
+bool myfs_window_size_valid(uint32_t window_size)
 {
+    return window_size >= MYFS_MIN_WINDOW_SIZE &&
+           window_size <= MYFS_MAX_WINDOW_SIZE &&
+           (window_size & (window_size - 1U)) == 0;
+}
+
+uint64_t myfs_window_base(uint64_t offset, uint32_t window_size)
+{
+    return offset & ~((uint64_t)window_size - 1U);
+}
+
+int myfs_window_ceil(uint64_t offset, uint32_t window_size, uint64_t *result)
+{
+    if (!result || !myfs_window_size_valid(window_size))
+        return -EINVAL;
+    uint64_t mask = (uint64_t)window_size - 1U;
+    if (offset > UINT64_MAX - mask)
+        return -EOVERFLOW;
+    *result = (offset + mask) & ~mask;
+    return 0;
+}
+
+bool chunk_map_is_packed(const myfs_chunk_map_t *map, uint32_t window_size)
+{
+    if (!myfs_window_size_valid(window_size))
+        return false;
     for (uint32_t i = 0; i < map->num_chunks; i++)
     {
         const myfs_chunk_t *c = &map->chunks[i];
-        if (c->logical_offset % CHUNK_SIZE != 0 ||
-            c->stored_size == 0 || c->stored_size > CHUNK_SIZE)
+        if (c->logical_offset % window_size != 0 ||
+            c->stored_size == 0 || c->stored_size > window_size)
             return false;
         if (i > 0 && c->logical_offset <= map->chunks[i - 1].logical_offset)
             return false;
@@ -163,6 +188,7 @@ int myfs_blob_append(int fd, off_t *eof, const char *payload, size_t len,
  */
 int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
                         const myfs_chunk_map_t *map,
+                        uint32_t window_size,
                         uint32_t first_idx, uint32_t consumed,
                         off_t region_lo, off_t region_hi,
                         const char *patch, off_t patch_off, size_t patch_len,
@@ -172,11 +198,21 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
     *out_count = 0;
     if (region_hi <= region_lo)
         return 0;
+    if (!myfs_window_size_valid(window_size) || region_lo < 0 || region_hi < 0)
+        return -EINVAL;
 
-    uint32_t max_windows =
-        (uint32_t)((WINDOW_CEIL(region_hi) - WINDOW_BASE(region_lo)) / CHUNK_SIZE);
+    uint64_t ceil_hi;
+    int ret = myfs_window_ceil((uint64_t)region_hi, window_size, &ceil_hi);
+    if (ret != 0)
+        return ret;
+    uint64_t base_lo = myfs_window_base((uint64_t)region_lo, window_size);
+    uint64_t max_windows64 = (ceil_hi - base_lo) / window_size;
+    if (max_windows64 > UINT32_MAX ||
+        max_windows64 > SIZE_MAX / sizeof(myfs_chunk_t))
+        return -EFBIG;
+    uint32_t max_windows = (uint32_t)max_windows64;
     myfs_chunk_t *entries = malloc((size_t)max_windows * sizeof(*entries));
-    char *win_buf = malloc(CHUNK_SIZE);
+    char *win_buf = malloc(window_size);
     if (!entries || !win_buf)
     {
         free(entries);
@@ -184,16 +220,16 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
         return -ENOMEM;
     }
 
-    int ret = 0;
+    ret = 0;
     uint32_t count = 0;
     /* Cache payload của chunk vắt qua nhiều cửa sổ (legacy) — giải nén 1 lần. */
     int64_t cached_idx = -1;
     char *cached_payload = NULL;
 
-    off_t win = (off_t)WINDOW_BASE(region_lo);
+    off_t win = (off_t)myfs_window_base((uint64_t)region_lo, window_size);
     while (win < region_hi && ret == 0)
     {
-        off_t win_end = win + (off_t)CHUNK_SIZE;
+        off_t win_end = win + (off_t)window_size;
 
         /* Nguồn dữ liệu kế tiếp từ vị trí win — cho phép nhảy qua các cửa sổ
          * trống của file sparse thay vì memset 64KB vô ích cho từng cửa sổ. */
@@ -220,7 +256,7 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
         {
             if (next_data >= region_hi)
                 break;
-            win = (off_t)WINDOW_BASE(next_data);
+            win = (off_t)myfs_window_base((uint64_t)next_data, window_size);
             continue;
         }
 
@@ -230,15 +266,15 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
             patch_off + (off_t)patch_len >= win_end)
         {
             ret = myfs_blob_append(dst_fd, eof, patch + (win - patch_off),
-                                   (size_t)CHUNK_SIZE, (uint64_t)win,
+                                   (size_t)window_size, (uint64_t)win,
                                    &entries[count]);
             if (ret == 0)
                 count++;
-            win += (off_t)CHUNK_SIZE;
+            win += (off_t)window_size;
             continue;
         }
 
-        memset(win_buf, 0, CHUNK_SIZE);
+        memset(win_buf, 0, window_size);
         size_t win_used = 0;
 
         /* Ghép phần giao của các source chunk vào cửa sổ. */
@@ -308,7 +344,7 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
             if (ret == 0)
                 count++;
         }
-        win += (off_t)CHUNK_SIZE;
+        win += (off_t)window_size;
     }
 
     free(cached_payload);

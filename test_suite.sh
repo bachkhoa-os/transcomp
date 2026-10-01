@@ -109,12 +109,15 @@ if [ ! -d "$MOUNT" ]; then
     exit 1
 fi
 
-if ! mountpoint -q "$MOUNT" 2>/dev/null; then
-    # Một số hệ thống không có mountpoint command, thử cách khác
-    if ! ls "$MOUNT" > /dev/null 2>&1; then
-        echo -e "${RED}ERROR: '$MOUNT' chưa được mount.${NC}"
-        exit 1
-    fi
+if ! command -v mountpoint > /dev/null 2>&1; then
+    echo -e "${RED}ERROR: cần tiện ích 'mountpoint' để xác minh FUSE mount.${NC}"
+    exit 1
+fi
+
+if ! mountpoint -q -- "$MOUNT" 2>/dev/null; then
+    echo -e "${RED}ERROR: '$MOUNT' chưa được mount.${NC}"
+    echo "Khởi động myfs trước: ./myfs -f '$MOUNT' '$BACKING'"
+    exit 1
 fi
 
 echo ""
@@ -150,12 +153,8 @@ assert_content "TC02.1 — overwrite bằng redirect" \
     "SECOND VERSION" "$MOUNT/test_trunc.txt"
 
 # chunk map phải reset về 1 chunk (không accumulate từ lần write cũ)
-NUM_CHUNKS=$(python3 -c "
-import struct, sys
-with open('$BACKING/test_trunc.txt.meta', 'rb') as f:
-    n = struct.unpack('<I', f.read(4))[0]
-print(n)
-" 2>/dev/null)
+NUM_CHUNKS=$(python3 tests/meta_inspect.py count \
+    "$BACKING/test_trunc.txt.meta" 2>/dev/null)
 assert_eq "TC02.2 — chunk map không accumulate sau overwrite" "1" "$NUM_CHUNKS"
 
 # =============================================================================
@@ -201,27 +200,14 @@ section "TC06: Magic byte detection (incompressible formats)"
 
 # JPEG magic: FF D8 FF E0
 printf '\xFF\xD8\xFF\xE0test jpeg content' > "$MOUNT/magic_jpeg.jpg"
-CODEC=$(python3 -c "
-import struct
-with open('$BACKING/magic_jpeg.jpg.meta', 'rb') as f:
-    f.read(4)   # num_chunks
-    f.read(8)   # logical_size
-    # chunk: logical_offset(8) + raw_size(4) + stored_size(4) + codec_type(1)
-    f.read(8); f.read(4); f.read(4)
-    codec = struct.unpack('B', f.read(1))[0]
-print(codec)
-" 2>/dev/null)
+CODEC=$(python3 tests/meta_inspect.py codec0 \
+    "$BACKING/magic_jpeg.jpg.meta" 2>/dev/null)
 assert_eq "TC06.1 — JPEG magic byte → codec=0 (raw)" "0" "$CODEC"
 
 # ZIP magic: 50 4B 03 04
 printf '\x50\x4B\x03\x04test zip content' > "$MOUNT/magic_zip.zip"
-CODEC=$(python3 -c "
-import struct
-with open('$BACKING/magic_zip.zip.meta', 'rb') as f:
-    f.read(4); f.read(8); f.read(8); f.read(4); f.read(4)
-    codec = struct.unpack('B', f.read(1))[0]
-print(codec)
-" 2>/dev/null)
+CODEC=$(python3 tests/meta_inspect.py codec0 \
+    "$BACKING/magic_zip.zip.meta" 2>/dev/null)
 assert_eq "TC06.2 — ZIP magic byte → codec=0 (raw)" "0" "$CODEC"
 
 # =============================================================================
@@ -414,13 +400,8 @@ echo "UPDATED" > "$MOUNT/tc15_persist.txt"
 assert_content "TC15.2 — write sau nhiều lần đọc" "UPDATED" "$MOUNT/tc15_persist.txt"
 
 # Verify backing store nhất quán với mountpoint
-META_SIZE=$(python3 -c "
-import struct
-with open('$BACKING/tc15_persist.txt.meta', 'rb') as f:
-    f.read(4)  # num_chunks
-    size = struct.unpack('<Q', f.read(8))[0]
-print(size)
-" 2>/dev/null)
+META_SIZE=$(python3 tests/meta_inspect.py logical-size \
+    "$BACKING/tc15_persist.txt.meta" 2>/dev/null)
 MOUNT_SIZE=$(stat -c%s "$MOUNT/tc15_persist.txt")
 assert_eq "TC15.3 — logical_size trong .meta khớp với stat" "$MOUNT_SIZE" "$META_SIZE"
 
@@ -528,12 +509,12 @@ print('OK' if data == expect else 'MISMATCH tail=%r' % data[96:])
 assert_eq "TC19.1 — write phủ hole+chunk: dữ liệu mới thắng (direct read)" "OK" "$ACTUAL"
 
 OVERLAP=$(python3 -c "
-import struct
-d = open('$BACKING/tc19_overlap.bin.meta','rb').read()
-n = struct.unpack_from('<I', d, 0)[0]
-ranges = sorted((struct.unpack_from('<Q', d, 12+32*i)[0],
-                 struct.unpack_from('<Q', d, 12+32*i)[0] +
-                 struct.unpack_from('<I', d, 12+32*i+12)[0]) for i in range(n))
+import sys
+sys.path.insert(0, 'tests')
+from meta_inspect import load_meta
+m = load_meta('$BACKING/tc19_overlap.bin.meta')
+ranges = sorted((c['logical_offset'], c['logical_offset'] + c['stored_size'])
+                for c in m['chunks'])
 ok = all(ranges[i][1] <= ranges[i+1][0] for i in range(len(ranges)-1))
 print('OK' if ok else 'OVERLAP %r' % ranges)
 ")
@@ -551,13 +532,14 @@ os.pwrite(fd, b'EE', 50)
 os.close(fd)
 "
 SORTED=$(python3 -c "
-import struct
-d = open('$BACKING/tc19_sparse.bin.meta','rb').read()
-n = struct.unpack_from('<I', d, 0)[0]
-offs = [struct.unpack_from('<Q', d, 12+32*i)[0] for i in range(n)]
-ends = [offs[i] + struct.unpack_from('<I', d, 12+32*i+12)[0] for i in range(n)]
-ok = n >= 1 and offs == sorted(offs) and \
-     all(ends[i] <= offs[i+1] for i in range(n-1))
+import sys
+sys.path.insert(0, 'tests')
+from meta_inspect import load_meta
+m = load_meta('$BACKING/tc19_sparse.bin.meta')
+offs = [c['logical_offset'] for c in m['chunks']]
+ends = [c['logical_offset'] + c['stored_size'] for c in m['chunks']]
+ok = len(offs) >= 1 and offs == sorted(offs) and \
+     all(ends[i] <= offs[i+1] for i in range(len(offs)-1))
 print('OK' if ok else 'BAD %r' % offs)
 ")
 assert_eq "TC19.3 — sparse write offset giảm dần: map sắp xếp, không chồng lấn" "OK" "$SORTED"
@@ -612,9 +594,10 @@ os.write(fd, b'A' * 8192)
 os.close(fd)
 "
 CODEC=$(python3 -c "
-import struct
-d = open('$BACKING/tc20_trunc.bin.meta','rb').read()
-print(struct.unpack_from('<QIIBB2xIQ', d, 12)[3])
+import sys
+sys.path.insert(0, 'tests')
+from meta_inspect import load_meta
+print(load_meta('$BACKING/tc20_trunc.bin.meta')['chunks'][0]['codec_type'])
 ")
 assert_eq "TC20.1 — 8KB chữ A được nén (codec=1)" "1" "$CODEC"
 
@@ -629,11 +612,13 @@ assert_eq "TC20.2 — direct read sau truncate giữa chunk nén thành công" "
 assert_eq "TC20.3 — nội dung 4096 byte A đúng" "OK" "$CONTENT_OK"
 
 META_OK=$(python3 -c "
-import struct
-d = open('$BACKING/tc20_trunc.bin.meta','rb').read()
-n = struct.unpack_from('<I', d, 0)[0]
-lsize = struct.unpack_from('<Q', d, 4)[0]
-stored = struct.unpack_from('<QIIBB2xIQ', d, 12)[2]
+import sys
+sys.path.insert(0, 'tests')
+from meta_inspect import load_meta
+m = load_meta('$BACKING/tc20_trunc.bin.meta')
+n = len(m['chunks'])
+lsize = m['logical_size']
+stored = m['chunks'][0]['stored_size']
 print('OK' if n == 1 and lsize == 4096 and stored == 4096
       else 'BAD n=%d lsize=%d stored=%d' % (n, lsize, stored))
 ")
@@ -660,10 +645,12 @@ os.close(fd)
 "
 truncate -s 65536 "$MOUNT/tc20_bound.bin"
 BOUND_OK=$(python3 -c "
-import struct
-d = open('$BACKING/tc20_bound.bin.meta','rb').read()
-n = struct.unpack_from('<I', d, 0)[0]
-stored = struct.unpack_from('<QIIBB2xIQ', d, 12)[2]
+import sys
+sys.path.insert(0, 'tests')
+from meta_inspect import load_meta
+m = load_meta('$BACKING/tc20_bound.bin.meta')
+n = len(m['chunks'])
+stored = m['chunks'][0]['stored_size']
 print('OK' if n == 1 and stored == 65536 else 'BAD n=%d stored=%d' % (n, stored))
 ")
 assert_eq "TC20.6 — truncate tại ranh giới chunk: chunk đầu giữ nguyên" "OK" "$BOUND_OK"
@@ -761,16 +748,21 @@ os.close(fd)
 ref.close()
 "
 PACK_OK=$(python3 -c "
-import struct
-d = open('$BACKING/tc23_pack.bin.meta','rb').read()
-n = struct.unpack_from('<I', d, 0)[0]
-lsize = struct.unpack_from('<Q', d, 4)[0]
-recs = [struct.unpack_from('<QIIBB2xIQ', d, 12+32*i) for i in range(n)]
-aligned = all(r[0] % 65536 == 0 and 0 < r[2] <= 65536 for r in recs)
-print('OK' if n == 16 and lsize == 1048576 and aligned and len(d) == 12+32*n
-      else 'BAD n=%d lsize=%d aligned=%s' % (n, lsize, aligned))
+import sys
+sys.path.insert(0, 'tests')
+from meta_inspect import load_meta
+m = load_meta('$BACKING/tc23_pack.bin.meta')
+n = len(m['chunks'])
+window = m['window_size']
+lsize = m['logical_size']
+aligned = all(c['logical_offset'] % window == 0 and
+              0 < c['stored_size'] <= window for c in m['chunks'])
+expected = (lsize + window - 1) // window
+print('OK' if n == expected and lsize == 1048576 and aligned
+      else 'BAD n=%d expected=%d window=%d lsize=%d aligned=%s' %
+           (n, expected, window, lsize, aligned))
 ")
-assert_eq "TC23.1 — 256 append 4KB → đúng 16 chunk 64KB head-aligned" "OK" "$PACK_OK"
+assert_eq "TC23.1 — 256 append 4KB → packed theo window hiện hành" "OK" "$PACK_OK"
 
 dd if="$MOUNT/tc23_pack.bin" of=/tmp/myfs_tc23_read.bin iflag=direct bs=65536 2>/dev/null
 cmp -s /tmp/myfs_tc23_ref.bin /tmp/myfs_tc23_read.bin
@@ -798,10 +790,7 @@ print('OK' if data == expect else 'BAD len=%d' % len(data))
 ")
 assert_eq "TC24.1 — overwrite 80KB vắt qua 3 cửa sổ: nội dung đúng" "OK" "$CROSS_OK"
 
-N=$(python3 -c "
-import struct
-print(struct.unpack_from('<I', open('$BACKING/tc24_cross.bin.meta','rb').read(), 0)[0])
-")
+N=$(python3 tests/meta_inspect.py count "$BACKING/tc24_cross.bin.meta")
 assert_eq "TC24.2 — vẫn đúng 3 chunk sau overwrite" "3" "$N"
 
 # =============================================================================
@@ -811,10 +800,7 @@ section "TC25: Append gộp vào chunk đuôi"
 rm -f "$MOUNT/tc25_tail.txt"
 printf 'AAAAAAAAAA' > "$MOUNT/tc25_tail.txt"
 printf 'BBBBBBBBBBBBBBBBBBBB' >> "$MOUNT/tc25_tail.txt"
-N=$(python3 -c "
-import struct
-print(struct.unpack_from('<I', open('$BACKING/tc25_tail.txt.meta','rb').read(), 0)[0])
-")
+N=$(python3 tests/meta_inspect.py count "$BACKING/tc25_tail.txt.meta")
 assert_eq "TC25.1 — append nhỏ gộp vào chunk đuôi (1 chunk, không sibling)" "1" "$N"
 assert_content "TC25.2 — nội dung sau merge đúng" \
     "AAAAAAAAAABBBBBBBBBBBBBBBBBBBB" "$MOUNT/tc25_tail.txt"
@@ -825,10 +811,7 @@ fd = os.open('$MOUNT/tc25_tail.txt', os.O_WRONLY | os.O_APPEND)
 os.write(fd, b'C' * 65536)
 os.close(fd)
 "
-N=$(python3 -c "
-import struct
-print(struct.unpack_from('<I', open('$BACKING/tc25_tail.txt.meta','rb').read(), 0)[0])
-")
+N=$(python3 tests/meta_inspect.py count "$BACKING/tc25_tail.txt.meta")
 assert_eq "TC25.3 — append vượt ranh giới cửa sổ → tách 2 chunk" "2" "$N"
 
 # =============================================================================
@@ -843,11 +826,13 @@ os.pwrite(fd, b'SPARSE!!', 300000)
 os.close(fd)
 "
 META_OK=$(python3 -c "
-import struct
-d = open('$BACKING/tc26_sparse.bin.meta','rb').read()
-n = struct.unpack_from('<I', d, 0)[0]
-lsize = struct.unpack_from('<Q', d, 4)[0]
-off = struct.unpack_from('<Q', d, 12)[0]
+import sys
+sys.path.insert(0, 'tests')
+from meta_inspect import load_meta
+m = load_meta('$BACKING/tc26_sparse.bin.meta')
+n = len(m['chunks'])
+lsize = m['logical_size']
+off = m['chunks'][0]['logical_offset']
 print('OK' if n == 1 and off == 262144 and lsize == 300008
       else 'BAD n=%d off=%d lsize=%d' % (n, off, lsize))
 ")
@@ -887,11 +872,14 @@ assert_eq "TC27.1 — đọc file legacy unpacked (tolerant tier)" "OK" "$CONTEN
 # được repack bất kể waste); chờ chút cho release xử lý xong.
 sleep 1
 PACKED=$(python3 -c "
-import struct
-d = open('$BACKING/tc27_legacy.bin.meta','rb').read()
-n = struct.unpack_from('<I', d, 0)[0]
-recs = [struct.unpack_from('<QIIBB2xIQ', d, 12+32*i) for i in range(n)]
-ok = n == 1 and all(r[0] % 65536 == 0 and 0 < r[2] <= 65536 for r in recs)
+import sys
+sys.path.insert(0, 'tests')
+from meta_inspect import load_meta
+m = load_meta('$BACKING/tc27_legacy.bin.meta')
+n = len(m['chunks'])
+window = m['window_size']
+ok = n == 1 and all(c['logical_offset'] % window == 0 and
+                    0 < c['stored_size'] <= window for c in m['chunks'])
 print('OK' if ok else 'BAD n=%d' % n)
 ")
 assert_eq "TC27.2 — sau release: repack thành packed (1 chunk 15000 byte)" "OK" "$PACKED"

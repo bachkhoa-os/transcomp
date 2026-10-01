@@ -12,7 +12,7 @@ GUARD_SRCS = src/guards/guards.c
 
 SRCS = src/main.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS)
 
-.PHONY: all release run umount test bench clean
+.PHONY: all release run umount test test-unit bench clean
 
 all: myfs
 
@@ -32,6 +32,17 @@ test:
 	@chmod +x test_suite.sh
 	@./test_suite.sh mountpoint backing
 
+test-unit: tests/test_metadata tests/test_file_ops
+	@./tests/test_metadata
+	@./tests/test_file_ops
+	@bash ./tests/test_suite_guard.sh
+
+tests/test_metadata: tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c src/myfs.h
+	$(CC) $(CFLAGS) -o $@ tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c $(LIBS)
+
+tests/test_file_ops: tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) src/myfs.h
+	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) $(LIBS)
+
 bench: release
 	@chmod +x benchmark.sh
 	@./benchmark.sh mountpoint backing
@@ -41,5 +52,5 @@ clean:
 		echo "[ERROR] mountpoint dang duoc mount. Chay 'make umount' truoc."; \
 		exit 1; \
 	fi
-	rm -f myfs verify_remount.sh
+	rm -f myfs verify_remount.sh tests/test_metadata tests/test_file_ops
 	rm -rf backing/* .myfs_bench.*
