@@ -36,13 +36,13 @@ Application (cat, cp, grep, ...)
 │  fuse_ops/file.c                │
 │    myfs_read()  ─► decompress   │
 │    myfs_write() ─► compress     │
-│    repack 64KB windows (RMW)    │
+│    repack per-file windows (RMW)│
 │                                 │
 │  core/                          │
 │    compress.c   Zstd + heuristic│
-│    chunkio.c    64KB window I/O │
-│    metadata.c   chunk map I/O   │
-│    compact.c    garbage collect │
+│    chunkio.c    window I/O      │
+│    metadata.c   map + journal   │
+│    compact.c    GC + adaptation │
 │    path.c       path mapping    │
 └─────────────────────────────────┘
         │
@@ -56,15 +56,15 @@ Application (cat, cp, grep, ...)
 
 Sau lần compaction đầu tiên, storage của file chuyển sang **generation model**: mỗi lần compact tạo một generation directory mới, publish bằng atomic symlink rename (`.current`), còn `.data`/`.meta` được giữ dưới dạng hard-link alias để debug/benchmark vẫn quan sát được file vật lý đang active. Generation cũ được GC thu hồi khi không còn handle nào mở.
 
-### Thiết kế chunk-based (cửa sổ 64 KB)
+### Thiết kế chunk-based (cửa sổ thích nghi theo file)
 
-Không gian logic của file chia thành các **cửa sổ 64 KB**; mỗi cửa sổ chứa tối đa một chunk, luôn **head-aligned**: `logical_offset = k×64K`, `stored_size ≤ 64K`, mảng chunk sắp xếp tăng nghiêm ngặt (⇒ không chồng lấn, không vắt qua cửa sổ). Cửa sổ trống không có chunk — file sparse giữ nguyên, hole đọc ra byte 0. Mỗi chunk nén riêng bằng Zstd thành một blob append-only trên `.data`; `.meta` ánh xạ `logical_offset → physical_offset + raw_size + stored_size + codec + CRC32`.
+Không gian logic của mỗi file được chia thành các cửa sổ cố định cho generation đó. File mới bắt đầu ở **64 KiB**; compaction có thể đổi từng bước ×2 trong khoảng **16 KiB–1 MiB** dựa trên tỷ lệ full-window write và partial-RMW. Mỗi cửa sổ chứa tối đa một chunk, luôn head-aligned theo `window_size` của file. Cửa sổ trống không có chunk — file sparse giữ nguyên, hole đọc ra byte 0. Mỗi chunk nén riêng bằng Zstd thành một blob append-only trên `.data`; `.meta` ánh xạ `logical_offset → physical_offset + raw_size + stored_size + codec + CRC32`.
 
-**Read path:** file packed → binary search theo `WINDOW_BASE(offset)`; file legacy chưa packed → linear scan (tầng tolerant, giữ vĩnh viễn) → `pread` blob → verify CRC32 → decompress → trả đúng offset/size.
+**Read path:** file packed → binary search theo window base của file; file legacy chưa packed → linear scan (tầng tolerant, giữ vĩnh viễn) → `pread` blob → verify CRC32 → decompress → trả đúng offset/size.
 
-**Write path:** append, overwrite và ghi vào hole đi chung một đường: xác định các cửa sổ bị chạm → repack từng cửa sổ (merge dữ liệu cũ + patch; cửa sổ được patch phủ trọn thì nén thẳng từ buffer người dùng) → Zstd nếu tiết kiệm ≥ 12.5%, ngược lại raw → append blob → **một** `fdatasync` cho cả batch → save chunk map (atomic rename). Append vào chunk đuôi chưa đầy merge vào chunk đó thay vì tạo chunk mới — nhiều write nhỏ không còn làm nở chunk map.
+**Write path:** handle giữ cache chunk map + storage generation; read/write không reload `.meta` khi epoch không đổi. Append, overwrite và ghi vào hole đi chung một đường: xác định các cửa sổ bị chạm → repack từng cửa sổ → Zstd nếu tiết kiệm ≥ 12.5%, ngược lại raw → append blob → `fdatasync` data → append một metadata delta có CRC + commit marker → `fdatasync` metadata. Checkpoint toàn map chỉ chạy sau 1024 delta hoặc khi journal vượt ngưỡng kích thước.
 
-**Migration:** file từ phiên bản cũ (chunk kích thước tuỳ ý) vẫn đọc được qua tầng linear scan; lần compaction kế tiếp (trong `release()`) repack toàn bộ về bất biến cửa sổ. Tính packed được **derive khi load**, không persist — flag stale sau crash tự lành.
+**Migration:** metadata v0 không tag và v1 được đọc với cửa sổ 64 KiB; metadata v2 lưu `window_size` trong header little-endian 64 byte. File có chunk layout cũ vẫn đọc được qua tầng linear scan; compaction repack sang generation v2 mà không trộn window size trong cùng một generation.
 
 ---
 
@@ -82,11 +82,11 @@ transcomp/
 │   ├── main.c            ← Entry point, FUSE init/destroy, fuse_operations table
 │   ├── core/
 │   │   ├── path.c        ← build_path(), build_data_path(), build_meta_path()
-│   │   ├── metadata.c    ← load_chunk_map(), save_chunk_map() với atomic write
+│   │   ├── metadata.c    ← v0/v1/v2 reader, checkpoint + delta journal
 │   │   ├── compress.c    ← zstd_compress(), zstd_decompress(), is_incompressible()
-│   │   ├── chunkio.c     ← Engine chung: payload load, blob append, repack cửa sổ 64KB
+│   │   ├── chunkio.c     ← Engine chung: payload load, blob append, repack cửa sổ
 │   │   ├── lock.c        ← Per-file lock table (mutex theo path, refcount)
-│   │   └── compact.c     ← Compaction generation + GC registry + background worker
+│   │   └── compact.c     ← Generation/GC + adaptive resize + live-handle handoff
 │   ├── fuse_ops/
 │   │   ├── file.c        ← myfs_read, myfs_write, write_rmw, myfs_truncate,
 │   │   │                    myfs_create, myfs_open, myfs_release
@@ -137,6 +137,9 @@ make umount
 ```bash
 # Cần FUSE đang chạy ở terminal khác
 make test
+
+# Không cần mount; chạy metadata/cache/resize/concurrency tests trực tiếp
+make test-unit
 ```
 
 84 test cases cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing 64KB, migration file legacy, ghi song song per-file locking, background compaction.
@@ -157,13 +160,14 @@ make bench
 | Quyết định | Lý do |
 |---|---|
 | FUSE thay vì kernel module | Debug nhanh, không kernel panic, đủ để học semantics |
-| Chunk size 64 KB | Cân bằng compression ratio vs chi phí partial overwrite |
+| Per-file window 16 KiB–1 MiB | Thu nhỏ cho RMW, tăng cho full-window sequential writes |
 | Zstd thay vì zlib/LZ4 | Ratio cao nhất trong nhóm fast codec, decompress 1550 MB/s |
 | Directory + `.data`/`.meta` | Dễ debug (hexdump trực tiếp), dễ implement atomic write |
 | Append-only blob | Tránh in-place rewrite, đơn giản, atomic với rename |
-| Checkpoint + atomic rename | Tránh journaling phức tạp, đủ cho prototype 8 tuần |
+| Delta journal + checkpoint | Metadata write O(changed windows), torn tail tự phục hồi |
 | Per-file lock + leaf mutex | File khác nhau chạy song song; thứ tự lock cố định → không deadlock |
 | Background compaction thread | `release()` không trả tiền GC/compact; queue dedupe, drain khi unmount |
+| Writer-preferring cache rwlock | Handoff không starvation; read fast path không gọi metadata syscall |
 
 ---
 

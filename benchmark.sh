@@ -15,6 +15,8 @@ BACKING="${2:-backing}"
 RESULT_FILE="benchmark_results.txt"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=benchmark_helpers.sh
+. "$SCRIPT_DIR/benchmark_helpers.sh"
 TMP_PARENT="${MYFS_BENCH_TMP_PARENT:-$SCRIPT_DIR}"
 TMP_PARENT="$(realpath -e -- "$TMP_PARENT")" || {
     echo "ERROR: benchmark temp parent does not exist: '$TMP_PARENT'" >&2
@@ -84,7 +86,7 @@ measure_write_mbs() {
 measure_read_mbs() {
     local src="$1" size_mb="$2"
     local start_ns end_ns elapsed_ms
-    sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1 || true
+    myfs_drop_page_cache
     start_ns=$(date +%s%N)
     dd if="$src" of=/dev/null bs=4M 2>/dev/null
     end_ns=$(date +%s%N)
@@ -285,7 +287,6 @@ log "  ext4 rand write:  ${EXT4_WRITE_RAND:-N/A}"
 
 log ""
 log "--- ext4 baseline: read 100MB text (drop cache first) ---"
-sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1 || true
 EXT4_READ_TEXT=$(measure_read_mbs "$TMP_DIR/ext4_text.bin" 100)
 log "  ext4 text read:   ${EXT4_READ_TEXT:-N/A}"
 

@@ -10,12 +10,6 @@ int guard_chunk_metadata(const myfs_chunk_t *chunk, uint32_t chunk_idx)
         return -EIO;
     }
 
-    if (chunk->physical_offset < 0)
-    {
-        printf("[ERROR] chunk %u has negative physical_offset\n", chunk_idx);
-        return -EIO;
-    }
-
     return 0;
 }
 

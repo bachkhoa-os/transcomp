@@ -146,19 +146,3 @@ int zstd_decompress_prefix(const void *src, size_t src_size,
     free(scratch);
     return ret;
 }
-
-/*
- * Tạo một ZSTD_DCtx có thể tái sử dụng cho các lần giải nén sau.
- * Việc giữ context ở dạng reusable có thể giảm chi phí khởi tạo nếu luồng xử lý
- * thực hiện nhiều thao tác giải nén liên tiếp.
- */
-ZSTD_DCtx *zstd_create_dctx(void)
-{
-    ZSTD_DCtx *dctx = ZSTD_createDCtx();
-    if (!dctx)
-    {
-        LOG("[ERROR] ZSTD_createDCtx failed\n");
-        return NULL;
-    }
-    return dctx;
-}

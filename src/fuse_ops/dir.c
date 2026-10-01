@@ -37,27 +37,35 @@ int myfs_getattr(const char *path, struct stat *stbuf, struct fuse_file_info *fi
         }
     }
 
-    if (ret == 0)
+    if (ret == 0 && handle)
     {
-        if (handle)
+        ret = myfs_refresh_handle_cache_locked(handle);
+        int lock_ret = ret == 0
+            ? pthread_rwlock_rdlock(&handle->cache_lock) : 0;
+        if (lock_ret != 0)
+            ret = -lock_ret;
+        else if (ret == 0)
+        {
             ret = (fstat(handle->data_fd, stbuf) == 0) ? 0 : -errno;
-        else
-            ret = (stat(storage.data_path, stbuf) == 0) ? 0 : -errno;
+            if (ret == 0 && handle->cache_valid)
+                stbuf->st_size = INODE_LSIZE(handle->cached_inode);
+            else if (ret == 0)
+                ret = -EIO;
+            pthread_rwlock_unlock(&handle->cache_lock);
+        }
     }
-
-    /* Cập nhật kích thước logic từ chunk map để phản ánh đúng nội dung file. */
-    myfs_inode_t inode = {0};
-    if (ret == 0)
+    else if (ret == 0)
     {
-        int meta_ret = load_chunk_map_from_path(storage.meta_path, &inode);
-        if (meta_ret == -ENOENT && handle)
-            meta_ret = load_chunk_map_from_fd(handle->meta_fd, &inode);
-        if (meta_ret == 0)
-            stbuf->st_size = INODE_LSIZE(inode);
-        else
-            ret = meta_ret;
+        ret = (stat(storage.data_path, stbuf) == 0) ? 0 : -errno;
+        myfs_inode_t inode = {0};
+        if (ret == 0)
+        {
+            ret = load_chunk_map_from_path(storage.meta_path, &inode);
+            if (ret == 0)
+                stbuf->st_size = INODE_LSIZE(inode);
+        }
+        free(inode.chunk_map.chunks);
     }
-    free(inode.chunk_map.chunks);
 
     myfs_unlock_file(lk);
     return ret;

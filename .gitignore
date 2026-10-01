@@ -13,3 +13,9 @@ Thumbs.db
 *.o
 *.txt
 verify_remount.sh
+.agents/
+.claude/
+.codex/
+tests/__pycache__/
+tests/test_file_ops
+tests/test_metadata
