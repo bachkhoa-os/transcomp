@@ -36,6 +36,7 @@ test-unit: tests/test_metadata tests/test_file_ops
 	@./tests/test_metadata
 	@./tests/test_file_ops
 	@bash ./tests/test_suite_guard.sh
+	@bash ./tests/test_benchmark_helpers.sh
 
 tests/test_metadata: tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c src/myfs.h
 	$(CC) $(CFLAGS) -o $@ tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c $(LIBS)
