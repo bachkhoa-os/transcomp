@@ -19,3 +19,8 @@ verify_remount.sh
 tests/__pycache__/
 tests/test_file_ops
 tests/test_metadata
+tests/test_zstd_context
+benchmarks/zstd_context_bench
+tests/test_meta_inspect
+benchmarks/meta_inspect
+benchmark-results/*
