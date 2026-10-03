@@ -68,6 +68,8 @@ Không gian logic của mỗi file được chia thành các cửa sổ cố đ�
 
 **Zstd context reuse:** mỗi FUSE worker thread tạo lười một `ZSTD_CCtx` và một `ZSTD_DCtx`, tái sử dụng chúng qua thread-local storage và tự giải phóng bằng destructor của `pthread_key_t` khi worker kết thúc. Context không bao giờ được chia sẻ giữa các thread, vì vậy đường nén/giải nén không thêm global lock và không tạo quan hệ lock-order mới với `cache_lock` hay per-path file lock. Compression giữ nguyên `ZSTD_CLEVEL_DEFAULT` và output byte-identical với API one-shot; decompression reset cả session lẫn sticky parameters trước mỗi frame. Lỗi Zstd loại context tương ứng để lần gọi sau tạo context sạch, còn lỗi cấp phát TLS tự động fallback về API one-shot với cùng semantics.
 
+**Path-lock sharding:** bảng mutex theo path dùng 64 shard × 64 bucket, với FNV-1a 64-bit và fmix64 để phân bố path. Mỗi shard có mutex riêng; refcount pin cả owner, waiter và unlocker, entry được unlink khi refcount về 0 rồi mới destroy/free ngoài shard mutex. Code luôn nhả shard mutex trước khi chờ path mutex. Nếu một thao tác tương lai cần nhiều path lock, thứ tự chuẩn là tăng dần `(shard index, strcmp(path))`, deduplicate path trùng và release theo thứ tự ngược lại.
+
 ---
 
 ## Cấu trúc thư mục
@@ -76,34 +78,37 @@ Không gian logic của mỗi file được chia thành các cửa sổ cố đ�
 transcomp/
 ├── Makefile
 ├── README.md
-├── benchmark.sh                ← Đo throughput, compression ratio, RMW latency
-├── benchmark_results.txt       ← Kết quả benchmark lần chạy gần nhất
+├── benchmark.sh                 ← Đo throughput, compression ratio, RMW latency
+├── benchmark_results.txt        ← Kết quả benchmark lần chạy gần nhất
 ├── benchmarks/
-│   ├── meta_inspect.c          ← Đọc metadata bằng parser production
-│   └── zstd_context_bench.c    ← So sánh one-shot với TLS context reuse
-├── test_suite.sh               ← FUSE regression suite (84 checks)
-├── tests/                      ← Unit, concurrency, metadata/tooling tests
+│   ├── meta_inspect.c           ← Đọc metadata bằng parser production
+│   ├── zstd_context_bench.c     ← So sánh one-shot với TLS context reuse
+│   ├── lock_table_bench.c       ← So sánh lock table linear với sharded
+│   └── fixtures/
+│       └── lock_table_linear.c  ← Baseline frozen từ commit add0290
+├── test_suite.sh                ← FUSE regression suite (84 checks)
+├── tests/                       ← Unit, concurrency, metadata/tooling tests
 ├── src/
-│   ├── myfs.h                  ← Structs, constants, prototypes, LOG macro, CRC32 helper
-│   ├── main.c                  ← Entry point, FUSE init/destroy, fuse_operations table
+│   ├── myfs.h                   ← Structs, constants, prototypes, LOG macro, CRC32 helper
+│   ├── main.c                   ← Entry point, FUSE init/destroy, fuse_operations table
 │   ├── core/
-│   │   ├── path.c              ← build_path(), build_data_path(), build_meta_path()
-│   │   ├── metadata.c          ← v0/v1/v2 reader, checkpoint + delta journal
-│   │   ├── compress.c          ← zstd_compress(), zstd_decompress(), is_incompressible()
-│   │   ├── chunkio.c           ← Engine chung: payload load, blob append, repack cửa sổ
+│   │   ├── path.c               ← build_path(), build_data_path(), build_meta_path()
+│   │   ├── metadata.c           ← v0/v1/v2 reader, checkpoint + delta journal
+│   │   ├── compress.c           ← zstd_compress(), zstd_decompress(), is_incompressible()
+│   │   ├── chunkio.c            ← Engine chung: payload load, blob append, repack cửa sổ
 │   │   ├── lock.c              ← Per-file lock table (mutex theo path, refcount)
-│   │   └── compact.c           ← Generation/GC + adaptive resize + live-handle handoff
+│   │   └── compact.c            ← Generation/GC + adaptive resize + live-handle handoff
 │   ├── fuse_ops/
-│   │   ├── file.c              ← myfs_read, myfs_write, write_rmw, myfs_truncate,
+│   │   ├── file.c               ← myfs_read, myfs_write, write_rmw, myfs_truncate,
 │   │   │                         myfs_create, myfs_open, myfs_release
-│   │   └── dir.c               ← myfs_getattr, myfs_readdir, myfs_mkdir,
+│   │   └── dir.c                ← myfs_getattr, myfs_readdir, myfs_mkdir,
 │   │                             myfs_rmdir, myfs_unlink, myfs_utimens
 │   └── guards/
 │       ├── guards.h
-│       └── guards.c            ← Validation functions: chunk metadata, bounds, pread result
-├── benchmark-results/          ← Report cục bộ (git-ignored)
-├── backing/                    ← Backing store (.data/.meta + generation dirs sau compaction)
-└── mountpoint/                 ← Mount point (giao diện logic cho user)
+│       └── guards.c             ← Validation functions: chunk metadata, bounds, pread result
+├── benchmark-results/           ← Report cục bộ (git-ignored)
+├── backing/                     ← Backing store (.data/.meta + generation dirs sau compaction)
+└── mountpoint/                  ← Mount point (giao diện logic cho user)
 ```
 
 ---
@@ -150,7 +155,7 @@ make test
 make test-unit
 ```
 
-84 FUSE regression checks cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing, migration file legacy, ghi song song per-file locking và background compaction. `make test-unit` bổ sung metadata v0/v1/v2 + journal, cache/generation/concurrency, Zstd byte parity/error recovery/TLS isolation/destructor cleanup/sticky-parameter reset, metadata inspector và format output của microbenchmark.
+84 FUSE regression checks cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing, migration file legacy, ghi song song per-file locking và background compaction. `make test-unit` bổ sung metadata v0/v1/v2 + journal, cache/generation/concurrency, Zstd byte parity/error recovery/TLS isolation/destructor cleanup/sticky-parameter reset, path-lock refcount/reclamation/concurrency, metadata inspector và format output của cả hai microbenchmark.
 
 ### Benchmark
 
@@ -160,6 +165,14 @@ make bench
 
 make bench-zstd-context
 # Microbenchmark one-shot vs TLS reuse: p50/p99, ops/s và 8-thread throughput
+
+make bench-lock-table
+# Linear frozen baseline vs 64×64 sharded table.
+# Mặc định: worker 1/4/8/16 × resident path 0/64/256, 7 paired repetitions.
+# Chạy gate chính nhanh hơn:
+./benchmarks/lock_table_bench --workers 8 --resident-paths 256
+# Control single-thread không có resident path:
+./benchmarks/lock_table_bench --workers 1 --resident-paths 0
 
 make benchmarks/meta_inspect
 ./benchmarks/meta_inspect backing/test.txt.meta
@@ -184,6 +197,7 @@ make benchmarks/meta_inspect
 | Background compaction thread | `release()` không trả tiền GC/compact; queue dedupe, drain khi unmount |
 | Writer-preferring cache rwlock | Handoff không starvation; read fast path không gọi metadata syscall |
 | Zstd context theo worker thread | Bỏ allocation mỗi call mà không share context, global lock hay serialization |
+| Path-lock table 64 × 64 | Giới hạn lookup theo bucket và contention theo shard, vẫn eager reclaim |
 
 ---
 
