@@ -39,7 +39,7 @@ Application (cat, cp, grep, ...)
 │    repack per-file windows (RMW)│
 │                                 │
 │  core/                          │
-│    compress.c   Zstd + heuristic│
+│    compress.c   Zstd + TLS reuse│
 │    chunkio.c    window I/O      │
 │    metadata.c   map + journal   │
 │    compact.c    GC + adaptation │
@@ -66,6 +66,8 @@ Không gian logic của mỗi file được chia thành các cửa sổ cố đ�
 
 **Migration:** metadata v0 không tag và v1 được đọc với cửa sổ 64 KiB; metadata v2 lưu `window_size` trong header little-endian 64 byte. File có chunk layout cũ vẫn đọc được qua tầng linear scan; compaction repack sang generation v2 mà không trộn window size trong cùng một generation.
 
+**Zstd context reuse:** mỗi FUSE worker thread tạo lười một `ZSTD_CCtx` và một `ZSTD_DCtx`, tái sử dụng chúng qua thread-local storage và tự giải phóng bằng destructor của `pthread_key_t` khi worker kết thúc. Context không bao giờ được chia sẻ giữa các thread, vì vậy đường nén/giải nén không thêm global lock và không tạo quan hệ lock-order mới với `cache_lock` hay per-path file lock. Compression giữ nguyên `ZSTD_CLEVEL_DEFAULT` và output byte-identical với API one-shot; decompression reset cả session lẫn sticky parameters trước mỗi frame. Lỗi Zstd loại context tương ứng để lần gọi sau tạo context sạch, còn lỗi cấp phát TLS tự động fallback về API one-shot với cùng semantics.
+
 ---
 
 ## Cấu trúc thư mục
@@ -76,7 +78,11 @@ transcomp/
 ├── README.md
 ├── benchmark.sh          ← Đo throughput, compression ratio, RMW latency
 ├── benchmark_results.txt ← Kết quả benchmark lần chạy gần nhất
-├── test_suite.sh         ← Regression test suite (49 test cases)
+├── benchmarks/
+│   ├── meta_inspect.c       ← Đọc metadata bằng parser production
+│   └── zstd_context_bench.c ← So sánh one-shot với TLS context reuse
+├── test_suite.sh         ← FUSE regression suite (84 checks)
+├── tests/                ← Unit, concurrency, metadata/tooling tests
 ├── src/
 │   ├── myfs.h            ← Structs, constants, prototypes, LOG macro, CRC32 helper
 │   ├── main.c            ← Entry point, FUSE init/destroy, fuse_operations table
@@ -95,6 +101,7 @@ transcomp/
 │   └── guards/
 │       ├── guards.h
 │       └── guards.c      ← Validation functions: chunk metadata, bounds, pread result
+├── benchmark-results/     ← Report cục bộ (git-ignored)
 ├── backing/              ← Backing store (.data/.meta + generation dirs sau compaction)
 └── mountpoint/           ← Mount point (giao diện logic cho user)
 ```
@@ -113,6 +120,7 @@ sudo apt install libfuse3-dev libzstd-dev zlib1g-dev pkg-config gcc
 
 ```bash
 make          # compile
+make release  # build -O2 -DNDEBUG
 make clean    # xóa binary + backing store (chỉ khi đã unmount)
 ```
 
@@ -142,16 +150,23 @@ make test
 make test-unit
 ```
 
-84 test cases cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing 64KB, migration file legacy, ghi song song per-file locking, background compaction.
+84 FUSE regression checks cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing, migration file legacy, ghi song song per-file locking và background compaction. `make test-unit` bổ sung metadata v0/v1/v2 + journal, cache/generation/concurrency, Zstd byte parity/error recovery/TLS isolation/destructor cleanup/sticky-parameter reset, metadata inspector và format output của microbenchmark.
 
 ### Benchmark
 
 ```bash
 make bench
 # Kết quả lưu vào benchmark_results.txt
+
+make bench-zstd-context
+# Microbenchmark one-shot vs TLS reuse: p50/p99, ops/s và 8-thread throughput
+
+make benchmarks/meta_inspect
+./benchmarks/meta_inspect backing/test.txt.meta
+# chunks=N<TAB>logical_size=N<TAB>raw_chunks=N
 ```
 
-10 benchmark sections: sequential write/read throughput, compression ratio theo workload, RMW latency, so sánh với ext4 baseline, heuristic skip throughput, FUSE overhead vs Zstd overhead breakdown, append pattern analysis.
+10 benchmark sections: sequential write/read throughput, compression ratio theo workload, RMW latency, so sánh với ext4 baseline, heuristic skip throughput, FUSE overhead vs Zstd overhead breakdown, append pattern analysis. BM07 và BM10 gọi `meta_inspect`, nên dùng chung parser/validation/journal replay của `core/metadata.c` thay vì hard-code offset của format trên disk.
 
 ---
 
@@ -168,25 +183,22 @@ make bench
 | Per-file lock + leaf mutex | File khác nhau chạy song song; thứ tự lock cố định → không deadlock |
 | Background compaction thread | `release()` không trả tiền GC/compact; queue dedupe, drain khi unmount |
 | Writer-preferring cache rwlock | Handoff không starvation; read fast path không gọi metadata syscall |
+| Zstd context theo worker thread | Bỏ allocation mỗi call mà không share context, global lock hay serialization |
 
 ---
 
 ## Kết quả benchmark (tóm tắt)
 
-| Metric | myfs | ext4 baseline |
-|---|---|---|
-| Write text 100MB | ~162 MB/s | ~450 MB/s |
-| Write random 100MB | ~139 MB/s | ~198 MB/s |
-| Read text 50MB | ~410 MB/s | ~3704 MB/s |
-| Read random 50MB | ~1786 MB/s | ~3846 MB/s |
-| Compression (text lặp lại) | ~3277x | 1.00x |
-| Compression (source code) | 1.27x | 1.00x |
-| Compression (random binary) | 1.00x | 1.00x |
-| RMW avg latency | ~81 ms | N/A |
-| Append 1KB ×1024 (packing) | 17 chunk, disk 1KB (~860x) | — |
-| Zstd compress (in-memory) | ~4400 MB/s | — |
+Microbenchmark chuyên biệt cho allocation context cho kết quả lặp lại trên hai lần đo độc lập:
 
-> **Ghi chú:** Số đo sau khi thêm `fdatasync` blob mỗi write (giá của crash-safe ordering) và 64KB window packing. Baseline ext4 giờ đo trên thư mục disk-backed thay vì tmpfs nên thấp hơn số cũ — tỷ lệ myfs/ext4 mới phản ánh đúng hơn. Overhead chính vẫn là FUSE round-trip + device flush, không phải Zstd (~4400 MB/s in-memory).
+| Workload | TLS reuse so với one-shot |
+|---|---:|
+| Single-thread, buffer 1–64 KiB | **1.27×–2.50×** nhanh hơn |
+| 8 worker thread, buffer 4 KiB | **1.41×–1.67×** throughput |
+
+Không thấy serialization hay lock contention. Đây là instrument chính cho thay đổi này vì nó tách đúng chi phí tạo/hủy `ZSTD_CCtx`/`ZSTD_DCtx` khỏi FUSE, I/O và page cache.
+
+`benchmark.sh` end-to-end được chạy baseline/candidate năm lần xen kẽ với cold-cache đã xác minh. Mọi chênh lệch median đều nhỏ hơn spread min–max ngay trong cùng một phía; cả control ext4 không liên quan cũng dao động mạnh (ví dụ ext4 write 211–461 MB/s). Vì noise floor của host lớn hơn ngưỡng 5%, gate end-to-end được báo cáo **inconclusive**, không phải pass/fail. Hai control thuần Zstd vẫn ổn định qua cả hai lần so sánh: compress −0.04%/−0.67%, decompress +0.16%/+0.35%, không cho thấy regression tính toán.
 
 ---
 
@@ -211,9 +223,11 @@ Log in ra stderr với timestamp millisecond:
 [13:05:01.241] [DEBUG] myfs_read success: read 12 bytes
 ```
 
-Xem backing store trực tiếp:
+Xem backing store trực tiếp. Dùng inspector cho thông tin metadata có ngữ nghĩa; tool này gọi parser production nên hỗ trợ cùng v0/v1/v2 và journal replay như filesystem:
 
 ```bash
-ls -la backing/          # thấy .data và .meta cho mỗi file
-hexdump -C backing/test.txt.meta   # xem chunk map binary
+ls -la backing/                          # .data/.meta của mỗi file
+make benchmarks/meta_inspect
+./benchmarks/meta_inspect backing/test.txt.meta
+hexdump -C backing/test.txt.meta         # chỉ dùng khi cần xem wire bytes
 ```

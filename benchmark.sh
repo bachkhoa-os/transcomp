@@ -15,6 +15,54 @@ BACKING="${2:-backing}"
 RESULT_FILE="benchmark_results.txt"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+META_INSPECT="${MYFS_META_INSPECT:-$SCRIPT_DIR/benchmarks/meta_inspect}"
+if [ ! -x "$META_INSPECT" ]; then
+    echo "ERROR: metadata inspector is not executable: '$META_INSPECT'" >&2
+    echo "       Build it with: make benchmarks/meta_inspect" >&2
+    exit 1
+fi
+
+read_metadata_stats() {
+    local output field
+    META_INSPECT_ERROR=""
+    META_CHUNKS=""
+    META_LOGICAL_SIZE=""
+    META_RAW_CHUNKS=""
+
+    if ! output=$("$META_INSPECT" "$1" 2>/dev/null); then
+        META_INSPECT_ERROR="metadata inspector rejected $1"
+        return 1
+    fi
+
+    while IFS= read -r field; do
+        case "$field" in
+            chunks=*) META_CHUNKS=${field#chunks=} ;;
+            logical_size=*) META_LOGICAL_SIZE=${field#logical_size=} ;;
+            raw_chunks=*) META_RAW_CHUNKS=${field#raw_chunks=} ;;
+            *)
+                META_INSPECT_ERROR="unexpected inspector field: $field"
+                return 1
+                ;;
+        esac
+    done <<EOF
+$(printf '%s\n' "$output" | tr '\t' '\n')
+EOF
+
+    for field in "$META_CHUNKS" "$META_LOGICAL_SIZE" "$META_RAW_CHUNKS"; do
+        case "$field" in
+            ''|*[!0-9]*)
+                META_INSPECT_ERROR="invalid inspector output: $output"
+                return 1
+                ;;
+        esac
+    done
+    if [ "$META_RAW_CHUNKS" -gt "$META_CHUNKS" ]; then
+        META_INSPECT_ERROR="invalid inspector output: $output"
+        return 1
+    fi
+    return 0
+}
+
 # shellcheck source=benchmark_helpers.sh
 . "$SCRIPT_DIR/benchmark_helpers.sh"
 TMP_PARENT="${MYFS_BENCH_TMP_PARENT:-$SCRIPT_DIR}"
@@ -335,24 +383,16 @@ WRITE_JPEG=$(measure_write_mbs "$TMP_DIR/fake_jpeg.bin" "$MOUNT/bm_heur_jpeg.bin
 L_JPEG=$(stat -c%s "$MOUNT/bm_heur_jpeg.bin")
 D_JPEG=$(stat -c%s "$BACKING/bm_heur_jpeg.bin.data")
 RATIO_JPEG=$(compression_ratio $L_JPEG $D_JPEG)
-# Đọc codec_type từ .meta: nếu tất cả chunk raw thì heuristic đã kích hoạt
-CODEC_JPEG=$(python3 -c "
-import struct, sys
-try:
-    with open('$BACKING/bm_heur_jpeg.bin.meta', 'rb') as f:
-        num_chunks, logical_size = struct.unpack('<IQ', f.read(12))
-        codecs = []
-        for _ in range(num_chunks):
-            # sizeof(myfs_chunk_t) = 32 (2 byte padding sau flags);
-            # codec_type nằm tại offset 16 trong record.
-            data = f.read(32)
-            if len(data) < 32: break
-            codecs.append(data[16])
-    all_raw = all(c == 0 for c in codecs)
-    print(f'raw={sum(1 for c in codecs if c==0)}/{len(codecs)} → {\"SKIP OK\" if all_raw else \"COMPRESSED\"}')
-except Exception as e:
-    print(f'N/A ({e})')
-" 2>/dev/null)
+# Đọc codec_type qua parser metadata chính thức của myfs.
+if read_metadata_stats "$BACKING/bm_heur_jpeg.bin.meta"; then
+    if [ "$META_RAW_CHUNKS" -eq "$META_CHUNKS" ]; then
+        CODEC_JPEG="raw=${META_RAW_CHUNKS}/${META_CHUNKS} → SKIP OK"
+    else
+        CODEC_JPEG="raw=${META_RAW_CHUNKS}/${META_CHUNKS} → COMPRESSED"
+    fi
+else
+    CODEC_JPEG="N/A (${META_INSPECT_ERROR})"
+fi
 log "  JPEG write:       ${WRITE_JPEG:-N/A}"
 log "  Logical size:     $(python3 -c "print(f'{$L_JPEG/1024/1024:.1f} MB')")"
 log "  Disk size:        $(python3 -c "print(f'{$D_JPEG/1024/1024:.2f} MB')")"
@@ -707,17 +747,12 @@ SIZE_1KB_MB=1  # ~1024 * 1KB = 1MB
 WRITE_1KB=$(python3 -c "print(f'{$SIZE_1KB_MB * 1000 / $ELAPSED_MS_1KB:.1f} MB/s')")
 AVG_RMW_MS=$(python3 -c "print(f'{$ELAPSED_MS_1KB / 1024:.2f}')")
 sleep 0.5  # đợi release/compact xử lý xong để đọc meta ổn định
-PACK_STATS=$(python3 -c "
-import struct, os
-try:
-    d = open('$BACKING/bm_append_1kb.bin.meta','rb').read()
-    n = struct.unpack_from('<I', d, 0)[0]
-    lsize = struct.unpack_from('<Q', d, 4)[0]
-    disk = os.path.getsize('$BACKING/bm_append_1kb.bin.data')
-    print(f'{n} chunks | logical {lsize/1024:.0f}KB | disk {disk/1024:.0f}KB | ratio {lsize/max(disk,1):.2f}x')
-except Exception as e:
-    print(f'N/A ({e})')
-")
+if read_metadata_stats "$BACKING/bm_append_1kb.bin.meta"; then
+    PACK_DISK=$(stat -c%s "$BACKING/bm_append_1kb.bin.data")
+    PACK_STATS=$(python3 -c "print(f'{$META_CHUNKS} chunks | logical {$META_LOGICAL_SIZE/1024:.0f}KB | disk {$PACK_DISK/1024:.0f}KB | ratio {$META_LOGICAL_SIZE/max($PACK_DISK,1):.2f}x')")
+else
+    PACK_STATS="N/A (${META_INSPECT_ERROR})"
+fi
 rm -f "$MOUNT/bm_append_1kb.bin"
 log "  Append 1024x1KB:      ${WRITE_1KB:-N/A}  (avg ${AVG_RMW_MS} ms/write)"
 log "  Chunk packing:        ${PACK_STATS}"
