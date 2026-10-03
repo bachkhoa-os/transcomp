@@ -76,34 +76,34 @@ Không gian logic của mỗi file được chia thành các cửa sổ cố đ�
 transcomp/
 ├── Makefile
 ├── README.md
-├── benchmark.sh          ← Đo throughput, compression ratio, RMW latency
-├── benchmark_results.txt ← Kết quả benchmark lần chạy gần nhất
+├── benchmark.sh                ← Đo throughput, compression ratio, RMW latency
+├── benchmark_results.txt       ← Kết quả benchmark lần chạy gần nhất
 ├── benchmarks/
-│   ├── meta_inspect.c       ← Đọc metadata bằng parser production
-│   └── zstd_context_bench.c ← So sánh one-shot với TLS context reuse
-├── test_suite.sh         ← FUSE regression suite (84 checks)
-├── tests/                ← Unit, concurrency, metadata/tooling tests
+│   ├── meta_inspect.c          ← Đọc metadata bằng parser production
+│   └── zstd_context_bench.c    ← So sánh one-shot với TLS context reuse
+├── test_suite.sh               ← FUSE regression suite (84 checks)
+├── tests/                      ← Unit, concurrency, metadata/tooling tests
 ├── src/
-│   ├── myfs.h            ← Structs, constants, prototypes, LOG macro, CRC32 helper
-│   ├── main.c            ← Entry point, FUSE init/destroy, fuse_operations table
+│   ├── myfs.h                  ← Structs, constants, prototypes, LOG macro, CRC32 helper
+│   ├── main.c                  ← Entry point, FUSE init/destroy, fuse_operations table
 │   ├── core/
-│   │   ├── path.c        ← build_path(), build_data_path(), build_meta_path()
-│   │   ├── metadata.c    ← v0/v1/v2 reader, checkpoint + delta journal
-│   │   ├── compress.c    ← zstd_compress(), zstd_decompress(), is_incompressible()
-│   │   ├── chunkio.c     ← Engine chung: payload load, blob append, repack cửa sổ
-│   │   ├── lock.c        ← Per-file lock table (mutex theo path, refcount)
-│   │   └── compact.c     ← Generation/GC + adaptive resize + live-handle handoff
+│   │   ├── path.c              ← build_path(), build_data_path(), build_meta_path()
+│   │   ├── metadata.c          ← v0/v1/v2 reader, checkpoint + delta journal
+│   │   ├── compress.c          ← zstd_compress(), zstd_decompress(), is_incompressible()
+│   │   ├── chunkio.c           ← Engine chung: payload load, blob append, repack cửa sổ
+│   │   ├── lock.c              ← Per-file lock table (mutex theo path, refcount)
+│   │   └── compact.c           ← Generation/GC + adaptive resize + live-handle handoff
 │   ├── fuse_ops/
-│   │   ├── file.c        ← myfs_read, myfs_write, write_rmw, myfs_truncate,
-│   │   │                    myfs_create, myfs_open, myfs_release
-│   │   └── dir.c         ← myfs_getattr, myfs_readdir, myfs_mkdir,
-│   │                        myfs_rmdir, myfs_unlink, myfs_utimens
+│   │   ├── file.c              ← myfs_read, myfs_write, write_rmw, myfs_truncate,
+│   │   │                         myfs_create, myfs_open, myfs_release
+│   │   └── dir.c               ← myfs_getattr, myfs_readdir, myfs_mkdir,
+│   │                             myfs_rmdir, myfs_unlink, myfs_utimens
 │   └── guards/
 │       ├── guards.h
-│       └── guards.c      ← Validation functions: chunk metadata, bounds, pread result
-├── benchmark-results/     ← Report cục bộ (git-ignored)
-├── backing/              ← Backing store (.data/.meta + generation dirs sau compaction)
-└── mountpoint/           ← Mount point (giao diện logic cho user)
+│       └── guards.c            ← Validation functions: chunk metadata, bounds, pread result
+├── benchmark-results/          ← Report cục bộ (git-ignored)
+├── backing/                    ← Backing store (.data/.meta + generation dirs sau compaction)
+└── mountpoint/                 ← Mount point (giao diện logic cho user)
 ```
 
 ---
