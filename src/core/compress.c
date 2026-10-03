@@ -1,4 +1,126 @@
 #include "myfs.h"
+
+typedef struct
+{
+    ZSTD_CCtx *cctx;
+    ZSTD_DCtx *dctx;
+} zstd_thread_context_t;
+
+static pthread_once_t zstd_context_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t zstd_context_key;
+static int zstd_context_key_status = EAGAIN;
+#ifdef MYFS_TEST_FAILPOINTS
+static size_t zstd_test_destroy_count;
+#endif
+
+static void zstd_destroy_thread_context(void *value)
+{
+    zstd_thread_context_t *context = value;
+    if (!context)
+        return;
+
+    (void)ZSTD_freeCCtx(context->cctx);
+    (void)ZSTD_freeDCtx(context->dctx);
+    free(context);
+#ifdef MYFS_TEST_FAILPOINTS
+    (void)__atomic_add_fetch(&zstd_test_destroy_count, 1, __ATOMIC_RELAXED);
+#endif
+}
+
+static void zstd_create_context_key(void)
+{
+    zstd_context_key_status =
+        pthread_key_create(&zstd_context_key, zstd_destroy_thread_context);
+}
+
+static zstd_thread_context_t *zstd_get_thread_context(void)
+{
+    if (pthread_once(&zstd_context_key_once, zstd_create_context_key) != 0 ||
+        zstd_context_key_status != 0)
+        return NULL;
+
+    zstd_thread_context_t *context = pthread_getspecific(zstd_context_key);
+    if (context)
+        return context;
+
+    context = calloc(1, sizeof(*context));
+    if (!context)
+        return NULL;
+
+    if (pthread_setspecific(zstd_context_key, context) != 0)
+    {
+        free(context);
+        return NULL;
+    }
+
+    return context;
+}
+
+static ZSTD_CCtx *zstd_get_thread_cctx(zstd_thread_context_t **thread_context)
+{
+    zstd_thread_context_t *context = zstd_get_thread_context();
+    if (!context)
+        return NULL;
+
+    if (!context->cctx)
+        context->cctx = ZSTD_createCCtx();
+
+    if (context->cctx)
+        *thread_context = context;
+    return context->cctx;
+}
+
+static ZSTD_DCtx *zstd_get_thread_dctx(zstd_thread_context_t **thread_context)
+{
+    zstd_thread_context_t *context = zstd_get_thread_context();
+    if (!context)
+        return NULL;
+
+    if (!context->dctx)
+        context->dctx = ZSTD_createDCtx();
+
+    if (context->dctx)
+        *thread_context = context;
+    return context->dctx;
+}
+
+static void zstd_discard_thread_cctx(zstd_thread_context_t *context)
+{
+    if (!context)
+        return;
+
+    (void)ZSTD_freeCCtx(context->cctx);
+    context->cctx = NULL;
+}
+
+static void zstd_discard_thread_dctx(zstd_thread_context_t *context)
+{
+    if (!context)
+        return;
+
+    (void)ZSTD_freeDCtx(context->dctx);
+    context->dctx = NULL;
+}
+
+#ifdef MYFS_TEST_FAILPOINTS
+ZSTD_CCtx *zstd_test_get_thread_cctx(void)
+{
+    zstd_thread_context_t *context = NULL;
+    return zstd_get_thread_cctx(&context);
+}
+
+ZSTD_DCtx *zstd_test_get_thread_dctx(void)
+{
+    zstd_thread_context_t *context = NULL;
+    return zstd_get_thread_dctx(&context);
+}
+
+size_t zstd_test_get_destroy_count(void)
+{
+    return __atomic_load_n(&zstd_test_destroy_count, __ATOMIC_RELAXED);
+}
+#endif
+
 /*
  * Kiểm tra nhanh xem dữ liệu có thuộc định dạng đã biết là incompressible không.
  * Dựa trên magic bytes ở đầu buffer — không cần scan toàn bộ dữ liệu.
@@ -44,7 +166,7 @@ static int is_incompressible(const void *src, size_t src_size)
 }
 
 /*
- * Compress a chunk using Zstd one-shot API at default compression level.
+ * Compress a chunk using a thread-local Zstd context at default compression level.
  * Returns 0 on success (saved >= 12.5%), -EFBIG if not worth compressing,
  * -EIO on Zstd internal error.
  */
@@ -60,12 +182,21 @@ int zstd_compress(const void *src, size_t src_size,
         return -EFBIG;
     }
 
-    size_t const result = ZSTD_compress(dst, dst_capacity, src, src_size,
-                                        ZSTD_CLEVEL_DEFAULT);
+    zstd_thread_context_t *thread_context = NULL;
+    ZSTD_CCtx *cctx = zstd_get_thread_cctx(&thread_context);
+    /* compressCCtx mirrors ZSTD_compress(): it resets all advanced settings
+     * and retains only the requested compression level. */
+    size_t const result = cctx
+                              ? ZSTD_compressCCtx(cctx, dst, dst_capacity,
+                                                  src, src_size,
+                                                  ZSTD_CLEVEL_DEFAULT)
+                              : ZSTD_compress(dst, dst_capacity, src, src_size,
+                                              ZSTD_CLEVEL_DEFAULT);
     if (ZSTD_isError(result))
     {
         LOG("[ERROR] ZSTD_compress failed: %s\n",
             ZSTD_getErrorName(result));
+        zstd_discard_thread_cctx(thread_context);
         return -EIO;
     }
 
@@ -92,11 +223,39 @@ int zstd_decompress(const void *src, size_t src_size,
                     void *dst, size_t dst_capacity,
                     size_t *decompressed_size)
 {
-    size_t const result = ZSTD_decompress(dst, dst_capacity, src, src_size);
+    zstd_thread_context_t *thread_context = NULL;
+    ZSTD_DCtx *dctx = zstd_get_thread_dctx(&thread_context);
+    size_t result;
+
+    if (dctx)
+    {
+        /*
+         * DCtx parameters and dictionaries are sticky. Reset both session and
+         * parameters before every independent frame so a future advanced-API
+         * use cannot affect an unrelated decompression on this worker thread.
+         * This retains the context's allocations and performs no syscall.
+         */
+        result = ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters);
+        if (ZSTD_isError(result))
+        {
+            LOG("[ERROR] ZSTD_DCtx_reset failed: %s\n",
+                ZSTD_getErrorName(result));
+            zstd_discard_thread_dctx(thread_context);
+            return -EIO;
+        }
+
+        result = ZSTD_decompressDCtx(dctx, dst, dst_capacity, src, src_size);
+    }
+    else
+    {
+        result = ZSTD_decompress(dst, dst_capacity, src, src_size);
+    }
+
     if (ZSTD_isError(result))
     {
         LOG("[ERROR] ZSTD_decompress failed: %s\n",
             ZSTD_getErrorName(result));
+        zstd_discard_thread_dctx(thread_context);
         return -EIO;
     }
     *decompressed_size = result;
