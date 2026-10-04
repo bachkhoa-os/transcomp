@@ -1,4 +1,5 @@
 #include "myfs.h"
+#include "chunkio_scratch.h"
 
 /*
  * chunkio.c — engine I/O mức chunk dùng chung cho write path, truncate,
@@ -98,12 +99,15 @@ bool chunk_map_is_packed(const myfs_chunk_map_t *map, uint32_t window_size)
  */
 int myfs_chunk_payload_load(int fd, const myfs_chunk_t *chunk, char *dst)
 {
-    char *raw_buf = malloc(chunk->raw_size);
-    if (!raw_buf)
-        return -ENOMEM;
+    myfs_chunkio_scratch_lease_t raw_lease = {0};
+    int ret = myfs_chunkio_scratch_acquire(MYFS_CHUNKIO_SCRATCH_RAW,
+                                           chunk->raw_size, &raw_lease);
+    if (ret != 0)
+        return ret;
+    char *raw_buf = raw_lease.data;
 
-    int ret = pread_all(fd, raw_buf, chunk->raw_size,
-                        (off_t)chunk->physical_offset);
+    ret = pread_all(fd, raw_buf, chunk->raw_size,
+                    (off_t)chunk->physical_offset);
     if (ret == 0 && chunk->checksum != 0 &&
         chunk_crc32(raw_buf, chunk->raw_size) != chunk->checksum)
     {
@@ -134,7 +138,7 @@ int myfs_chunk_payload_load(int fd, const myfs_chunk_t *chunk, char *dst)
             ret = -EIO;
         }
     }
-    free(raw_buf);
+    myfs_chunkio_scratch_release(&raw_lease);
     return ret;
 }
 
@@ -147,9 +151,12 @@ int myfs_blob_append(int fd, off_t *eof, const char *payload, size_t len,
                      uint64_t logical_offset, myfs_chunk_t *out)
 {
     size_t bound = ZSTD_compressBound(len);
-    char *comp_buf = malloc(bound);
-    if (!comp_buf)
-        return -ENOMEM;
+    myfs_chunkio_scratch_lease_t comp_lease = {0};
+    int ret = myfs_chunkio_scratch_acquire(MYFS_CHUNKIO_SCRATCH_COMP,
+                                           bound, &comp_lease);
+    if (ret != 0)
+        return ret;
+    char *comp_buf = comp_lease.data;
 
     const char *blob = payload;
     size_t blob_size = len;
@@ -162,7 +169,7 @@ int myfs_blob_append(int fd, off_t *eof, const char *payload, size_t len,
         codec = 1;
     }
 
-    int ret = pwrite_all(fd, blob, blob_size, *eof);
+    ret = pwrite_all(fd, blob, blob_size, *eof);
     if (ret == 0)
     {
         out->logical_offset = logical_offset;
@@ -174,7 +181,7 @@ int myfs_blob_append(int fd, off_t *eof, const char *payload, size_t len,
         out->checksum = chunk_crc32(blob, blob_size);
         *eof += (off_t)blob_size;
     }
-    free(comp_buf);
+    myfs_chunkio_scratch_release(&comp_lease);
     return ret;
 }
 
@@ -212,18 +219,18 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
         return -EFBIG;
     uint32_t max_windows = (uint32_t)max_windows64;
     myfs_chunk_t *entries = malloc((size_t)max_windows * sizeof(*entries));
-    char *win_buf = malloc(window_size);
-    if (!entries || !win_buf)
+    if (!entries)
     {
-        free(entries);
-        free(win_buf);
         return -ENOMEM;
     }
 
     ret = 0;
     uint32_t count = 0;
+    myfs_chunkio_scratch_lease_t window_lease = {0};
+    char *win_buf = NULL;
     /* Cache payload của chunk vắt qua nhiều cửa sổ (legacy) — giải nén 1 lần. */
     int64_t cached_idx = -1;
+    myfs_chunkio_scratch_lease_t cached_lease = {0};
     char *cached_payload = NULL;
 
     off_t win = (off_t)myfs_window_base((uint64_t)region_lo, window_size);
@@ -274,6 +281,14 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
             continue;
         }
 
+        if (!window_lease.data)
+        {
+            ret = myfs_chunkio_scratch_acquire(
+                MYFS_CHUNKIO_SCRATCH_WINDOW, window_size, &window_lease);
+            if (ret != 0)
+                break;
+            win_buf = window_lease.data;
+        }
         memset(win_buf, 0, window_size);
         size_t win_used = 0;
 
@@ -301,13 +316,15 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
             {
                 if (cached_idx != (int64_t)i)
                 {
-                    free(cached_payload);
-                    cached_payload = malloc(c->stored_size);
-                    if (!cached_payload)
-                    {
-                        ret = -ENOMEM;
+                    myfs_chunkio_scratch_release(&cached_lease);
+                    cached_payload = NULL;
+                    cached_idx = -1;
+                    ret = myfs_chunkio_scratch_acquire(
+                        MYFS_CHUNKIO_SCRATCH_CACHED, c->stored_size,
+                        &cached_lease);
+                    if (ret != 0)
                         break;
-                    }
+                    cached_payload = cached_lease.data;
                     ret = myfs_chunk_payload_load(src_fd, c, cached_payload);
                     if (ret != 0)
                         break;
@@ -347,8 +364,8 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
         win += (off_t)window_size;
     }
 
-    free(cached_payload);
-    free(win_buf);
+    myfs_chunkio_scratch_release(&cached_lease);
+    myfs_chunkio_scratch_release(&window_lease);
     if (ret != 0)
     {
         free(entries);

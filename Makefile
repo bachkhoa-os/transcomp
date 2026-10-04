@@ -6,17 +6,17 @@ CFLAGS ?= $(DEBUG_CFLAGS)
 LIBS = `pkg-config fuse3 --cflags --libs` -lzstd -lz
 
 # Định nghĩa các thư mục mã nguồn
-CORE_SRCS = src/core/path.c src/core/metadata.c src/core/compress.c src/core/compact.c src/core/chunkio.c src/core/lock.c
+CORE_SRCS = src/core/path.c src/core/metadata.c src/core/compress.c src/core/compact.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/lock.c
 OPS_SRCS = src/fuse_ops/file.c src/fuse_ops/dir.c
 GUARD_SRCS = src/guards/guards.c
 
 SRCS = src/main.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS)
 
-.PHONY: all release run umount test test-unit test-lock test-lock-tsan bench bench-zstd-context bench-lock-table clean
+.PHONY: all release run umount test test-unit test-lock test-lock-tsan test-chunkio-scratch test-chunkio-scratch-tsan bench bench-zstd-context bench-lock-table clean
 
 all: myfs
 
-myfs: $(SRCS)
+myfs: $(SRCS) src/core/chunkio_scratch.h
 	$(CC) $(CFLAGS) -o myfs $(SRCS) $(LIBS)
 
 release:
@@ -32,10 +32,12 @@ test:
 	@chmod +x test_suite.sh
 	@./test_suite.sh mountpoint backing
 
-test-unit: tests/test_metadata tests/test_file_ops tests/test_zstd_context tests/test_lock tests/test_meta_inspect benchmarks/zstd_context_bench benchmarks/lock_table_bench benchmarks/meta_inspect
+test-unit: tests/test_metadata tests/test_file_ops tests/test_zstd_context tests/test_chunkio_scratch tests/test_chunkio_scratch_integration tests/test_lock tests/test_meta_inspect benchmarks/zstd_context_bench benchmarks/lock_table_bench benchmarks/meta_inspect
 	@./tests/test_metadata
 	@./tests/test_file_ops
 	@./tests/test_zstd_context
+	@./tests/test_chunkio_scratch
+	@./tests/test_chunkio_scratch_integration
 	@./tests/test_lock
 	@./tests/test_meta_inspect ./benchmarks/meta_inspect
 	@bash ./tests/test_suite_guard.sh
@@ -43,14 +45,30 @@ test-unit: tests/test_metadata tests/test_file_ops tests/test_zstd_context tests
 	@bash ./tests/test_zstd_context_benchmark_output.sh ./benchmarks/zstd_context_bench
 	@bash ./tests/test_lock_table_benchmark_output.sh ./benchmarks/lock_table_bench
 
-tests/test_metadata: tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c src/myfs.h
-	$(CC) $(CFLAGS) -o $@ tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c $(LIBS)
+tests/test_metadata: tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/chunkio_scratch.h src/core/compress.c src/core/path.c src/myfs.h
+	$(CC) $(CFLAGS) -o $@ tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/compress.c src/core/path.c $(LIBS)
 
-tests/test_file_ops: tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) src/myfs.h
+tests/test_file_ops: tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) src/core/chunkio_scratch.h src/myfs.h
 	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) $(LIBS)
 
 tests/test_zstd_context: tests/test_zstd_context.c src/core/compress.c src/myfs.h
 	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_zstd_context.c src/core/compress.c $(LIBS)
+
+tests/test_chunkio_scratch: tests/test_chunkio_scratch.c src/core/chunkio_scratch.c src/core/chunkio_scratch.h src/myfs.h
+	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_chunkio_scratch.c src/core/chunkio_scratch.c $(LIBS)
+
+tests/test_chunkio_scratch_integration: tests/test_chunkio_scratch_integration.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/chunkio_scratch.h src/core/compress.c src/myfs.h
+	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_chunkio_scratch_integration.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/compress.c $(LIBS)
+
+test-chunkio-scratch: tests/test_chunkio_scratch tests/test_chunkio_scratch_integration
+	@./tests/test_chunkio_scratch
+	@./tests/test_chunkio_scratch_integration
+
+test-chunkio-scratch-tsan:
+	$(CC) $(COMMON_CFLAGS) -g -O1 -DMYFS_TEST_FAILPOINTS -fsanitize=thread -fno-omit-frame-pointer -o /tmp/myfs-test-chunkio-scratch-tsan tests/test_chunkio_scratch.c src/core/chunkio_scratch.c $(LIBS)
+	@TSAN_OPTIONS=halt_on_error=1 /tmp/myfs-test-chunkio-scratch-tsan
+	$(CC) $(COMMON_CFLAGS) -g -O1 -DMYFS_TEST_FAILPOINTS -fsanitize=thread -fno-omit-frame-pointer -o /tmp/myfs-test-chunkio-scratch-integration-tsan tests/test_chunkio_scratch_integration.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/compress.c $(LIBS)
+	@TSAN_OPTIONS=halt_on_error=1 /tmp/myfs-test-chunkio-scratch-integration-tsan
 
 tests/test_lock: tests/test_lock.c src/core/lock.c src/myfs.h
 	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_lock.c src/core/lock.c $(LIBS)
@@ -62,15 +80,15 @@ test-lock-tsan:
 	$(CC) $(COMMON_CFLAGS) -g -O1 -DMYFS_TEST_FAILPOINTS -fsanitize=thread -fno-omit-frame-pointer -o /tmp/myfs-test-lock-tsan tests/test_lock.c src/core/lock.c $(LIBS)
 	@TSAN_OPTIONS=halt_on_error=1 /tmp/myfs-test-lock-tsan
 
-tests/test_meta_inspect: tests/test_meta_inspect.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c src/myfs.h
-	$(CC) $(CFLAGS) -o $@ tests/test_meta_inspect.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c $(LIBS)
+tests/test_meta_inspect: tests/test_meta_inspect.c src/core/metadata.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/chunkio_scratch.h src/core/compress.c src/core/path.c src/myfs.h
+	$(CC) $(CFLAGS) -o $@ tests/test_meta_inspect.c src/core/metadata.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/compress.c src/core/path.c $(LIBS)
 
 bench: release benchmarks/meta_inspect
 	@chmod +x benchmark.sh
 	@./benchmark.sh mountpoint backing
 
-benchmarks/meta_inspect: benchmarks/meta_inspect.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c src/myfs.h
-	$(CC) $(RELEASE_CFLAGS) -o $@ benchmarks/meta_inspect.c src/core/metadata.c src/core/chunkio.c src/core/compress.c src/core/path.c $(LIBS)
+benchmarks/meta_inspect: benchmarks/meta_inspect.c src/core/metadata.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/chunkio_scratch.h src/core/compress.c src/core/path.c src/myfs.h
+	$(CC) $(RELEASE_CFLAGS) -o $@ benchmarks/meta_inspect.c src/core/metadata.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/compress.c src/core/path.c $(LIBS)
 
 benchmarks/zstd_context_bench: benchmarks/zstd_context_bench.c src/core/compress.c src/myfs.h
 	$(CC) $(RELEASE_CFLAGS) -o $@ benchmarks/zstd_context_bench.c src/core/compress.c $(LIBS)
@@ -89,5 +107,5 @@ clean:
 		echo "[ERROR] mountpoint dang duoc mount. Chay 'make umount' truoc."; \
 		exit 1; \
 	fi
-	rm -f myfs verify_remount.sh tests/test_metadata tests/test_file_ops tests/test_zstd_context tests/test_lock tests/test_meta_inspect benchmarks/meta_inspect benchmarks/zstd_context_bench benchmarks/lock_table_bench
+	rm -f myfs verify_remount.sh tests/test_metadata tests/test_file_ops tests/test_zstd_context tests/test_chunkio_scratch tests/test_chunkio_scratch_integration tests/test_lock tests/test_meta_inspect benchmarks/meta_inspect benchmarks/zstd_context_bench benchmarks/lock_table_bench
 	rm -rf backing/* .myfs_bench.*
