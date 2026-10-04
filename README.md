@@ -68,6 +68,8 @@ Không gian logic của mỗi file được chia thành các cửa sổ cố đ�
 
 **Zstd context reuse:** mỗi FUSE worker thread tạo lười một `ZSTD_CCtx` và một `ZSTD_DCtx`, tái sử dụng chúng qua thread-local storage và tự giải phóng bằng destructor của `pthread_key_t` khi worker kết thúc. Context không bao giờ được chia sẻ giữa các thread, vì vậy đường nén/giải nén không thêm global lock và không tạo quan hệ lock-order mới với `cache_lock` hay per-path file lock. Compression giữ nguyên `ZSTD_CLEVEL_DEFAULT` và output byte-identical với API one-shot; decompression reset cả session lẫn sticky parameters trước mỗi frame. Lỗi Zstd loại context tương ứng để lần gọi sau tạo context sạch, còn lỗi cấp phát TLS tự động fallback về API one-shot với cùng semantics.
 
+**Chunk-I/O scratch reuse:** mỗi thread có bốn slot TLS tách theo vai trò `RAW`, `COMP`, `WINDOW` và `CACHED`, nên các buffer đang sống đồng thời trong repack không alias nhau. Slot tăng theo high-water mark của thread, không shrink giữa các operation, và được destructor của một `pthread_key_t` riêng giải phóng khi thread kết thúc. `RAW`/`WINDOW`/`CACHED` giữ tối đa 1 MiB mỗi slot; `COMP` giữ tối đa `ZSTD_COMPRESSBOUND(1 MiB)` = 1,052,672 byte, nên trần retained thông thường là **4,198,400 byte/thread** đã chạm đủ bốn role. Request vượt cap, lỗi khởi tạo TLS, lỗi grow, hoặc acquisition cùng role khi slot còn bận đều dùng allocation tạm thời rồi free khi release; retained buffer cũ vẫn nguyên vẹn. `entries` trả về cho caller, plaintext buffer ở FUSE, copy buffer của compaction và prefix scratch của decompressor không thuộc pool này.
+
 **Path-lock sharding:** bảng mutex theo path dùng 64 shard × 64 bucket, với FNV-1a 64-bit và fmix64 để phân bố path. Mỗi shard có mutex riêng; refcount pin cả owner, waiter và unlocker, entry được unlink khi refcount về 0 rồi mới destroy/free ngoài shard mutex. Code luôn nhả shard mutex trước khi chờ path mutex. Nếu một thao tác tương lai cần nhiều path lock, thứ tự chuẩn là tăng dần `(shard index, strcmp(path))`, deduplicate path trùng và release theo thứ tự ngược lại.
 
 ---
@@ -78,37 +80,39 @@ Không gian logic của mỗi file được chia thành các cửa sổ cố đ�
 transcomp/
 ├── Makefile
 ├── README.md
-├── benchmark.sh                 ← Đo throughput, compression ratio, RMW latency
-├── benchmark_results.txt        ← Kết quả benchmark lần chạy gần nhất
+├── benchmark.sh                  ← Đo throughput, compression ratio, RMW latency
+├── benchmark_results.txt         ← Kết quả benchmark lần chạy gần nhất
 ├── benchmarks/
-│   ├── meta_inspect.c           ← Đọc metadata bằng parser production
-│   ├── zstd_context_bench.c     ← So sánh one-shot với TLS context reuse
-│   ├── lock_table_bench.c       ← So sánh lock table linear với sharded
+│   ├── meta_inspect.c            ← Đọc metadata bằng parser production
+│   ├── zstd_context_bench.c      ← So sánh one-shot với TLS context reuse
+│   ├── chunkio_scratch_bench.c   ← malloc/free vs TLS scratch, không FUSE/I/O/Zstd
+│   ├── lock_table_bench.c        ← So sánh lock table linear với sharded
 │   └── fixtures/
-│       └── lock_table_linear.c  ← Baseline frozen từ commit add0290
-├── test_suite.sh                ← FUSE regression suite (84 checks)
-├── tests/                       ← Unit, concurrency, metadata/tooling tests
+│       └── lock_table_linear.c   ← Baseline frozen từ commit add0290
+├── test_suite.sh                 ← FUSE regression suite (84 checks)
+├── tests/                        ← Unit, concurrency, metadata/tooling tests
 ├── src/
-│   ├── myfs.h                   ← Structs, constants, prototypes, LOG macro, CRC32 helper
-│   ├── main.c                   ← Entry point, FUSE init/destroy, fuse_operations table
+│   ├── myfs.h                    ← Structs, constants, prototypes, LOG macro, CRC32 helper
+│   ├── main.c                    ← Entry point, FUSE init/destroy, fuse_operations table
 │   ├── core/
-│   │   ├── path.c               ← build_path(), build_data_path(), build_meta_path()
-│   │   ├── metadata.c           ← v0/v1/v2 reader, checkpoint + delta journal
-│   │   ├── compress.c           ← zstd_compress(), zstd_decompress(), is_incompressible()
-│   │   ├── chunkio.c            ← Engine chung: payload load, blob append, repack cửa sổ
-│   │   ├── lock.c              ← Per-file lock table (mutex theo path, refcount)
-│   │   └── compact.c            ← Generation/GC + adaptive resize + live-handle handoff
+│   │   ├── path.c                ← build_path(), build_data_path(), build_meta_path()
+│   │   ├── metadata.c            ← v0/v1/v2 reader, checkpoint + delta journal
+│   │   ├── compress.c            ← zstd_compress(), zstd_decompress(), is_incompressible()
+│   │   ├── chunkio.c             ← Engine chung: payload load, blob append, repack cửa sổ
+│   │   ├── chunkio_scratch.c/.h  ← Bốn role scratch TLS có cap + fallback tạm thời
+│   │   ├── lock.c                ← Per-file lock table (mutex theo path, refcount)
+│   │   └── compact.c             ← Generation/GC + adaptive resize + live-handle handoff
 │   ├── fuse_ops/
-│   │   ├── file.c               ← myfs_read, myfs_write, write_rmw, myfs_truncate,
-│   │   │                         myfs_create, myfs_open, myfs_release
-│   │   └── dir.c                ← myfs_getattr, myfs_readdir, myfs_mkdir,
-│   │                             myfs_rmdir, myfs_unlink, myfs_utimens
+│   │   ├── file.c                ← myfs_read, myfs_write, write_rmw, myfs_truncate,
+│   │   │                          myfs_create, myfs_open, myfs_release
+│   │   └── dir.c                 ← myfs_getattr, myfs_readdir, myfs_mkdir,
+│   │                              myfs_rmdir, myfs_unlink, myfs_utimens
 │   └── guards/
 │       ├── guards.h
-│       └── guards.c             ← Validation functions: chunk metadata, bounds, pread result
-├── benchmark-results/           ← Report cục bộ (git-ignored)
-├── backing/                     ← Backing store (.data/.meta + generation dirs sau compaction)
-└── mountpoint/                  ← Mount point (giao diện logic cho user)
+│       └── guards.c              ← Validation functions: chunk metadata, bounds, pread result
+├── benchmark-results/            ← Report cục bộ (git-ignored)
+├── backing/                      ← Backing store (.data/.meta + generation dirs sau compaction)
+└── mountpoint/                   ← Mount point (giao diện logic cho user)
 ```
 
 ---
@@ -155,7 +159,7 @@ make test
 make test-unit
 ```
 
-84 FUSE regression checks cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing, migration file legacy, ghi song song per-file locking và background compaction. `make test-unit` bổ sung metadata v0/v1/v2 + journal, cache/generation/concurrency, Zstd byte parity/error recovery/TLS isolation/destructor cleanup/sticky-parameter reset, path-lock refcount/reclamation/concurrency, metadata inspector và format output của cả hai microbenchmark.
+84 FUSE regression checks cover: basic read/write, O\_TRUNC, partial overwrite (RMW), multi-chunk file (>64KB), compression/incompressible detection, magic byte heuristic, truncate (kể cả cắt giữa chunk nén), unlink, append, cross-boundary overwrite, persistence sau remount, garbage collection, sparse hole (đọc zero + write chồng lấn), thư mục >2048 entry, durability ordering, chunk packing, migration file legacy, ghi song song per-file locking và background compaction. `make test-unit` bổ sung metadata v0/v1/v2 + journal, cache/generation/concurrency, Zstd byte parity/error recovery/TLS isolation/destructor cleanup/sticky-parameter reset, chunk-I/O scratch reuse/grow/cap/oversize/nested-acquisition/error cleanup/thread isolation, path-lock refcount/reclamation/concurrency, metadata inspector và format output của cả ba microbenchmark.
 
 ### Benchmark
 
@@ -165,6 +169,11 @@ make bench
 
 make bench-zstd-context
 # Microbenchmark one-shot vs TLS reuse: p50/p99, ops/s và 8-thread throughput
+
+make bench-chunkio-scratch
+# Standalone malloc/free vs scratch TLS; không gọi FUSE, I/O hay Zstd.
+# 7 workload × 1/8 thread × 7 paired repetitions, thứ tự chạy xen kẽ.
+# CSV chứa retained bytes/role, timed growth và temporary acquisition.
 
 make bench-lock-table
 # Linear frozen baseline vs 64×64 sharded table.
@@ -197,11 +206,26 @@ make benchmarks/meta_inspect
 | Background compaction thread | `release()` không trả tiền GC/compact; queue dedupe, drain khi unmount |
 | Writer-preferring cache rwlock | Handoff không starvation; read fast path không gọi metadata syscall |
 | Zstd context theo worker thread | Bỏ allocation mỗi call mà không share context, global lock hay serialization |
+| Scratch TLS tách 4 role, có cap | Cho phép RAW/COMP/WINDOW/CACHED sống đồng thời; giới hạn retained memory và fallback an toàn khi nested/oversize |
 | Path-lock table 64 × 64 | Giới hạn lookup theo bucket và contention theo shard, vẫn eager reclaim |
 
 ---
 
 ## Kết quả benchmark (tóm tắt)
+
+`chunkio_scratch_bench` là instrument chính cho thay đổi buffer: dùng trực tiếp production acquire/release, touch cache line đầu/cuối, warm-up trước timed phase và đo baseline/TLS theo cặp xen kẽ. Lần chạy mặc định 7 repetition ngày 2026-10-04 cho kết quả median sau (số tuyệt đối phụ thuộc host, không dùng speed threshold trong CI):
+
+| Workload | 1 thread | 8 thread | Retained/thread | Timed growth/temp |
+|---|---:|---:|---:|---:|
+| RAW 64 KiB | 1.70× | 1.85× | 65,536 B | 0 / 0 |
+| COMP bound 64 KiB | 1.73× | 1.70× | 65,824 B | 0 / 0 |
+| Partial RMW 64 KiB | 2.23× | 2.17× | 196,896 B | 0 / 0 |
+| Adaptive shrink 1 MiB → 512 KiB | 34.47× | 76.49× | 3,147,776 B | 0 / 0 |
+| Mixed 16 KiB–1 MiB | 2.37× | 2.21× | 3,149,824 B | 0 / 0 |
+| Max retained | 43.51× | 77.67× | 4,198,400 B | 0 / 0 |
+| Oversize fallback | 1.03× | 0.99× | 0 B | 0 / temporary-only |
+
+Gate output kiểm tra metric hữu hạn/dương, đủ mọi workload/mode/thread count, không grow sau warm-up, không temporary allocation ở workload thông thường, từng role không vượt cap, tổng retained không vượt 4,198,400 byte/thread, và oversize chỉ dùng allocation tạm mà không tăng retained capacity.
 
 Microbenchmark chuyên biệt cho allocation context cho kết quả lặp lại trên hai lần đo độc lập:
 
