@@ -12,9 +12,23 @@ GUARD_SRCS = src/guards/guards.c
 
 SRCS = src/main.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS)
 
-.PHONY: all release run umount test test-unit test-lock test-lock-tsan test-chunkio-scratch test-chunkio-scratch-tsan bench bench-zstd-context bench-chunkio-scratch bench-lock-table clean
+.PHONY: all help test-help release run umount test test-unit test-generation-registry tsan-generation-registry tsan-file-ops test-lock test-lock-tsan test-chunkio-scratch test-chunkio-scratch-tsan bench bench-zstd-context bench-chunkio-scratch bench-lock-table clean
 
 all: myfs
+
+help: test-help
+
+test-help:
+	@echo "Available test targets:"
+	@echo "  make test-unit                  Full unit/guard suite (no FUSE mount)"
+	@echo "  make test-generation-registry  Registry and two-phase GC tests"
+	@echo "  make tsan-generation-registry  Registry/GC tests under ThreadSanitizer"
+	@echo "  make tsan-file-ops             File/handoff tests under ThreadSanitizer"
+	@echo "  make test-lock                  Path-lock table tests"
+	@echo "  make test-lock-tsan             Path-lock tests under ThreadSanitizer"
+	@echo "  make test-chunkio-scratch       Chunk-I/O scratch tests"
+	@echo "  make test-chunkio-scratch-tsan  Chunk-I/O scratch tests under ThreadSanitizer"
+	@echo "  make test                       Mounted FUSE integration suite"
 
 myfs: $(SRCS) src/core/chunkio_scratch.h
 	$(CC) $(CFLAGS) -o myfs $(SRCS) $(LIBS)
@@ -32,9 +46,10 @@ test:
 	@chmod +x test_suite.sh
 	@./test_suite.sh mountpoint backing
 
-test-unit: tests/test_metadata tests/test_file_ops tests/test_zstd_context tests/test_chunkio_scratch tests/test_chunkio_scratch_integration tests/test_lock tests/test_meta_inspect benchmarks/zstd_context_bench benchmarks/chunkio_scratch_bench benchmarks/lock_table_bench benchmarks/meta_inspect
+test-unit: tests/test_metadata tests/test_file_ops tests/test_generation_registry tests/test_zstd_context tests/test_chunkio_scratch tests/test_chunkio_scratch_integration tests/test_lock tests/test_meta_inspect benchmarks/zstd_context_bench benchmarks/chunkio_scratch_bench benchmarks/lock_table_bench benchmarks/meta_inspect
 	@./tests/test_metadata
 	@./tests/test_file_ops
+	@./tests/test_generation_registry
 	@./tests/test_zstd_context
 	@./tests/test_chunkio_scratch
 	@./tests/test_chunkio_scratch_integration
@@ -49,8 +64,22 @@ test-unit: tests/test_metadata tests/test_file_ops tests/test_zstd_context tests
 tests/test_metadata: tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/chunkio_scratch.h src/core/compress.c src/core/path.c src/myfs.h
 	$(CC) $(CFLAGS) -o $@ tests/test_metadata.c src/core/metadata.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/compress.c src/core/path.c $(LIBS)
 
-tests/test_file_ops: tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) src/core/chunkio_scratch.h src/myfs.h
+tests/test_file_ops: tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) src/core/compact_test.h src/core/chunkio_scratch.h src/myfs.h
 	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) $(LIBS)
+
+tsan-file-ops:
+	$(CC) $(COMMON_CFLAGS) -g -O1 -DMYFS_TEST_FAILPOINTS -fsanitize=thread -fno-omit-frame-pointer -o /tmp/myfs-test-file-ops-tsan tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) $(LIBS)
+	@TSAN_OPTIONS=halt_on_error=1 /tmp/myfs-test-file-ops-tsan
+
+tests/test_generation_registry: tests/test_generation_registry.c $(CORE_SRCS) src/core/compact_test.h src/core/chunkio_scratch.h src/myfs.h
+	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_generation_registry.c $(CORE_SRCS) $(LIBS)
+
+test-generation-registry: tests/test_generation_registry
+	@./tests/test_generation_registry
+
+tsan-generation-registry:
+	$(CC) $(COMMON_CFLAGS) -g -O1 -DMYFS_TEST_FAILPOINTS -fsanitize=thread -fno-omit-frame-pointer -o /tmp/myfs-test-generation-registry-tsan tests/test_generation_registry.c $(CORE_SRCS) $(LIBS)
+	@TSAN_OPTIONS=halt_on_error=1 /tmp/myfs-test-generation-registry-tsan
 
 tests/test_zstd_context: tests/test_zstd_context.c src/core/compress.c src/myfs.h
 	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_zstd_context.c src/core/compress.c $(LIBS)
@@ -114,5 +143,5 @@ clean:
 		echo "[ERROR] mountpoint dang duoc mount. Chay 'make umount' truoc."; \
 		exit 1; \
 	fi
-	rm -f myfs verify_remount.sh tests/test_metadata tests/test_file_ops tests/test_zstd_context tests/test_chunkio_scratch tests/test_chunkio_scratch_integration tests/test_lock tests/test_meta_inspect benchmarks/meta_inspect benchmarks/zstd_context_bench benchmarks/chunkio_scratch_bench benchmarks/lock_table_bench
+	rm -f myfs verify_remount.sh tests/test_metadata tests/test_file_ops tests/test_generation_registry tests/test_zstd_context tests/test_chunkio_scratch tests/test_chunkio_scratch_integration tests/test_lock tests/test_meta_inspect benchmarks/meta_inspect benchmarks/zstd_context_bench benchmarks/chunkio_scratch_bench benchmarks/lock_table_bench
 	rm -rf backing/* .myfs_bench.*

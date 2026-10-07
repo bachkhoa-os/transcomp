@@ -55,8 +55,10 @@ static myfs_file_handle_t *get_file_handle(struct fuse_file_info *fi)
     return (myfs_file_handle_t *)(uintptr_t)fi->fh;
 }
 
-/* Caller holds myfs_metadata_mutex so the resolved generation cannot be
- * superseded between opening its descriptors and registering the reference. */
+/* Caller holds the logical path lock so compaction cannot supersede the
+ * resolved generation between opening its descriptors and registering the
+ * reference.  attach_file_handle_locked() initializes the cache_lock used by
+ * subsequent handle operations and live handoff. */
 static int attach_file_handle_locked(const myfs_storage_t *storage, int data_fd,
                                      int flags, struct fuse_file_info *fi)
 {
@@ -1185,9 +1187,10 @@ int myfs_release(const char *path, struct fuse_file_info *fi)
             release_compaction_scheduled = true;
     }
 
-    /* Compaction chạy trên background worker — release chỉ enqueue path,
-     * không còn trả tiền compact/GC đồng bộ trong FUSE op. Worker sẽ lấy
-     * file lock của path khi xử lý. */
+    /* Generation GC above completes synchronously while the path lock and
+     * handle cache write lock are held.  Only compaction scheduling happens
+     * here, after those locks have been released; the worker or synchronous
+     * fallback acquires the path lock before executing it. */
     if (!release_compaction_scheduled)
     {
         int compact_ret = schedule_compaction(path);

@@ -149,10 +149,11 @@ typedef struct myfs_file_handle
     struct myfs_file_handle *registry_next;
 } myfs_file_handle_t;
 
-/* Per-file locking: mọi thao tác mutate trên một file logic serialize qua
- * lock của path đó (hàm *_locked = caller đang giữ file lock); thao tác trên
- * các file khác nhau chạy song song. Registry generation và compaction queue
- * có mutex riêng (leaf lock — luôn lấy SAU file lock, không bao giờ ngược). */
+/* Per-file mutation serializes on the logical path lock.  Handle operations
+ * may then take cache_lock and briefly a generation-registry shard; fast reads
+ * take cache_lock -> registry shard without a path lock.  Never wait for a
+ * path or cache lock while holding a registry shard.  compact_queue_mu is
+ * released before either worker or fallback waits for a path lock. */
 typedef struct myfs_file_lock myfs_file_lock_t;
 myfs_file_lock_t *myfs_lock_file(const char *path);
 void myfs_unlock_file(myfs_file_lock_t *lk);
@@ -161,8 +162,9 @@ void destroy_lock_table(void);
 /* Cấu hình mount toàn cục (set trong main) — cho worker thread ngoài FUSE ctx. */
 extern struct myfs_config *myfs_conf;
 
-/* Background compaction worker: release() chỉ enqueue, worker thread chạy
- * compact dưới file lock của path tương ứng. */
+/* release() runs eligible generation GC synchronously, then schedules only
+ * compaction.  The worker and stopped-worker fallback both compact under the
+ * corresponding logical path lock. */
 int start_compaction_worker(void);
 void stop_compaction_worker(void);
 int schedule_compaction(const char *path);
