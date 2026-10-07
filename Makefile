@@ -71,7 +71,7 @@ tsan-file-ops:
 	$(CC) $(COMMON_CFLAGS) -g -O1 -DMYFS_TEST_FAILPOINTS -fsanitize=thread -fno-omit-frame-pointer -o /tmp/myfs-test-file-ops-tsan tests/test_file_ops.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS) $(LIBS)
 	@TSAN_OPTIONS=halt_on_error=1 /tmp/myfs-test-file-ops-tsan
 
-tests/test_generation_registry: tests/test_generation_registry.c $(CORE_SRCS) src/core/compact_test.h src/core/chunkio_scratch.h src/myfs.h
+tests/test_generation_registry: tests/test_generation_registry.c $(CORE_SRCS) src/core/compact_test.h src/core/lock_test.h src/core/chunkio_scratch.h src/myfs.h
 	$(CC) $(CFLAGS) -DMYFS_TEST_FAILPOINTS -o $@ tests/test_generation_registry.c $(CORE_SRCS) $(LIBS)
 
 test-generation-registry: tests/test_generation_registry

@@ -64,6 +64,16 @@ typedef int (*myfs_generation_handoff_test_hook_fn)(
 
 typedef void (*myfs_compaction_stop_test_hook_fn)(void *context);
 
+enum myfs_compaction_schedule_allocation_test_stage
+{
+    MYFS_COMPACTION_SCHEDULE_TEST_REQUEST_ALLOCATION = 0,
+    MYFS_COMPACTION_SCHEDULE_TEST_PATH_COPY_ALLOCATION,
+};
+
+typedef bool (*myfs_compaction_schedule_allocation_test_hook_fn)(
+    enum myfs_compaction_schedule_allocation_test_stage stage,
+    const char *path, void *context);
+
 struct myfs_compaction_queue_test_snapshot
 {
     size_t queued_requests;
@@ -80,12 +90,20 @@ int myfs_generation_registry_test_try_path_shard(const char *path);
 int myfs_generation_registry_test_snapshot(
     const myfs_storage_t *storage,
     struct myfs_generation_registry_test_snapshot *snapshot);
+int myfs_generation_registry_test_advance_gc_claim_id(
+    const myfs_storage_t *storage);
+int myfs_generation_registry_test_restore_gc_pending(
+    const myfs_storage_t *storage, uint64_t expected_claim_id);
 void myfs_generation_registry_test_set_gc_hook(
     myfs_generation_gc_test_hook_fn hook, void *context);
 void myfs_generation_registry_test_set_handoff_hook(
     myfs_generation_handoff_test_hook_fn hook, void *context);
 void myfs_compaction_test_set_stop_post_join_hook(
     myfs_compaction_stop_test_hook_fn hook, void *context);
+/* The callback runs while compact_queue_mu is held.  Returning true consumes
+ * the one-shot hook and makes that request fail as if queue allocation did. */
+void myfs_compaction_test_set_schedule_allocation_fail_hook(
+    myfs_compaction_schedule_allocation_test_hook_fn hook, void *context);
 int myfs_compaction_test_queue_snapshot(
     struct myfs_compaction_queue_test_snapshot *snapshot);
 

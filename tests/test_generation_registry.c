@@ -23,6 +23,12 @@ static struct timespec deadline_after_ms(long milliseconds)
     return deadline;
 }
 
+static void join_thread_with_timeout(pthread_t thread, long milliseconds)
+{
+    struct timespec deadline = deadline_after_ms(milliseconds);
+    assert(pthread_timedjoin_np(thread, NULL, &deadline) == 0);
+}
+
 static myfs_storage_t fake_storage(const char *path, const char *generation)
 {
     myfs_storage_t storage = {0};
@@ -321,8 +327,12 @@ static int gc_gate_hook(enum myfs_generation_gc_test_stage stage,
     assert(pthread_mutex_lock(&gate->mu) == 0);
     gate->entered = true;
     assert(pthread_cond_broadcast(&gate->cv) == 0);
+    struct timespec deadline = deadline_after_ms(10000);
     while (!gate->release)
-        assert(pthread_cond_wait(&gate->cv, &gate->mu) == 0);
+    {
+        int status = pthread_cond_timedwait(&gate->cv, &gate->mu, &deadline);
+        assert(status == 0);
+    }
     int result = gate->result;
     assert(pthread_mutex_unlock(&gate->mu) == 0);
     return result;
@@ -493,11 +503,6 @@ static void verify_gc_pause_allows_progress(
     assert(pthread_create(&gc_thread, NULL, gc_thread_main, &gc_context) == 0);
     assert(wait_for_gate(&gate));
 
-    struct myfs_generation_registry_test_snapshot claimed =
-        snapshot_for(&fixture.victim);
-    assert(claimed.gc_state == MYFS_GENERATION_GC_TEST_CLAIMED);
-    assert(claimed.gc_claim_id != 0);
-
     struct progress_context progress = {
         .mu = PTHREAD_MUTEX_INITIALIZER,
         .cv = PTHREAD_COND_INITIALIZER,
@@ -508,8 +513,8 @@ static void verify_gc_pause_allows_progress(
                           &progress) == 0);
     bool progressed = wait_for_progress(&progress);
     release_gate(&gate);
-    assert(pthread_join(progress_thread, NULL) == 0);
-    assert(pthread_join(gc_thread, NULL) == 0);
+    join_thread_with_timeout(progress_thread, 5000);
+    join_thread_with_timeout(gc_thread, 5000);
     myfs_generation_registry_test_set_gc_hook(NULL, NULL);
     assert(progressed);
     assert(gc_context.result == 0);
@@ -578,6 +583,82 @@ static void test_gc_failures_restore_pending_for_retry(void)
         MYFS_GENERATION_GC_TEST_BEFORE_ALIAS);
     test_gc_error_restores_pending_and_retry_is_idempotent(
         MYFS_GENERATION_GC_TEST_BEFORE_REMOVE);
+}
+
+struct stale_gc_claim_context
+{
+    myfs_storage_t victim;
+    uint64_t claimed_id;
+    uint64_t replacement_id;
+    unsigned calls;
+};
+
+static int replace_gc_claim_id_before_finalize(
+    enum myfs_generation_gc_test_stage stage,
+    const myfs_storage_t *storage, void *argument)
+{
+    struct stale_gc_claim_context *context = argument;
+    if (stage != MYFS_GENERATION_GC_TEST_BEFORE_FINALIZE ||
+        !storage_generation_equal(storage, &context->victim))
+        return 0;
+    struct myfs_generation_registry_test_snapshot before =
+        snapshot_for(storage);
+    assert(before.gc_state == MYFS_GENERATION_GC_TEST_CLAIMED);
+    context->claimed_id = before.gc_claim_id;
+    assert(myfs_generation_registry_test_advance_gc_claim_id(storage) == 0);
+    struct myfs_generation_registry_test_snapshot after =
+        snapshot_for(storage);
+    context->replacement_id = after.gc_claim_id;
+    assert(context->replacement_id == context->claimed_id + 1);
+    context->calls++;
+    return 0;
+}
+
+static void test_stale_gc_claim_id_does_not_finalize_newer_claim(void)
+{
+    struct gc_fixture fixture;
+    initialize_gc_fixture(&fixture, "/gc-stale-finalize", false);
+
+    myfs_file_handle_t reader;
+    initialize_handle(&reader, &fixture.victim, O_RDONLY);
+    register_handle(&reader);
+    mark_generation(&fixture.victim, false);
+
+    struct stale_gc_claim_context context = {.victim = fixture.victim};
+    myfs_generation_registry_test_set_gc_hook(
+        replace_gc_claim_id_before_finalize, &context);
+    myfs_file_lock_t *lock = myfs_lock_file(fixture.path);
+    assert(lock != NULL);
+    int gc_ret = run_generation_gc_locked(fixture.path);
+    myfs_unlock_file(lock);
+    myfs_generation_registry_test_set_gc_hook(NULL, NULL);
+
+    assert(gc_ret == -EIO);
+    assert(context.calls == 1);
+    assert(context.claimed_id != 0);
+    struct myfs_generation_registry_test_snapshot stale =
+        snapshot_for(&fixture.victim);
+    assert(stale.gc_state == MYFS_GENERATION_GC_TEST_CLAIMED);
+    assert(stale.gc_claim_id == context.replacement_id);
+    assert(stale.open_refs == 1);
+    assert(access(fixture.victim.data_path, F_OK) == 0);
+    assert(access(fixture.victim.meta_path, F_OK) == 0);
+
+    assert(myfs_generation_registry_test_restore_gc_pending(
+               &fixture.victim, context.replacement_id) == 0);
+    struct myfs_generation_registry_test_snapshot restored =
+        snapshot_for(&fixture.victim);
+    assert(restored.gc_state == MYFS_GENERATION_GC_TEST_PENDING);
+    assert(restored.gc_claim_id == context.replacement_id);
+
+    unregister_handle(&reader);
+    lock = myfs_lock_file(fixture.path);
+    assert(lock != NULL);
+    assert(run_generation_gc_locked(fixture.path) == 0);
+    myfs_unlock_file(lock);
+    assert(myfs_generation_registry_test_snapshot(&fixture.victim, NULL) ==
+           -ENOENT);
+    cleanup_gc_fixture(&fixture);
 }
 
 static void test_open_references_defer_retirement_safely(void)
@@ -901,8 +982,7 @@ static void stop_compaction_worker_with_timeout(void)
     pthread_t stop_thread;
     assert(pthread_create(&stop_thread, NULL, stop_compaction_worker_main,
                           NULL) == 0);
-    struct timespec deadline = deadline_after_ms(5000);
-    assert(pthread_timedjoin_np(stop_thread, NULL, &deadline) == 0);
+    join_thread_with_timeout(stop_thread, 5000);
 }
 
 static void make_storage_compaction_eligible(const myfs_storage_t *storage)
@@ -1109,9 +1189,32 @@ static void test_stopping_worker_uses_synchronous_fallback(void)
         snapshot_for(&fixture.active);
     assert_registry_snapshots_equal(&duplicate, &restored);
 
+    myfs_adaptive_ticket_t retry = {0};
+    lock = myfs_lock_file(fixture.path);
+    assert(lock != NULL);
+    assert(generation_observe_write_locked(&writer, 0, 0, &retry));
+    myfs_unlock_file(lock);
+    assert(retry.valid);
+    assert(retry.evaluation_id == ticket.evaluation_id + 1);
+    assert(retry.stats_snapshot.full_windows ==
+           before_ticket.adaptive_full_windows);
+    assert(retry.stats_snapshot.partial_rmw ==
+           before_ticket.adaptive_partial_rmw);
+    generation_adaptive_schedule_failed(&retry);
+    struct myfs_generation_registry_test_snapshot retry_restored =
+        snapshot_for(&fixture.active);
+    assert(retry_restored.adaptive_state ==
+           MYFS_GENERATION_ADAPTIVE_TEST_IDLE);
+    assert(retry_restored.adaptive_eval_id == retry.evaluation_id);
+    assert(retry_restored.adaptive_full_windows ==
+           before_ticket.adaptive_full_windows);
+    assert(retry_restored.adaptive_partial_rmw ==
+           before_ticket.adaptive_partial_rmw);
+    assert(retry_restored.classified_since_evaluation ==
+           before_ticket.classified_since_evaluation);
+
     release_stop_post_join_gate(&gate);
-    struct timespec deadline = deadline_after_ms(5000);
-    assert(pthread_timedjoin_np(stop_thread, NULL, &deadline) == 0);
+    join_thread_with_timeout(stop_thread, 5000);
     myfs_compaction_test_set_stop_post_join_hook(NULL, NULL);
     assert(pthread_mutex_lock(&gate.mu) == 0);
     assert(gate.calls == 1);
@@ -1264,6 +1367,22 @@ static void test_worker_shutdown_drains_inflight_and_queued_adaptive_work(void)
     assert(queued.queued_requests == 1);
     assert(!queued.head_is_null && !queued.tail_is_null);
 
+    assert(schedule_adaptive_compaction(second_path, &second_ticket) == 0);
+    assert(myfs_compaction_test_queue_snapshot(&queued) == 0);
+    assert(queued.queued_requests == 1);
+    myfs_adaptive_ticket_t wrong_evaluation = second_ticket;
+    wrong_evaluation.evaluation_id++;
+    assert(schedule_adaptive_compaction(second_path, &wrong_evaluation) ==
+           -EBUSY);
+    assert(myfs_compaction_test_queue_snapshot(&queued) == 0);
+    assert(queued.queued_requests == 1);
+    myfs_adaptive_ticket_t wrong_source = second_ticket;
+    wrong_source.source_storage = fixture.active;
+    assert(schedule_adaptive_compaction(second_path, &wrong_source) ==
+           -EBUSY);
+    assert(myfs_compaction_test_queue_snapshot(&queued) == 0);
+    assert(queued.queued_requests == 1);
+
     pthread_t stop_thread;
     assert(pthread_create(&stop_thread, NULL, stop_compaction_worker_main,
                           NULL) == 0);
@@ -1278,8 +1397,7 @@ static void test_worker_shutdown_drains_inflight_and_queued_adaptive_work(void)
            MYFS_GENERATION_ADAPTIVE_TEST_QUEUED);
 
     release_adaptive_drain_gate(&gate);
-    struct timespec deadline = deadline_after_ms(5000);
-    assert(pthread_timedjoin_np(stop_thread, NULL, &deadline) == 0);
+    join_thread_with_timeout(stop_thread, 5000);
     myfs_generation_registry_test_set_handoff_hook(NULL, NULL);
 
     struct myfs_compaction_queue_test_snapshot drained;
@@ -1521,7 +1639,7 @@ static void test_schedule_failure_restoration_races_claimed_gc(void)
     assert_ticket_restored_once(&fixture.victim, &ticket,
                                 MYFS_GENERATION_GC_TEST_CLAIMED);
     release_gate(&gate);
-    assert(pthread_join(gc_thread, NULL) == 0);
+    join_thread_with_timeout(gc_thread, 5000);
     assert(gc_context.result == -EIO);
     assert_ticket_restored_once(&fixture.victim, &ticket,
                                 MYFS_GENERATION_GC_TEST_PENDING);
@@ -1558,7 +1676,7 @@ static void test_schedule_failure_restoration_races_claimed_gc(void)
                                 MYFS_GENERATION_GC_TEST_CLAIMED);
     assert(snapshot_for(&fixture.victim).gc_claim_id == successful_claim_id);
     release_gate(&gate);
-    assert(pthread_join(gc_thread, NULL) == 0);
+    join_thread_with_timeout(gc_thread, 5000);
     assert(gc_context.result == 0);
     assert(myfs_generation_registry_test_snapshot(&fixture.victim, NULL) ==
            -ENOENT);
@@ -1676,7 +1794,7 @@ static void test_concurrent_shard_churn_is_race_free(void)
                               &contexts[i]) == 0);
     }
     for (unsigned i = 0; i < THREADS; i++)
-        assert(pthread_join(threads[i], NULL) == 0);
+        join_thread_with_timeout(threads[i], 30000);
     assert(atomic_load(&failed) == 0);
     assert(myfs_generation_registry_test_record_count() == 0);
 }
@@ -1689,6 +1807,7 @@ int main(void)
     test_sharded_destroy_is_idempotent_and_reusable();
     test_gc_io_pause_points_release_registry_shards();
     test_gc_failures_restore_pending_for_retry();
+    test_stale_gc_claim_id_does_not_finalize_newer_claim();
     test_open_references_defer_retirement_safely();
     test_legacy_references_defer_alias_replacement();
     test_alias_install_can_finish_before_old_reader_retires();

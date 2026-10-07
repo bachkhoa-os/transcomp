@@ -1351,6 +1351,61 @@ int myfs_generation_registry_test_snapshot(
     pthread_mutex_unlock(&location.shard->mu);
     return 0;
 }
+
+int myfs_generation_registry_test_advance_gc_claim_id(
+    const myfs_storage_t *storage)
+{
+    if (!storage)
+        return -EINVAL;
+    struct generation_registry_location location;
+    int status = generation_registry_location_for_path(storage->logical_path,
+                                                       &location);
+    if (status != 0)
+        return -status;
+    status = pthread_mutex_lock(&location.shard->mu);
+    if (status != 0)
+        return -status;
+    struct myfs_generation_record *record = find_generation_record_locked(
+        location.shard, location.bucket_index, storage);
+    int ret = 0;
+    if (!record)
+        ret = -ENOENT;
+    else if (record->gc_state != GENERATION_GC_CLAIMED)
+        ret = -EINVAL;
+    else if (record->gc_claim_id == UINT64_MAX)
+        ret = -EOVERFLOW;
+    else
+        record->gc_claim_id++;
+    pthread_mutex_unlock(&location.shard->mu);
+    return ret;
+}
+
+int myfs_generation_registry_test_restore_gc_pending(
+    const myfs_storage_t *storage, uint64_t expected_claim_id)
+{
+    if (!storage)
+        return -EINVAL;
+    struct generation_registry_location location;
+    int status = generation_registry_location_for_path(storage->logical_path,
+                                                       &location);
+    if (status != 0)
+        return -status;
+    status = pthread_mutex_lock(&location.shard->mu);
+    if (status != 0)
+        return -status;
+    struct myfs_generation_record *record = find_generation_record_locked(
+        location.shard, location.bucket_index, storage);
+    int ret = 0;
+    if (!record)
+        ret = -ENOENT;
+    else if (record->gc_state != GENERATION_GC_CLAIMED ||
+             record->gc_claim_id != expected_claim_id)
+        ret = -ESTALE;
+    else
+        record->gc_state = GENERATION_GC_PENDING;
+    pthread_mutex_unlock(&location.shard->mu);
+    return ret;
+}
 #endif
 
 static int pread_full_at(int fd, void *buf, size_t size, off_t offset)
@@ -2141,6 +2196,9 @@ static bool compact_worker_stop;
 #ifdef MYFS_TEST_FAILPOINTS
 static myfs_compaction_stop_test_hook_fn compact_stop_post_join_test_hook;
 static void *compact_stop_post_join_test_hook_context;
+static myfs_compaction_schedule_allocation_test_hook_fn
+    compact_schedule_allocation_test_hook;
+static void *compact_schedule_allocation_test_hook_context;
 
 void myfs_compaction_test_set_stop_post_join_hook(
     myfs_compaction_stop_test_hook_fn hook, void *context)
@@ -2150,6 +2208,29 @@ void myfs_compaction_test_set_stop_post_join_hook(
     compact_stop_post_join_test_hook = hook;
     compact_stop_post_join_test_hook_context = context;
     pthread_mutex_unlock(&compact_queue_mu);
+}
+
+void myfs_compaction_test_set_schedule_allocation_fail_hook(
+    myfs_compaction_schedule_allocation_test_hook_fn hook, void *context)
+{
+    if (pthread_mutex_lock(&compact_queue_mu) != 0)
+        return;
+    compact_schedule_allocation_test_hook = hook;
+    compact_schedule_allocation_test_hook_context = context;
+    pthread_mutex_unlock(&compact_queue_mu);
+}
+
+static bool compact_schedule_allocation_test_should_fail(
+    enum myfs_compaction_schedule_allocation_test_stage stage,
+    const char *path)
+{
+    if (!compact_schedule_allocation_test_hook ||
+        !compact_schedule_allocation_test_hook(
+            stage, path, compact_schedule_allocation_test_hook_context))
+        return false;
+    compact_schedule_allocation_test_hook = NULL;
+    compact_schedule_allocation_test_hook_context = NULL;
+    return true;
 }
 
 int myfs_compaction_test_queue_snapshot(
@@ -2225,8 +2306,22 @@ static int schedule_request(const char *path, bool ordinary,
             return 0; /* đã có trong hàng đợi */
         }
     }
-    struct compact_request *req = malloc(sizeof(*req));
-    char *copy = req ? strdup(path) : NULL;
+    struct compact_request *req =
+#ifdef MYFS_TEST_FAILPOINTS
+        compact_schedule_allocation_test_should_fail(
+            MYFS_COMPACTION_SCHEDULE_TEST_REQUEST_ALLOCATION, path)
+            ? NULL :
+#endif
+        malloc(sizeof(*req));
+    char *copy = NULL;
+    if (req)
+    {
+#ifdef MYFS_TEST_FAILPOINTS
+        if (!compact_schedule_allocation_test_should_fail(
+                MYFS_COMPACTION_SCHEDULE_TEST_PATH_COPY_ALLOCATION, path))
+#endif
+            copy = strdup(path);
+    }
     if (!req || !copy)
     {
         free(req);

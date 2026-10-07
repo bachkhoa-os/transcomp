@@ -4,6 +4,41 @@
 #include <assert.h>
 #include <stdatomic.h>
 
+static struct timespec deadline_after_ms(long milliseconds)
+{
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += milliseconds / 1000;
+    deadline.tv_nsec += (milliseconds % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L)
+    {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    return deadline;
+}
+
+static int join_thread_with_timeout(pthread_t thread, long milliseconds)
+{
+    struct timespec deadline = deadline_after_ms(milliseconds);
+    return pthread_timedjoin_np(thread, NULL, &deadline);
+}
+
+static void *stop_compaction_worker_main(void *argument)
+{
+    (void)argument;
+    stop_compaction_worker();
+    return NULL;
+}
+
+static void stop_compaction_worker_with_timeout(void)
+{
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, stop_compaction_worker_main, NULL) ==
+           0);
+    assert(join_thread_with_timeout(thread, 10000) == 0);
+}
+
 static void test_open_handle_reads_from_its_cache(const char *dir)
 {
     struct myfs_config conf = {0};
@@ -260,7 +295,7 @@ static void test_getattr_epoch_and_truncate_preserve_reader_bundle(
 
     struct fuse_file_info truncator = {.flags = O_RDWR | O_TRUNC};
     assert(myfs_open("/coherent", &truncator) == 0);
-    assert(pthread_join(reader, NULL) == 0);
+    assert(join_thread_with_timeout(reader, 5000) == 0);
     assert(read_ctx.result == 6);
     assert(memcmp(read_ctx.data, "abcdef", 6) == 0);
     unsetenv("MYFS_TEST_READ_HOLD_MS");
@@ -399,8 +434,12 @@ static int handoff_test_hook_main(
     hook->executing_thread_valid = true;
     hook->entered = true;
     assert(pthread_cond_broadcast(&hook->cv) == 0);
+    struct timespec deadline = deadline_after_ms(10000);
     while (hook->pause && !hook->release)
-        assert(pthread_cond_wait(&hook->cv, &hook->mu) == 0);
+    {
+        int status = pthread_cond_timedwait(&hook->cv, &hook->mu, &deadline);
+        assert(status == 0);
+    }
     int result = hook->result;
     assert(pthread_mutex_unlock(&hook->mu) == 0);
     return result;
@@ -460,6 +499,188 @@ static void write_partial_samples(const char *path,
         assert(myfs_write(path, "X", 1, 0, writer) == 1);
 }
 
+struct schedule_allocation_failure
+{
+    char path[PATH_MAX];
+    pthread_t thread;
+    enum myfs_compaction_schedule_allocation_test_stage stage;
+    unsigned matching_calls;
+};
+
+static bool fail_schedule_allocation_once(
+    enum myfs_compaction_schedule_allocation_test_stage stage,
+    const char *path, void *argument)
+{
+    struct schedule_allocation_failure *failure = argument;
+    if (stage != failure->stage || strcmp(path, failure->path) != 0 ||
+        !pthread_equal(pthread_self(), failure->thread))
+        return false;
+    failure->matching_calls++;
+    assert(failure->matching_calls == 1);
+    return true;
+}
+
+static struct myfs_generation_registry_test_snapshot
+prime_adaptive_evidence(const char *path, myfs_file_handle_t *handle)
+{
+    myfs_file_lock_t *lock = myfs_lock_file(path);
+    assert(lock != NULL);
+    assert(!generation_observe_write_locked(handle, 0, 128, NULL));
+    myfs_unlock_file(lock);
+    struct myfs_generation_registry_test_snapshot snapshot =
+        registry_snapshot(&handle->storage);
+    assert(snapshot.adaptive_state == MYFS_GENERATION_ADAPTIVE_TEST_IDLE);
+    assert(snapshot.adaptive_full_windows == 0);
+    assert(snapshot.adaptive_partial_rmw == 128);
+    assert(snapshot.classified_since_evaluation == 128);
+    return snapshot;
+}
+
+static void assert_adaptive_evidence_restored(
+    const myfs_storage_t *storage,
+    const struct myfs_generation_registry_test_snapshot *before,
+    uint64_t expected_evaluation_id)
+{
+    struct myfs_generation_registry_test_snapshot restored =
+        registry_snapshot(storage);
+    assert(restored.adaptive_state == MYFS_GENERATION_ADAPTIVE_TEST_IDLE);
+    assert(restored.adaptive_full_windows ==
+           before->adaptive_full_windows);
+    assert(restored.adaptive_partial_rmw == before->adaptive_partial_rmw);
+    assert(restored.classified_since_evaluation ==
+           before->classified_since_evaluation);
+    assert(restored.adaptive_eval_id == expected_evaluation_id);
+}
+
+static myfs_adaptive_ticket_t claim_fresh_adaptive_ticket(
+    const char *path, myfs_file_handle_t *handle,
+    const struct myfs_generation_registry_test_snapshot *before)
+{
+    myfs_adaptive_ticket_t ticket = {0};
+    myfs_file_lock_t *lock = myfs_lock_file(path);
+    assert(lock != NULL);
+    assert(generation_observe_write_locked(handle, 0, 0, &ticket));
+    myfs_unlock_file(lock);
+    assert(ticket.valid);
+    assert(ticket.stats_snapshot.full_windows ==
+           before->adaptive_full_windows);
+    assert(ticket.stats_snapshot.partial_rmw ==
+           before->adaptive_partial_rmw);
+    return ticket;
+}
+
+static void initialize_schedule_failure(
+    struct schedule_allocation_failure *failure, const char *path,
+    enum myfs_compaction_schedule_allocation_test_stage stage)
+{
+    memset(failure, 0, sizeof(*failure));
+    assert(snprintf(failure->path, sizeof(failure->path), "%s", path) <
+           (int)sizeof(failure->path));
+    failure->thread = pthread_self();
+    failure->stage = stage;
+}
+
+static void test_write_restores_adaptive_ticket_after_enqueue_failure(
+    const char *dir)
+{
+    struct myfs_config conf = {0};
+    assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+           (int)sizeof(conf.root));
+    myfs_conf = &conf;
+    stop_compaction_worker_with_timeout();
+    assert(start_compaction_worker() == 0);
+
+    const char *path = "/write-schedule-failure";
+    struct fuse_file_info writer = {.flags = O_RDWR};
+    assert(myfs_create(path, 0600, &writer) == 0);
+    assert(myfs_write(path, "initial-data", 12, 0, &writer) == 12);
+    myfs_file_handle_t *handle =
+        (myfs_file_handle_t *)(uintptr_t)writer.fh;
+    myfs_storage_t storage = handle->storage;
+    struct myfs_generation_registry_test_snapshot before =
+        prime_adaptive_evidence(path, handle);
+
+    struct schedule_allocation_failure failure;
+    initialize_schedule_failure(
+        &failure, path,
+        MYFS_COMPACTION_SCHEDULE_TEST_REQUEST_ALLOCATION);
+    myfs_compaction_test_set_schedule_allocation_fail_hook(
+        fail_schedule_allocation_once, &failure);
+    assert(myfs_write(path, "Z", 1, 2 * MYFS_DEFAULT_WINDOW_SIZE,
+                      &writer) == 1);
+    myfs_compaction_test_set_schedule_allocation_fail_hook(NULL, NULL);
+    assert(failure.matching_calls == 1);
+    struct myfs_compaction_queue_test_snapshot queue;
+    assert(myfs_compaction_test_queue_snapshot(&queue) == 0);
+    assert(queue.queued_requests == 0);
+    assert(queue.head_is_null && queue.tail_is_null);
+    assert(queue.worker_running && !queue.stop_requested);
+    assert_adaptive_evidence_restored(
+        &storage, &before, before.adaptive_eval_id + 1);
+
+    myfs_adaptive_ticket_t retry = claim_fresh_adaptive_ticket(
+        path, handle, &before);
+    generation_adaptive_schedule_failed(&retry);
+    assert_adaptive_evidence_restored(
+        &storage, &before, before.adaptive_eval_id + 2);
+
+    assert(myfs_release(path, &writer) == 0);
+    assert(writer.fh == 0);
+    stop_compaction_worker_with_timeout();
+    myfs_conf = NULL;
+}
+
+static void test_release_restores_adaptive_ticket_after_enqueue_failure(
+    const char *dir)
+{
+    struct myfs_config conf = {0};
+    assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+           (int)sizeof(conf.root));
+    myfs_conf = &conf;
+    stop_compaction_worker_with_timeout();
+    assert(start_compaction_worker() == 0);
+
+    const char *path = "/release-schedule-failure";
+    struct fuse_file_info writer = {.flags = O_RDWR};
+    assert(myfs_create(path, 0600, &writer) == 0);
+    assert(myfs_write(path, "initial-data", 12, 0, &writer) == 12);
+    myfs_file_handle_t *handle =
+        (myfs_file_handle_t *)(uintptr_t)writer.fh;
+    myfs_storage_t storage = handle->storage;
+    struct myfs_generation_registry_test_snapshot before =
+        prime_adaptive_evidence(path, handle);
+
+    struct schedule_allocation_failure failure;
+    initialize_schedule_failure(
+        &failure, path,
+        MYFS_COMPACTION_SCHEDULE_TEST_PATH_COPY_ALLOCATION);
+    myfs_compaction_test_set_schedule_allocation_fail_hook(
+        fail_schedule_allocation_once, &failure);
+    assert(myfs_release(path, &writer) == 0);
+    assert(writer.fh == 0);
+    myfs_compaction_test_set_schedule_allocation_fail_hook(NULL, NULL);
+    assert(failure.matching_calls == 1);
+    stop_compaction_worker_with_timeout();
+    assert_adaptive_evidence_restored(
+        &storage, &before, before.adaptive_eval_id + 1);
+    struct myfs_generation_registry_test_snapshot released =
+        registry_snapshot(&storage);
+    assert(released.open_refs == 0 && released.writer_refs == 0);
+
+    struct fuse_file_info retry_writer = {.flags = O_RDWR};
+    assert(myfs_open(path, &retry_writer) == 0);
+    myfs_file_handle_t *retry_handle =
+        (myfs_file_handle_t *)(uintptr_t)retry_writer.fh;
+    assert(storage_generation_equal(&retry_handle->storage, &storage));
+    myfs_adaptive_ticket_t retry = claim_fresh_adaptive_ticket(
+        path, retry_handle, &before);
+    generation_adaptive_schedule_failed(&retry);
+    assert_adaptive_evidence_restored(
+        &storage, &before, before.adaptive_eval_id + 2);
+    assert(myfs_release(path, &retry_writer) == 0);
+    myfs_conf = NULL;
+}
+
 static void assert_handle_bundle(myfs_file_handle_t *handle,
                                  const myfs_storage_t *storage,
                                  uint32_t window_size)
@@ -512,7 +733,7 @@ static void test_handoff_publication_failure_outcomes(const char *dir)
     assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
            (int)sizeof(conf.root));
     myfs_conf = &conf;
-    stop_compaction_worker();
+    stop_compaction_worker_with_timeout();
 
     struct fuse_file_info writer = {.flags = O_RDWR};
     assert(myfs_create("/pre-publish-failure", 0600, &writer) == 0);
@@ -699,7 +920,7 @@ static struct execution_context_outcome run_execution_context_case(
     assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
            (int)sizeof(conf.root));
     myfs_conf = &conf;
-    stop_compaction_worker();
+    stop_compaction_worker_with_timeout();
     if (worker_running)
         assert(start_compaction_worker() == 0);
 
@@ -770,7 +991,7 @@ static struct execution_context_outcome run_execution_context_case(
         myfs_generation_registry_test_snapshot(&old_storage, NULL) == -ENOENT;
     assert(outcome.old_retired_on_reader_release);
     assert(myfs_release(path, &writer) == 0);
-    stop_compaction_worker();
+    stop_compaction_worker_with_timeout();
     destroy_handoff_hook(&hook);
     myfs_conf = NULL;
     return outcome;
@@ -832,8 +1053,12 @@ static int release_gc_hook(enum myfs_generation_gc_test_stage stage,
     assert(pthread_mutex_lock(&gate->mu) == 0);
     gate->entered = true;
     assert(pthread_cond_broadcast(&gate->cv) == 0);
+    struct timespec deadline = deadline_after_ms(10000);
     while (!gate->release)
-        assert(pthread_cond_wait(&gate->cv, &gate->mu) == 0);
+    {
+        int status = pthread_cond_timedwait(&gate->cv, &gate->mu, &deadline);
+        assert(status == 0);
+    }
     assert(pthread_mutex_unlock(&gate->mu) == 0);
     return 0;
 }
@@ -870,20 +1095,23 @@ static void wait_for_release_gc_gate(struct release_gc_gate *gate)
     assert(pthread_mutex_unlock(&gate->mu) == 0);
 }
 
-static void test_release_runs_generation_gc_synchronously(const char *dir)
+static void test_release_gc_does_not_block_old_generation_fast_read(
+    const char *dir)
 {
     struct myfs_config conf = {0};
     assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
            (int)sizeof(conf.root));
     myfs_conf = &conf;
-    stop_compaction_worker();
+    stop_compaction_worker_with_timeout();
 
     const char *path = "/release-synchronous-gc";
     struct fuse_file_info writer = {.flags = O_RDWR};
     assert(myfs_create(path, 0600, &writer) == 0);
     assert(myfs_write(path, "initial-data", 12, 0, &writer) == 12);
-    struct fuse_file_info reader = {.flags = O_RDONLY};
-    assert(myfs_open(path, &reader) == 0);
+    struct fuse_file_info releasing_reader = {.flags = O_RDONLY};
+    struct fuse_file_info fast_reader = {.flags = O_RDONLY};
+    assert(myfs_open(path, &releasing_reader) == 0);
+    assert(myfs_open(path, &fast_reader) == 0);
     myfs_file_handle_t *writer_handle =
         (myfs_file_handle_t *)(uintptr_t)writer.fh;
     myfs_storage_t old_storage = writer_handle->storage;
@@ -892,7 +1120,17 @@ static void test_release_runs_generation_gc_synchronously(const char *dir)
     struct myfs_generation_registry_test_snapshot pending =
         registry_snapshot(&old_storage);
     assert(pending.gc_state == MYFS_GENERATION_GC_TEST_PENDING);
-    assert(pending.open_refs == 1 && pending.writer_refs == 0);
+    assert(pending.open_refs == 2 && pending.writer_refs == 0);
+
+    char warm[16] = {0};
+    assert(myfs_read(path, warm, sizeof(warm), 0, &fast_reader) == 12);
+    assert(memcmp(warm, "Xnitial-data", 12) == 0);
+    myfs_file_handle_t *fast_handle =
+        (myfs_file_handle_t *)(uintptr_t)fast_reader.fh;
+    assert(pthread_rwlock_rdlock(&fast_handle->cache_lock) == 0);
+    assert(fast_handle->cache_valid);
+    assert(fast_handle->seen_metadata_epoch == pending.metadata_epoch);
+    pthread_rwlock_unlock(&fast_handle->cache_lock);
 
     struct release_gc_gate gate = {
         .victim = old_storage,
@@ -902,7 +1140,7 @@ static void test_release_runs_generation_gc_synchronously(const char *dir)
     myfs_generation_registry_test_set_gc_hook(release_gc_hook, &gate);
     struct release_thread_context release_context = {
         .path = path,
-        .fi = &reader,
+        .fi = &releasing_reader,
         .result = -1,
     };
     pthread_t release_thread;
@@ -911,20 +1149,49 @@ static void test_release_runs_generation_gc_synchronously(const char *dir)
     wait_for_release_gc_gate(&gate);
     assert(atomic_load(&release_context.started));
     assert(!atomic_load(&release_context.finished));
-    struct myfs_generation_registry_test_snapshot claimed =
-        registry_snapshot(&old_storage);
-    assert(claimed.gc_state == MYFS_GENERATION_GC_TEST_CLAIMED);
-    assert(claimed.gc_claim_id > pending.gc_claim_id);
+
+    int shard_status = myfs_generation_registry_test_try_path_shard(path);
+    struct myfs_generation_registry_test_snapshot claimed = {0};
+    if (shard_status == 0)
+        claimed = registry_snapshot(&old_storage);
+
+    struct one_read_context read_context = {
+        .path = path,
+        .fi = &fast_reader,
+        .result = -1,
+    };
+    pthread_t read_thread;
+    assert(pthread_create(&read_thread, NULL, one_reader, &read_context) == 0);
+    int read_join_status = join_thread_with_timeout(read_thread, 2000);
 
     assert(pthread_mutex_lock(&gate.mu) == 0);
     gate.release = true;
     assert(pthread_cond_broadcast(&gate.cv) == 0);
     assert(pthread_mutex_unlock(&gate.mu) == 0);
-    assert(pthread_join(release_thread, NULL) == 0);
+    if (read_join_status != 0)
+        assert(join_thread_with_timeout(read_thread, 5000) == 0);
+    assert(join_thread_with_timeout(release_thread, 5000) == 0);
     myfs_generation_registry_test_set_gc_hook(NULL, NULL);
+
+    assert(read_join_status == 0);
+    assert(shard_status == 0);
+    assert(claimed.gc_state == MYFS_GENERATION_GC_TEST_CLAIMED);
+    assert(claimed.gc_claim_id > pending.gc_claim_id);
+    assert(claimed.open_refs == 1);
+    assert(read_context.result == 12);
+    assert(memcmp(read_context.data, "Xnitial-data", 12) == 0);
     assert(release_context.result == 0);
     assert(atomic_load(&release_context.finished));
-    assert(reader.fh == 0);
+    assert(releasing_reader.fh == 0);
+
+    struct myfs_generation_registry_test_snapshot deferred =
+        registry_snapshot(&old_storage);
+    assert(deferred.gc_state == MYFS_GENERATION_GC_TEST_PENDING);
+    assert(deferred.open_refs == 1 && deferred.writer_refs == 0);
+    assert(access(old_storage.data_path, F_OK) == 0);
+    assert(access(old_storage.meta_path, F_OK) == 0);
+
+    assert(myfs_release(path, &fast_reader) == 0);
     assert(myfs_generation_registry_test_snapshot(&old_storage, NULL) ==
            -ENOENT);
 
@@ -1031,7 +1298,7 @@ static void test_live_writer_is_rebound_after_periodic_resize(const char *dir)
     }
     assert(atomic_load(&blocked.started));
     release_handoff_hook(&hook);
-    assert(pthread_join(blocked_thread, NULL) == 0);
+    assert(join_thread_with_timeout(blocked_thread, 5000) == 0);
     assert(blocked.result == PAYLOAD_SIZE);
     assert(memcmp(blocked.out, blocked.expected, PAYLOAD_SIZE) == 0);
     free(blocked_output);
@@ -1064,7 +1331,7 @@ static void test_live_writer_is_rebound_after_periodic_resize(const char *dir)
     assert(elapsed_seconds(started, completed) <= 2.0);
     atomic_store(&readers.stop, true);
     for (size_t i = 0; i < 8; i++)
-        assert(pthread_join(threads[i], NULL) == 0);
+        assert(join_thread_with_timeout(threads[i], 30000) == 0);
     assert(atomic_load(&readers.failures) == 0);
     unsetenv("MYFS_TEST_READ_HOLD_MS");
 
@@ -1132,7 +1399,7 @@ static void test_live_writer_is_rebound_after_periodic_resize(const char *dir)
            -ENOENT);
     assert(myfs_release("/adaptive", &fi) == 0);
     assert(myfs_release("/adaptive", &second_writer) == 0);
-    stop_compaction_worker();
+    stop_compaction_worker_with_timeout();
     free(expected);
     myfs_conf = NULL;
 }
@@ -1161,6 +1428,20 @@ int main(void)
     char *readonly_release_dir = mkdtemp(readonly_release_template);
     assert(readonly_release_dir != NULL);
     test_readonly_release_does_not_claim_writer_sample(readonly_release_dir);
+    char write_schedule_failure_template[] =
+        "/tmp/myfs-write-schedule-failure-XXXXXX";
+    char *write_schedule_failure_dir =
+        mkdtemp(write_schedule_failure_template);
+    assert(write_schedule_failure_dir != NULL);
+    test_write_restores_adaptive_ticket_after_enqueue_failure(
+        write_schedule_failure_dir);
+    char release_schedule_failure_template[] =
+        "/tmp/myfs-release-schedule-failure-XXXXXX";
+    char *release_schedule_failure_dir =
+        mkdtemp(release_schedule_failure_template);
+    assert(release_schedule_failure_dir != NULL);
+    test_release_restores_adaptive_ticket_after_enqueue_failure(
+        release_schedule_failure_dir);
     char coherence_template[] = "/tmp/myfs-coherence-test-XXXXXX";
     char *coherence_dir = mkdtemp(coherence_template);
     assert(coherence_dir != NULL);
@@ -1184,7 +1465,7 @@ int main(void)
     char release_gc_template[] = "/tmp/myfs-release-gc-XXXXXX";
     char *release_gc_dir = mkdtemp(release_gc_template);
     assert(release_gc_dir != NULL);
-    test_release_runs_generation_gc_synchronously(release_gc_dir);
+    test_release_gc_does_not_block_old_generation_fast_read(release_gc_dir);
     destroy_generation_registry();
     destroy_lock_table();
     return 0;
