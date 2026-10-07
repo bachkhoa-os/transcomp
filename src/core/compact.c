@@ -2134,13 +2134,55 @@ static pthread_t compact_worker_thread;
 static bool compact_worker_running;
 static bool compact_worker_stop;
 
+/* Worker start/stop is serialized by init/destroy, and request producers are
+ * quiescent before destroy.  Once stop is set under compact_queue_mu, new work
+ * uses synchronous fallback; the worker exits only after the queue is empty. */
+
+#ifdef MYFS_TEST_FAILPOINTS
+static myfs_compaction_stop_test_hook_fn compact_stop_post_join_test_hook;
+static void *compact_stop_post_join_test_hook_context;
+
+void myfs_compaction_test_set_stop_post_join_hook(
+    myfs_compaction_stop_test_hook_fn hook, void *context)
+{
+    if (pthread_mutex_lock(&compact_queue_mu) != 0)
+        return;
+    compact_stop_post_join_test_hook = hook;
+    compact_stop_post_join_test_hook_context = context;
+    pthread_mutex_unlock(&compact_queue_mu);
+}
+
+int myfs_compaction_test_queue_snapshot(
+    struct myfs_compaction_queue_test_snapshot *snapshot)
+{
+    if (!snapshot)
+        return -EINVAL;
+    int status = pthread_mutex_lock(&compact_queue_mu);
+    if (status != 0)
+        return -status;
+    size_t queued_requests = 0;
+    for (struct compact_request *request = compact_queue_head;
+         request; request = request->next)
+        queued_requests++;
+    *snapshot = (struct myfs_compaction_queue_test_snapshot){
+        .queued_requests = queued_requests,
+        .head_is_null = compact_queue_head == NULL,
+        .tail_is_null = compact_queue_tail == NULL,
+        .worker_running = compact_worker_running,
+        .stop_requested = compact_worker_stop,
+    };
+    pthread_mutex_unlock(&compact_queue_mu);
+    return 0;
+}
+#endif
+
 static int schedule_request(const char *path, bool ordinary,
                             const myfs_adaptive_ticket_t *ticket)
 {
     pthread_mutex_lock(&compact_queue_mu);
-    if (!compact_worker_running)
+    if (!compact_worker_running || compact_worker_stop)
     {
-        /* Worker chưa chạy hoặc đã dừng: thực hiện compaction đồng bộ dưới
+        /* Worker chưa chạy hoặc đang dừng: thực hiện compaction đồng bộ dưới
          * path lock để không bỏ sót request. */
         pthread_mutex_unlock(&compact_queue_mu);
         if (ticket && ticket->valid)
@@ -2291,10 +2333,20 @@ void stop_compaction_worker(void)
         return;
     }
     compact_worker_stop = true;
+#ifdef MYFS_TEST_FAILPOINTS
+    myfs_compaction_stop_test_hook_fn post_join_hook =
+        compact_stop_post_join_test_hook;
+    void *post_join_hook_context = compact_stop_post_join_test_hook_context;
+#endif
     pthread_cond_broadcast(&compact_queue_cv);
     pthread_mutex_unlock(&compact_queue_mu);
 
     pthread_join(compact_worker_thread, NULL);
+
+#ifdef MYFS_TEST_FAILPOINTS
+    if (post_join_hook)
+        post_join_hook(post_join_hook_context);
+#endif
 
     pthread_mutex_lock(&compact_queue_mu);
     compact_worker_running = false;

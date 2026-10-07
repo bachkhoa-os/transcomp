@@ -62,6 +62,17 @@ typedef int (*myfs_generation_handoff_test_hook_fn)(
     const myfs_storage_t *old_storage,
     const myfs_storage_t *new_storage, void *context);
 
+typedef void (*myfs_compaction_stop_test_hook_fn)(void *context);
+
+struct myfs_compaction_queue_test_snapshot
+{
+    size_t queued_requests;
+    bool head_is_null;
+    bool tail_is_null;
+    bool worker_running;
+    bool stop_requested;
+};
+
 size_t myfs_generation_registry_test_shard_index(const char *path);
 size_t myfs_generation_registry_test_bucket_index(const char *path);
 size_t myfs_generation_registry_test_record_count(void);
@@ -73,6 +84,10 @@ void myfs_generation_registry_test_set_gc_hook(
     myfs_generation_gc_test_hook_fn hook, void *context);
 void myfs_generation_registry_test_set_handoff_hook(
     myfs_generation_handoff_test_hook_fn hook, void *context);
+void myfs_compaction_test_set_stop_post_join_hook(
+    myfs_compaction_stop_test_hook_fn hook, void *context);
+int myfs_compaction_test_queue_snapshot(
+    struct myfs_compaction_queue_test_snapshot *snapshot);
 
 #endif
 

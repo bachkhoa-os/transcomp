@@ -935,6 +935,405 @@ static void make_storage_compaction_eligible(const myfs_storage_t *storage)
     assert(save_chunk_map_to_path(storage->meta_path, &inode) == 0);
 }
 
+struct stop_post_join_gate
+{
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool entered;
+    bool release;
+    unsigned calls;
+};
+
+static void pause_stop_after_join(void *argument)
+{
+    struct stop_post_join_gate *gate = argument;
+    assert(pthread_mutex_lock(&gate->mu) == 0);
+    gate->calls++;
+    assert(gate->calls == 1);
+    gate->entered = true;
+    assert(pthread_cond_broadcast(&gate->cv) == 0);
+    struct timespec deadline = deadline_after_ms(5000);
+    while (!gate->release)
+    {
+        int status = pthread_cond_timedwait(&gate->cv, &gate->mu, &deadline);
+        assert(status == 0);
+    }
+    assert(pthread_mutex_unlock(&gate->mu) == 0);
+}
+
+static void wait_for_stop_post_join_gate(struct stop_post_join_gate *gate)
+{
+    assert(pthread_mutex_lock(&gate->mu) == 0);
+    struct timespec deadline = deadline_after_ms(5000);
+    while (!gate->entered)
+    {
+        int status = pthread_cond_timedwait(&gate->cv, &gate->mu, &deadline);
+        assert(status == 0);
+    }
+    assert(pthread_mutex_unlock(&gate->mu) == 0);
+}
+
+static void release_stop_post_join_gate(struct stop_post_join_gate *gate)
+{
+    assert(pthread_mutex_lock(&gate->mu) == 0);
+    gate->release = true;
+    assert(pthread_cond_broadcast(&gate->cv) == 0);
+    assert(pthread_mutex_unlock(&gate->mu) == 0);
+}
+
+struct submitter_lock_failure
+{
+    char path[PATH_MAX];
+    pthread_t submitter;
+    unsigned matching_calls;
+};
+
+static bool fail_submitter_path_lock_once(const char *path, void *argument)
+{
+    struct submitter_lock_failure *failure = argument;
+    if (strcmp(path, failure->path) != 0 ||
+        !pthread_equal(pthread_self(), failure->submitter))
+        return false;
+    failure->matching_calls++;
+    assert(failure->matching_calls == 1);
+    return true;
+}
+
+static void assert_registry_snapshots_equal(
+    const struct myfs_generation_registry_test_snapshot *actual,
+    const struct myfs_generation_registry_test_snapshot *expected)
+{
+    assert(actual->open_refs == expected->open_refs);
+    assert(actual->writer_refs == expected->writer_refs);
+    assert(actual->metadata_epoch == expected->metadata_epoch);
+    assert(actual->gc_claim_id == expected->gc_claim_id);
+    assert(actual->gc_state == expected->gc_state);
+    assert(actual->install_aliases == expected->install_aliases);
+    assert(actual->adaptive_full_windows == expected->adaptive_full_windows);
+    assert(actual->adaptive_partial_rmw == expected->adaptive_partial_rmw);
+    assert(actual->classified_since_evaluation ==
+           expected->classified_since_evaluation);
+    assert(actual->adaptive_eval_id == expected->adaptive_eval_id);
+    assert(actual->adaptive_state == expected->adaptive_state);
+    assert(actual->superseded == expected->superseded);
+}
+
+static void test_stopping_worker_uses_synchronous_fallback(void)
+{
+    stop_compaction_worker_with_timeout();
+    struct gc_fixture fixture;
+    initialize_gc_fixture(&fixture, "/worker-stop-fallback", false);
+    make_storage_compaction_eligible(&fixture.active);
+
+    myfs_file_handle_t writer;
+    initialize_handle(&writer, &fixture.active, O_RDWR);
+    register_handle(&writer);
+
+    myfs_adaptive_ticket_t seed = queue_adaptive_ticket(&writer);
+    myfs_adaptive_ticket_t unexpected = {0};
+    myfs_file_lock_t *lock = myfs_lock_file(fixture.path);
+    assert(lock != NULL);
+    assert(!generation_observe_write_locked(&writer, 0, 17, &unexpected));
+    myfs_unlock_file(lock);
+    assert(!unexpected.valid);
+    generation_adaptive_schedule_failed(&seed);
+    struct myfs_generation_registry_test_snapshot before_ticket =
+        snapshot_for(&fixture.active);
+    assert(before_ticket.adaptive_state ==
+           MYFS_GENERATION_ADAPTIVE_TEST_IDLE);
+    assert(before_ticket.adaptive_full_windows == 0);
+    assert(before_ticket.adaptive_partial_rmw == 145);
+    assert(before_ticket.classified_since_evaluation == 145);
+
+    struct stop_post_join_gate gate = {
+        .mu = PTHREAD_MUTEX_INITIALIZER,
+        .cv = PTHREAD_COND_INITIALIZER,
+    };
+    assert(start_compaction_worker() == 0);
+    myfs_compaction_test_set_stop_post_join_hook(pause_stop_after_join, &gate);
+    pthread_t stop_thread;
+    assert(pthread_create(&stop_thread, NULL, stop_compaction_worker_main,
+                          NULL) == 0);
+    wait_for_stop_post_join_gate(&gate);
+
+    struct myfs_compaction_queue_test_snapshot stopping;
+    assert(myfs_compaction_test_queue_snapshot(&stopping) == 0);
+    assert(stopping.worker_running);
+    assert(stopping.stop_requested);
+    assert(stopping.queued_requests == 0);
+    assert(stopping.head_is_null && stopping.tail_is_null);
+
+    myfs_adaptive_ticket_t ticket = {0};
+    lock = myfs_lock_file(fixture.path);
+    assert(lock != NULL);
+    assert(generation_observe_write_locked(&writer, 0, 0, &ticket));
+    myfs_unlock_file(lock);
+    assert(ticket.valid);
+    assert(ticket.stats_snapshot.full_windows ==
+           before_ticket.adaptive_full_windows);
+    assert(ticket.stats_snapshot.partial_rmw ==
+           before_ticket.adaptive_partial_rmw);
+
+    struct submitter_lock_failure failure = {
+        .submitter = pthread_self(),
+    };
+    assert(snprintf(failure.path, sizeof(failure.path), "%s", fixture.path) <
+           (int)sizeof(failure.path));
+    myfs_lock_test_set_acquire_fail_hook(fail_submitter_path_lock_once,
+                                         &failure);
+    assert(schedule_adaptive_compaction(fixture.path, &ticket) == -ENOMEM);
+    assert(failure.matching_calls == 1);
+    myfs_lock_test_set_acquire_fail_hook(NULL, NULL);
+
+    generation_adaptive_schedule_failed(&ticket);
+    struct myfs_generation_registry_test_snapshot restored =
+        snapshot_for(&fixture.active);
+    assert(restored.adaptive_state == MYFS_GENERATION_ADAPTIVE_TEST_IDLE);
+    assert(restored.adaptive_eval_id == ticket.evaluation_id);
+    assert(restored.adaptive_eval_id == before_ticket.adaptive_eval_id + 1);
+    assert(restored.open_refs == before_ticket.open_refs);
+    assert(restored.writer_refs == before_ticket.writer_refs);
+    assert(restored.metadata_epoch == before_ticket.metadata_epoch);
+    assert(restored.gc_claim_id == before_ticket.gc_claim_id);
+    assert(restored.gc_state == before_ticket.gc_state);
+    assert(restored.install_aliases == before_ticket.install_aliases);
+    assert(restored.adaptive_full_windows ==
+           before_ticket.adaptive_full_windows);
+    assert(restored.adaptive_partial_rmw ==
+           before_ticket.adaptive_partial_rmw);
+    assert(restored.classified_since_evaluation ==
+           before_ticket.classified_since_evaluation);
+    assert(restored.superseded == before_ticket.superseded);
+    generation_adaptive_schedule_failed(&ticket);
+    struct myfs_generation_registry_test_snapshot duplicate =
+        snapshot_for(&fixture.active);
+    assert_registry_snapshots_equal(&duplicate, &restored);
+
+    release_stop_post_join_gate(&gate);
+    struct timespec deadline = deadline_after_ms(5000);
+    assert(pthread_timedjoin_np(stop_thread, NULL, &deadline) == 0);
+    myfs_compaction_test_set_stop_post_join_hook(NULL, NULL);
+    assert(pthread_mutex_lock(&gate.mu) == 0);
+    assert(gate.calls == 1);
+    assert(pthread_mutex_unlock(&gate.mu) == 0);
+    assert(pthread_cond_destroy(&gate.cv) == 0);
+    assert(pthread_mutex_destroy(&gate.mu) == 0);
+
+    unregister_handle(&writer);
+    cleanup_gc_fixture(&fixture);
+}
+
+struct adaptive_drain_gate
+{
+    char path[PATH_MAX];
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool entered;
+    bool release;
+    unsigned calls;
+};
+
+static int pause_adaptive_handoff_for_drain(
+    enum myfs_generation_handoff_test_stage stage,
+    const myfs_storage_t *old_storage,
+    const myfs_storage_t *new_storage, void *argument)
+{
+    (void)new_storage;
+    struct adaptive_drain_gate *gate = argument;
+    if (stage != MYFS_GENERATION_HANDOFF_TEST_BEFORE_PUBLISH ||
+        strcmp(old_storage->logical_path, gate->path) != 0)
+        return 0;
+    assert(pthread_mutex_lock(&gate->mu) == 0);
+    gate->calls++;
+    assert(gate->calls == 1);
+    gate->entered = true;
+    assert(pthread_cond_broadcast(&gate->cv) == 0);
+    struct timespec deadline = deadline_after_ms(10000);
+    while (!gate->release)
+    {
+        int status = pthread_cond_timedwait(&gate->cv, &gate->mu, &deadline);
+        assert(status == 0);
+    }
+    assert(pthread_mutex_unlock(&gate->mu) == 0);
+    return 0;
+}
+
+static void wait_for_adaptive_drain_gate(struct adaptive_drain_gate *gate)
+{
+    assert(pthread_mutex_lock(&gate->mu) == 0);
+    struct timespec deadline = deadline_after_ms(5000);
+    while (!gate->entered)
+    {
+        int status = pthread_cond_timedwait(&gate->cv, &gate->mu, &deadline);
+        assert(status == 0);
+    }
+    assert(pthread_mutex_unlock(&gate->mu) == 0);
+}
+
+static void release_adaptive_drain_gate(struct adaptive_drain_gate *gate)
+{
+    assert(pthread_mutex_lock(&gate->mu) == 0);
+    gate->release = true;
+    assert(pthread_cond_broadcast(&gate->cv) == 0);
+    assert(pthread_mutex_unlock(&gate->mu) == 0);
+}
+
+static struct myfs_compaction_queue_test_snapshot
+wait_for_compaction_stop_requested(void)
+{
+    struct timespec deadline = deadline_after_ms(5000);
+    for (;;)
+    {
+        struct myfs_compaction_queue_test_snapshot snapshot;
+        assert(myfs_compaction_test_queue_snapshot(&snapshot) == 0);
+        if (snapshot.stop_requested)
+            return snapshot;
+        struct timespec now;
+        assert(clock_gettime(CLOCK_REALTIME, &now) == 0);
+        assert(now.tv_sec < deadline.tv_sec ||
+               (now.tv_sec == deadline.tv_sec &&
+                now.tv_nsec < deadline.tv_nsec));
+        struct timespec delay = {.tv_nsec = 1000 * 1000};
+        nanosleep(&delay, NULL);
+    }
+}
+
+static void unlink_path_links(const char *path)
+{
+    char current_path[PATH_MAX];
+    char data_alias[PATH_MAX];
+    char meta_alias[PATH_MAX];
+    build_current_path(current_path, path);
+    build_data_path(data_alias, path);
+    build_meta_path(meta_alias, path);
+    assert(unlink(current_path) == 0 || errno == ENOENT);
+    assert(unlink(data_alias) == 0 || errno == ENOENT);
+    assert(unlink(meta_alias) == 0 || errno == ENOENT);
+}
+
+static void test_worker_shutdown_drains_inflight_and_queued_adaptive_work(void)
+{
+    stop_compaction_worker_with_timeout();
+    struct gc_fixture fixture;
+    initialize_gc_fixture(&fixture, "/worker-drain-a", false);
+    make_storage_compaction_eligible(&fixture.active);
+
+    const char *second_path = "/worker-drain-b";
+    myfs_storage_t second_source;
+    assert(create_generation_storage(second_path, 0600, &second_source) == 0);
+    create_empty_file(second_source.meta_path);
+    assert(publish_generation(second_path, &second_source) == 0);
+    make_storage_compaction_eligible(&second_source);
+
+    myfs_file_handle_t first_reader;
+    myfs_file_handle_t first_writer;
+    myfs_file_handle_t second_reader;
+    myfs_file_handle_t second_writer;
+    initialize_handle(&first_reader, &fixture.active, O_RDONLY);
+    initialize_handle(&first_writer, &fixture.active, O_RDWR);
+    initialize_handle(&second_reader, &second_source, O_RDONLY);
+    initialize_handle(&second_writer, &second_source, O_RDWR);
+    register_handle(&first_reader);
+    register_handle(&first_writer);
+    register_handle(&second_reader);
+    register_handle(&second_writer);
+    myfs_adaptive_ticket_t first_ticket = queue_adaptive_ticket(&first_writer);
+    myfs_adaptive_ticket_t second_ticket = queue_adaptive_ticket(&second_writer);
+    unregister_handle(&first_writer);
+    unregister_handle(&second_writer);
+
+    struct adaptive_drain_gate gate = {
+        .mu = PTHREAD_MUTEX_INITIALIZER,
+        .cv = PTHREAD_COND_INITIALIZER,
+    };
+    assert(snprintf(gate.path, sizeof(gate.path), "%s", fixture.path) <
+           (int)sizeof(gate.path));
+    myfs_generation_registry_test_set_handoff_hook(
+        pause_adaptive_handoff_for_drain, &gate);
+    assert(start_compaction_worker() == 0);
+    assert(schedule_adaptive_compaction(fixture.path, &first_ticket) == 0);
+    wait_for_adaptive_drain_gate(&gate);
+    assert(snapshot_for(&fixture.active).adaptive_state ==
+           MYFS_GENERATION_ADAPTIVE_TEST_INFLIGHT);
+
+    assert(schedule_adaptive_compaction(second_path, &second_ticket) == 0);
+    assert(snapshot_for(&second_source).adaptive_state ==
+           MYFS_GENERATION_ADAPTIVE_TEST_QUEUED);
+    struct myfs_compaction_queue_test_snapshot queued;
+    assert(myfs_compaction_test_queue_snapshot(&queued) == 0);
+    assert(queued.queued_requests == 1);
+    assert(!queued.head_is_null && !queued.tail_is_null);
+
+    pthread_t stop_thread;
+    assert(pthread_create(&stop_thread, NULL, stop_compaction_worker_main,
+                          NULL) == 0);
+    struct myfs_compaction_queue_test_snapshot stopping =
+        wait_for_compaction_stop_requested();
+    assert(stopping.worker_running);
+    assert(stopping.stop_requested);
+    assert(stopping.queued_requests == 1);
+    assert(snapshot_for(&fixture.active).adaptive_state ==
+           MYFS_GENERATION_ADAPTIVE_TEST_INFLIGHT);
+    assert(snapshot_for(&second_source).adaptive_state ==
+           MYFS_GENERATION_ADAPTIVE_TEST_QUEUED);
+
+    release_adaptive_drain_gate(&gate);
+    struct timespec deadline = deadline_after_ms(5000);
+    assert(pthread_timedjoin_np(stop_thread, NULL, &deadline) == 0);
+    myfs_generation_registry_test_set_handoff_hook(NULL, NULL);
+
+    struct myfs_compaction_queue_test_snapshot drained;
+    assert(myfs_compaction_test_queue_snapshot(&drained) == 0);
+    assert(drained.queued_requests == 0);
+    assert(drained.head_is_null && drained.tail_is_null);
+    assert(!drained.worker_running);
+    assert(!drained.stop_requested);
+    assert(snapshot_for(&fixture.active).adaptive_state ==
+           MYFS_GENERATION_ADAPTIVE_TEST_IDLE);
+    assert(snapshot_for(&second_source).adaptive_state ==
+           MYFS_GENERATION_ADAPTIVE_TEST_IDLE);
+
+    myfs_storage_t first_active;
+    myfs_storage_t second_active;
+    assert(resolve_storage(fixture.path, &first_active) == 0);
+    assert(resolve_storage(second_path, &second_active) == 0);
+    assert(!storage_generation_equal(&first_active, &fixture.active));
+    assert(!storage_generation_equal(&second_active, &second_source));
+    int first_active_state = snapshot_for(&first_active).adaptive_state;
+    int second_active_state = snapshot_for(&second_active).adaptive_state;
+    assert(first_active_state != MYFS_GENERATION_ADAPTIVE_TEST_QUEUED &&
+           first_active_state != MYFS_GENERATION_ADAPTIVE_TEST_INFLIGHT);
+    assert(second_active_state != MYFS_GENERATION_ADAPTIVE_TEST_QUEUED &&
+           second_active_state != MYFS_GENERATION_ADAPTIVE_TEST_INFLIGHT);
+    assert(pthread_mutex_lock(&gate.mu) == 0);
+    assert(gate.calls == 1);
+    assert(pthread_mutex_unlock(&gate.mu) == 0);
+
+    unregister_handle(&first_reader);
+    unregister_handle(&second_reader);
+    myfs_file_lock_t *lock = myfs_lock_file(fixture.path);
+    assert(lock != NULL);
+    assert(run_generation_gc_locked(fixture.path) == 0);
+    myfs_unlock_file(lock);
+    lock = myfs_lock_file(second_path);
+    assert(lock != NULL);
+    assert(run_generation_gc_locked(second_path) == 0);
+    myfs_unlock_file(lock);
+
+    assert(pthread_cond_destroy(&gate.cv) == 0);
+    assert(pthread_mutex_destroy(&gate.mu) == 0);
+    unlink_path_links(fixture.path);
+    unlink_path_links(second_path);
+    assert(remove_generation_storage(&fixture.victim) == 0);
+    assert(remove_generation_storage(&fixture.active) == 0);
+    assert(remove_generation_storage(&first_active) == 0);
+    assert(remove_generation_storage(&second_source) == 0);
+    assert(remove_generation_storage(&second_active) == 0);
+    destroy_generation_registry();
+    assert(rmdir(fixture.root) == 0);
+    myfs_conf = NULL;
+}
+
 static void test_worker_path_lock_failure_restores_adaptive_ticket(void)
 {
     stop_compaction_worker_with_timeout();
@@ -1298,6 +1697,8 @@ int main(void)
     test_quiescent_sweep_continues_after_first_error();
     test_repeated_marks_merge_alias_requirement();
     test_schedule_failure_restoration_races_claimed_gc();
+    test_stopping_worker_uses_synchronous_fallback();
+    test_worker_shutdown_drains_inflight_and_queued_adaptive_work();
     test_worker_path_lock_failure_restores_adaptive_ticket();
     test_concurrent_shard_churn_is_race_free();
     destroy_generation_registry();
