@@ -136,7 +136,8 @@ static int myfs_create_locked(const char *path, mode_t mode,
     char data_path[PATH_MAX];
     build_data_path(data_path, path);
 
-    /* Tạo file .data ở chế độ đọc/ghi để fd này có thể dùng xuyên suốt vòng đời mở file. */
+    /* Mở fd .data ban đầu ở chế độ đọc/ghi để gắn vào handle; live handoff có
+     * thể thay fd này bằng fd của generation mới. */
     int fd = open(data_path, O_CREAT | O_RDWR | O_TRUNC, mode);
     if (fd == -1)
         return -errno;
@@ -179,7 +180,7 @@ int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 }
 
 /*
- * Mở một file dữ liệu hiện có và lưu file descriptor vào fi->fh.
+ * Mở storage hiện hành và lưu con trỏ handle sở hữu data/meta fd vào fi->fh.
  * Nếu kernel yêu cầu mở với O_TRUNC, metadata cũng phải được reset tương ứng
  * để tránh ghép dữ liệu mới lên chunk map cũ.
  */
@@ -262,11 +263,11 @@ int myfs_open(const char *path, struct fuse_file_info *fi)
 }
 
 /*
- * Truncate cắt vào giữa một chunk NÉN: không thể chỉ shrink stored_size trong
- * metadata — blob cũ giải nén ra nhiều hơn stored_size mới nên mọi lần đọc sau
- * sẽ fail (frame không vừa buffer). Ghi lại phần còn giữ thành blob mới: đọc +
- * verify CRC, giải nén, cắt, nén lại (raw fallback như write path), append vào
- * cuối .data, fdatasync rồi cập nhật entry. Blob cũ thành orphan chờ compact.
+ * Khi truncate cắt giữa một chunk NÉN, ghi lại prefix còn giữ thành blob mới để
+ * frame và stored_size cùng mô tả một payload: đọc + verify CRC, giải nén, cắt,
+ * nén lại (raw fallback như write path), append vào cuối .data, fdatasync rồi
+ * cập nhật entry. Decoder prefix vẫn giữ tương thích với metadata cũ từng chỉ
+ * shrink stored_size; blob cũ thành orphan chờ compact.
  */
 static int rewrite_truncated_chunk_fd(int fd, myfs_chunk_t *chunk,
                                       uint32_t new_stored)
@@ -473,8 +474,8 @@ static int myfs_truncate_locked(const char *path, off_t size,
 
     /*
      * Trường hợp 1: truncate về 0.
-     * Đây là tình huống thường gặp khi redirect ghi đè file. Cần xoá cả dữ liệu
-     * lẫn metadata để file thực sự trở về trạng thái rỗng.
+     * Đây là tình huống thường gặp khi redirect ghi đè file. Công bố chunk map
+     * rỗng và logical size 0; blob vật lý cũ thành orphan chờ compact.
      */
     if (size == 0)
     {
@@ -511,8 +512,8 @@ static int myfs_truncate_locked(const char *path, off_t size,
                 uint32_t new_stored = (uint32_t)(size - (off_t)c->logical_offset);
                 if (c->codec_type == 1)
                 {
-                    /* Chunk nén phải được ghi lại — chỉ shrink metadata sẽ làm
-                     * mọi lần decompress sau fail vì frame lớn hơn buffer. */
+                    /* Ghi lại prefix nén để frame mới và stored_size cùng mô tả
+                     * payload còn giữ. */
                     ret = rewrite_truncated_chunk(&storage, c, new_stored);
                     if (ret != 0)
                     {
@@ -673,8 +674,8 @@ static int read_from_inode(int fd, const myfs_inode_t *inode, char *buf,
         }
         else
         {
-            /* File legacy chưa packed: linear scan chịu được chunk kích thước
-             * bất kỳ — tầng fallback vĩnh viễn. */
+            /* Chunk map chưa packed (gồm layout legacy): linear scan chịu được
+             * chunk kích thước bất kỳ — tầng fallback vĩnh viễn. */
             for (uint32_t i = 0; i < inode->chunk_map.num_chunks; i++)
             {
                 const myfs_chunk_t *c = &inode->chunk_map.chunks[i];
@@ -831,10 +832,11 @@ int myfs_read(const char *path, char *buf, size_t size,
 }
 
 /*
- * Ghi dữ liệu vào file logic theo bất biến cửa sổ 64KB: vùng ghi được chia
- * theo các cửa sổ chứa nó, mỗi cửa sổ bị chạm được repack (merge dữ liệu cũ +
- * patch mới) thành đúng một chunk head-aligned. Append thuần, overwrite một
- * phần và write vào hole đều đi chung một đường — không còn nhánh RMW riêng.
+ * Ghi dữ liệu vào file logic theo window_size cố định của generation: vùng ghi
+ * được chia theo các cửa sổ chứa nó, mỗi cửa sổ bị chạm được repack (merge dữ
+ * liệu cũ + patch mới) thành đúng một chunk head-aligned. Append thuần,
+ * overwrite một phần và write vào hole đều đi chung một đường — không còn
+ * nhánh RMW riêng.
  */
 static int myfs_write_locked(const char *path, const char *buf, size_t size,
                              off_t offset, struct fuse_file_info *fi,
@@ -890,8 +892,9 @@ static int myfs_write_locked(const char *path, const char *buf, size_t size,
     myfs_inode_t *inode = &handle->cached_inode;
     if (inode->metadata_version == MYFS_META_VERSION_LEGACY)
     {
-        /* One-time v0 conversion.  Normal writes after this point only append
-         * a bounded delta record and never replace the metadata inode. */
+        /* One-time v0 conversion.  Normal writes then append bounded delta
+         * records; periodic checkpoints may replace the metadata inode and
+         * reopen this handle's metadata descriptor. */
         ret = save_chunk_map_for_storage(&handle->storage, inode);
         uint64_t converted_epoch =
             generation_bump_metadata_epoch_locked(handle);
@@ -955,9 +958,10 @@ static int myfs_write_locked(const char *path, const char *buf, size_t size,
 
     /*
      * Xác định dải chunk bị tiêu thụ và miền cửa sổ cần repack.
-     * Miền khởi đầu là các cửa sổ 64KB phủ vùng ghi; chunk legacy có thể vắt
-     * qua ranh giới cửa sổ nên miền mở rộng theo fixpoint cho tới khi không
-     * kéo thêm chunk nào nữa (file đã packed: hội tụ ngay vòng đầu).
+     * Miền khởi đầu là các cửa sổ theo window_size của generation hiện tại phủ
+     * vùng ghi; chunk legacy có thể vắt qua ranh giới cửa sổ nên miền mở rộng
+     * theo fixpoint cho tới khi không kéo thêm chunk nào nữa (file đã packed:
+     * hội tụ ngay vòng đầu).
      */
     off_t region_lo = (off_t)myfs_window_base((uint64_t)offset, window_size);
     uint64_t region_hi_u64;
@@ -1187,7 +1191,7 @@ int myfs_release(const char *path, struct fuse_file_info *fi)
             release_compaction_scheduled = true;
     }
 
-    /* Generation GC above completes synchronously while the path lock and
+    /* Generation GC above runs synchronously while the path lock and
      * handle cache write lock are held.  Only compaction scheduling happens
      * here, after those locks have been released; the worker or synchronous
      * fallback acquires the path lock before executing it. */

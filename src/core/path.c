@@ -36,8 +36,9 @@ void build_path(char *dest, const char *path)
 }
 
 /* These two names remain the legacy storage pair and the compatibility names
- * inspected by the existing tests.  Once a file has generations, myfs itself
- * resolves .current and does not use these aliases for I/O. */
+ * inspected by the existing tests.  New storage resolution follows .current
+ * after publication; handles already pinned to legacy storage may keep using
+ * their original pair until handoff or release. */
 void build_data_path(char *dest, const char *path)
 {
     build_path(dest, path);
@@ -271,8 +272,8 @@ static int random_generation_id(char id[MYFS_GENERATION_HEX_LEN + 1])
     return 0;
 }
 
-/* Called only by compact_data_file(): allocate a unique unpublished generation
- * directory and its data file. */
+/* Allocate a unique unpublished generation directory and its data file for
+ * compaction. */
 int create_generation_storage(const char *path, mode_t data_mode,
                               myfs_storage_t *storage)
 {
@@ -422,8 +423,9 @@ int publish_generation(const char *path, const myfs_storage_t *storage)
         return ret;
     }
 
-    /* This directory fsync is the durability boundary.  Old generations are
-     * not eligible for GC unless this call succeeds. */
+    /* This parent-directory fsync confirms publication durability.  Old
+     * generations remain ineligible for publication-driven GC until it or a
+     * later recovery fsync confirms the current pointer. */
     return fsync_parent_path(current_path);
 }
 

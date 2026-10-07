@@ -54,7 +54,7 @@ Application (cat, cp, grep, ...)
     file.txt.g.<hex>/  ← generation directory (data + meta)
 ```
 
-Sau lần compaction đầu tiên, storage của file chuyển sang **generation model**: mỗi lần compact tạo một generation directory mới, publish bằng atomic symlink rename (`.current`), còn `.data`/`.meta` được giữ dưới dạng hard-link alias để debug/benchmark vẫn quan sát được file vật lý đang active. Generation cũ được GC thu hồi khi không còn handle nào mở.
+Sau lần compaction đầu tiên, storage của file chuyển sang **generation model**: mỗi lần compact tạo một generation directory mới và publish bằng atomic symlink rename (`.current`). `.data`/`.meta` là hard-link alias tương thích, không quyết định generation active; alias được cập nhật khi không còn handle legacy pin storage cũ. Generation cũ chỉ được GC thu hồi sau publication durable và khi không còn reference nào pin chính generation đó.
 
 ### Thiết kế chunk-based (cửa sổ thích nghi theo file)
 
@@ -71,6 +71,8 @@ Không gian logic của mỗi file được chia thành các cửa sổ cố đ�
 **Chunk-I/O scratch reuse:** mỗi thread có bốn slot TLS tách theo vai trò `RAW`, `COMP`, `WINDOW` và `CACHED`, nên các buffer đang sống đồng thời trong repack không alias nhau. Slot tăng theo high-water mark của thread, không shrink giữa các operation, và được destructor của một `pthread_key_t` riêng giải phóng khi thread kết thúc. `RAW`/`WINDOW`/`CACHED` giữ tối đa 1 MiB mỗi slot; `COMP` giữ tối đa `ZSTD_COMPRESSBOUND(1 MiB)` = 1,052,672 byte, nên trần retained thông thường là **4,198,400 byte/thread** đã chạm đủ bốn role. Request vượt cap, lỗi khởi tạo TLS, lỗi grow, hoặc acquisition cùng role khi slot còn bận đều dùng allocation tạm thời rồi free khi release; retained buffer cũ vẫn nguyên vẹn. `entries` trả về cho caller, plaintext buffer ở FUSE, copy buffer của compaction và prefix scratch của decompressor không thuộc pool này.
 
 **Path-lock sharding:** bảng mutex theo path dùng 64 shard × 64 bucket, với FNV-1a 64-bit và fmix64 để phân bố path. Mỗi shard có mutex riêng; refcount pin cả owner, waiter và unlocker, entry được unlink khi refcount về 0 rồi mới destroy/free ngoài shard mutex. Code luôn nhả shard mutex trước khi chờ path mutex. Nếu một thao tác tương lai cần nhiều path lock, thứ tự chuẩn là tăng dần `(shard index, strcmp(path))`, deduplicate path trùng và release theo thứ tự ngược lại.
+
+**Generation-registry sharding và GC hai pha:** registry là bảng 64 shard × 64 bucket độc lập với path-lock table, hash bằng FNV-1a + fmix64 chỉ trên `logical_path`; vì vậy generation cũ/mới của cùng path luôn ở chung một lock domain cho live handoff. GC chuyển `NONE → PENDING → CLAIMED`: claim copy identity, refcount snapshot, alias intent và claim ID dưới registry shard; resolve/alias/remove chạy ngoài shard (và dưới path lock trong luồng bình thường); finalize lấy lại đúng shard rồi revalidate record, state và claim ID trước khi retire hoặc đưa về `PENDING` để retry. Thứ tự nested lock là path lock → `cache_lock` → registry shard; read fast path dùng `cache_lock` → shard. `compact_queue_mu` luôn được nhả trước khi worker hoặc fallback chờ path lock. `release()` chạy GC đủ điều kiện đồng bộ dưới path lock + cache write lock, rồi mới schedule compaction sau khi nhả hai lock đó.
 
 ---
 
@@ -103,7 +105,7 @@ transcomp/
 │   │   ├── lock.c                ← Per-file lock table (mutex theo path, refcount)
 │   │   └── compact.c             ← Generation/GC + adaptive resize + live-handle handoff
 │   ├── fuse_ops/
-│   │   ├── file.c                ← myfs_read, myfs_write, write_rmw, myfs_truncate,
+│   │   ├── file.c                ← myfs_read, myfs_write, myfs_truncate,
 │   │   │                          myfs_create, myfs_open, myfs_release
 │   │   └── dir.c                 ← myfs_getattr, myfs_readdir, myfs_mkdir,
 │   │                              myfs_rmdir, myfs_unlink, myfs_utimens
@@ -202,12 +204,13 @@ make benchmarks/meta_inspect
 | Directory + `.data`/`.meta` | Dễ debug (hexdump trực tiếp), dễ implement atomic write |
 | Append-only blob | Tránh in-place rewrite, đơn giản, atomic với rename |
 | Delta journal + checkpoint | Metadata write O(changed windows), torn tail tự phục hồi |
-| Per-file lock + leaf mutex | File khác nhau chạy song song; thứ tự lock cố định → không deadlock |
-| Background compaction thread | `release()` không trả tiền GC/compact; queue dedupe, drain khi unmount |
+| Path/cache/registry lock hierarchy | Mutation theo path lock → cache rwlock → registry shard; read fast path dùng cache → shard |
+| Background compaction thread | `release()` chạy GC đủ điều kiện đồng bộ rồi schedule compaction; queue dedupe, drain khi unmount, fallback đồng bộ khi worker không chạy |
 | Writer-preferring cache rwlock | Handoff không starvation; read fast path không gọi metadata syscall |
 | Zstd context theo worker thread | Bỏ allocation mỗi call mà không share context, global lock hay serialization |
 | Scratch TLS tách 4 role, có cap | Cho phép RAW/COMP/WINDOW/CACHED sống đồng thời; giới hạn retained memory và fallback an toàn khi nested/oversize |
 | Path-lock table 64 × 64 | Giới hạn lookup theo bucket và contention theo shard, vẫn eager reclaim |
+| Generation registry 64 × 64 + GC hai pha | Gom mọi generation cùng logical path vào một shard; filesystem I/O nằm ngoài shard lock |
 
 ---
 
@@ -245,7 +248,7 @@ Không thấy serialization hay lock contention. Đây là instrument chính cho
 - **Chunk legacy cực lớn decompress nguyên khối:** file từ format cũ có chunk đã merge rất lớn sẽ được giải nén nguyên khối vào RAM ở lần chạm đầu (migration); streaming Zstd là follow-up nếu thành vấn đề.
 - **Một worker compaction duy nhất:** queue FIFO một thread — đủ cho tải hiện tại; nhiều worker là bước mở rộng sau.
 
-Các hạng mục đã hoàn thành (regression test TC19–TC29): sparse-hole write chồng lấn → stale read; hole đọc ra EOF thay vì byte 0; truncate vào giữa chunk nén làm hỏng chunk; `readdir` mất entry sau 2048 file; `fdatasync` blob trước khi publish metadata (crash-safe ordering); **chunk packing 64 KB thực sự** — bất biến cửa sổ head-aligned, append merge vào chunk đuôi, read lookup theo cửa sổ, migration tự động cho file legacy; **per-file locking** — thao tác trên các file khác nhau chạy song song, registry/queue dùng leaf mutex riêng (thứ tự lock cố định: file lock → leaf, không thể deadlock); **background compaction** — `release()` chỉ enqueue, worker thread compact dưới file lock của path, drain sạch queue khi unmount.
+Các hạng mục đã hoàn thành (regression test TC19–TC29): sparse-hole write chồng lấn → stale read; hole đọc ra EOF thay vì byte 0; truncate vào giữa chunk nén làm hỏng chunk; `readdir` mất entry sau 2048 file; `fdatasync` blob trước khi publish metadata (crash-safe ordering); **chunk packing theo generation** — cửa sổ head-aligned theo `window_size`, mặc định 64 KiB và thích nghi trong khoảng 16 KiB–1 MiB, append merge vào chunk đuôi, read lookup theo cửa sổ, migration tự động cho file legacy; **locking phân tầng** — thao tác trên file khác nhau chạy song song, mutation theo path lock → cache rwlock → registry shard, fast read theo cache → shard, queue mutex không được giữ khi chờ path lock; **background compaction + synchronous release GC** — `release()` unregister handle và chạy GC đủ điều kiện đồng bộ dưới path/cache locks, rồi mới schedule compaction; worker compact dưới path lock và drain sạch queue khi unmount, còn khi worker không chạy thì scheduling fallback đồng bộ.
 
 ---
 

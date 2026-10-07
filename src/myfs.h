@@ -132,8 +132,9 @@ typedef struct
 } myfs_adaptive_ticket_t;
 
 /* fi->fh stores a pointer to this structure, rather than a bare descriptor.
- * Both descriptors pin the selected generation for the complete FUSE handle
- * lifetime; the registry record supplies the GC open-reference count. */
+ * Its descriptors and registry reference pin one internally consistent
+ * generation bundle. Live handoff may atomically rebind writable handles;
+ * read-only handles retain their generation until release. */
 typedef struct myfs_file_handle
 {
     int data_fd;
@@ -251,7 +252,7 @@ unsigned generation_open_refs_locked(const myfs_storage_t *storage);
 int mark_generation_for_gc_locked(const myfs_storage_t *storage,
                                   bool install_aliases);
 /* GC các generation pending của một path (caller giữ file lock của path đó);
- * path == NULL = quét tất cả (chỉ dùng lúc destroy, single-thread). */
+ * path == NULL quét tất cả shard và chỉ hợp lệ khi registry users đã quiesce. */
 int run_generation_gc_locked(const char *path);
 int recover_generations_for_path_locked(const char *path,
                                         const myfs_storage_t *active);

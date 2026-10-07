@@ -1854,8 +1854,10 @@ static int compact_data_file_locked(const char *path,
     if (ret != 0)
         LOG("[WARN] compact: recovery for %s returned %d\n", path, ret);
 
-    /* A writer's handle is never allowed to become stale.  The final writable
-     * release removes its reference before invoking compaction. */
+    /* Ordinary compaction waits until the active generation has no writers.
+     * Adaptive compaction hands live writers to the new generation after a
+     * successful publication.  Final writable release removes its reference
+     * before scheduling compaction. */
     if (!adaptive && generation_writer_refs_locked(&old_storage) > 0)
     {
         LOG("[DEBUG] compact: deferred; active generation has writers\n");
@@ -1936,8 +1938,9 @@ static int compact_data_file_locked(const char *path,
     uint64_t wasted_bytes = (uint64_t)data_file_size - live_bytes;
     double wasted = data_file_size > 0
         ? (double)wasted_bytes / (double)data_file_size : 0.0;
-    /* File chưa packed luôn được compact bất kể waste — migration một lần
-     * sang bất biến cửa sổ 64KB; sau đó trigger phụ này tự im lặng. */
+    /* File chưa packed luôn được repack bất kể waste theo window_size của
+     * generation; adaptive resize có thể chọn window_size đích mới. Sau khi
+     * packed, trigger migration này tự im lặng. */
     if (!resize && inode.chunk_map.num_chunks != 0 &&
         (wasted < COMPACT_THRESHOLD || wasted_bytes < inode.window_size) &&
         inode.chunk_map.fully_packed)
@@ -2137,8 +2140,8 @@ static int schedule_request(const char *path, bool ordinary,
     pthread_mutex_lock(&compact_queue_mu);
     if (!compact_worker_running)
     {
-        /* Worker chưa chạy (init fail hoặc đang shutdown): fallback đồng bộ
-         * như hành vi cũ để không bỏ sót việc thu hồi. */
+        /* Worker chưa chạy hoặc đã dừng: thực hiện compaction đồng bộ dưới
+         * path lock để không bỏ sót request. */
         pthread_mutex_unlock(&compact_queue_mu);
         if (ticket && ticket->valid)
         {
