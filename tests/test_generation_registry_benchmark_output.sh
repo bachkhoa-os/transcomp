@@ -20,10 +20,56 @@ case $first_cpu in
         ;;
 esac
 
+expand_cpu_list()
+{
+    printf '%s\n' "$1" | tr ',' '\n' | while IFS= read -r part; do
+        case $part in
+            *-*)
+                first=${part%-*}
+                last=${part#*-}
+                seq "$first" "$last"
+                ;;
+            *)
+                printf '%s\n' "$part"
+                ;;
+        esac
+    done
+}
+
+gc_cpu=
+sibling_list=$first_cpu
+topology_available=false
+if [ -r "/sys/devices/system/cpu/cpu${first_cpu}/topology/thread_siblings_list" ]; then
+    sibling_list=$(cat "/sys/devices/system/cpu/cpu${first_cpu}/topology/thread_siblings_list")
+    topology_available=true
+fi
+sibling_cpus=$(expand_cpu_list "$sibling_list")
+if [ "$topology_available" = true ]; then
+    for candidate in $(expand_cpu_list "$allowed_cpus"); do
+        is_sibling=false
+        for sibling in $sibling_cpus; do
+            if [ "$candidate" = "$sibling" ]; then
+                is_sibling=true
+                break
+            fi
+        done
+        if [ "$is_sibling" = false ] &&
+           [ -r "/sys/devices/system/cpu/cpu${candidate}/topology/thread_siblings_list" ]; then
+            gc_cpu=$candidate
+            break
+        fi
+    done
+fi
+
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/generation-registry-benchmark-output.XXXXXX")
 trap 'rm -rf -- "$workdir"' EXIT
 
-output=$("$benchmark" --short --aa --cpus "$first_cpu" --workdir "$workdir")
+benchmark_args=(--short --aa --cpus "$first_cpu" --gc-iterations 5000
+    --min-gc-cycles 1 --workdir "$workdir")
+if [ -n "$gc_cpu" ]; then
+    benchmark_args+=(--gc-cpu "$gc_cpu")
+fi
+output=$("$benchmark" "${benchmark_args[@]}")
 
 leftover=$(find "$workdir" -mindepth 1 -print -quit)
 if [ -n "$leftover" ]; then
@@ -31,7 +77,9 @@ if [ -n "$leftover" ]; then
     exit 1
 fi
 
-printf '%s\n' "$output" | awk -F, '
+printf '%s\n' "$output" | awk -F, \
+    -v expected_foreground_cpu="$first_cpu" \
+    -v expected_gc_cpu="${gc_cpu:-inherited}" '
 function fail(message) {
     print "generation registry benchmark contract: " message > "/dev/stderr"
     failed = 1
@@ -62,9 +110,26 @@ BEGIN {
     note_prefix("TREE,hash=", "tree")
     note_prefix("HOST,", "host")
     note_prefix("AFFINITY,", "affinity")
+    note_prefix("TOPOLOGY,cpu=", "topology")
+    note_prefix("ASSIGNMENT,role=foreground,", "foreground_assignment")
+    note_prefix("ASSIGNMENT,role=gc,", "gc_assignment")
+    note_prefix("GC_LOCK_DUTY_CYCLE,status=not-measurable,", "gc_duty_cycle")
+    note_prefix("GC_WINDOW,stop=minimum-iterations-and-minimum-cycles,timeout_seconds=30", "gc_window")
+    note_prefix("METRIC,max_ns=informational", "max_metric")
     note_prefix("CONFIG,", "config")
     note_prefix("MIXED,skipped,reason=public-api-no-shard-placement", "mixed")
     note_prefix("SELF_CHECK,registry_empty=inferred-from-balanced-public-lifecycle,victims=retired,owned_files=removed", "self_check_scope")
+
+    if (index($0, "TOPOLOGY,cpu=") == 1) {
+        split($2, topology_cpu, "=")
+        topology_seen[topology_cpu[2]] = 1
+    }
+    if (index($0, "ASSIGNMENT,role=foreground,") == 1 &&
+        $4 != "cpu=" expected_foreground_cpu)
+        fail("unexpected foreground CPU assignment: " $0)
+    if (index($0, "ASSIGNMENT,role=gc,") == 1 &&
+        $4 != "cpu=" expected_gc_cpu)
+        fail("unexpected GC CPU assignment: " $0)
 
     if ($0 == "CSV_BEGIN") {
         csv_begin_count++
@@ -182,6 +247,22 @@ END {
         fail("expected one HOST header")
     if (header_count["affinity"] != 1)
         fail("expected one AFFINITY header")
+    if (header_count["topology"] < 1)
+        fail("expected at least one CPU topology line")
+    if (!topology_seen[expected_foreground_cpu])
+        fail("missing foreground CPU topology line")
+    if (expected_gc_cpu != "inherited" && !topology_seen[expected_gc_cpu])
+        fail("missing GC CPU topology line")
+    if (header_count["foreground_assignment"] != 2)
+        fail("expected one foreground assignment per short-run worker")
+    if (header_count["gc_assignment"] != 1)
+        fail("expected one GC assignment")
+    if (header_count["gc_duty_cycle"] != 1)
+        fail("expected one public-API GC duty-cycle status line")
+    if (header_count["gc_window"] != 1)
+        fail("expected one GC measurement-window line")
+    if (header_count["max_metric"] != 1)
+        fail("expected one informational max-latency marker")
     if (header_count["config"] != 1)
         fail("expected one CONFIG header")
     if (header_count["mixed"] != 1)
@@ -213,5 +294,61 @@ END {
                 fail("missing combination gc-interference/" io_mode "/" threads)
         }
     }
+    exit failed ? 1 : 0
+}'
+
+comparison_dir=$workdir/comparison
+mkdir "$comparison_dir"
+printf '%s\n' "$output" >"$comparison_dir/baseline.out"
+awk -F, -v OFS=, '
+    $0 == "CSV_BEGIN" { in_csv = 1; print; next }
+    in_csv && !header_seen { header_seen = 1; print; next }
+    in_csv && !changed && $1 == "control" && $2 == "none" && $3 == 1 {
+        $7 = sprintf("%.3f", $7 * 2)
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$comparison_dir/baseline.out" >"$comparison_dir/current.out"
+awk -F, -v OFS=, '
+    $0 == "CSV_BEGIN" { in_csv = 1; print; next }
+    in_csv && !header_seen { header_seen = 1; print; next }
+    in_csv && NF == 22 { $19 = "0.500000" }
+    { print }
+' "$comparison_dir/baseline.out" >"$comparison_dir/current-aa.out"
+cp "$comparison_dir/current-aa.out" "$comparison_dir/baseline-aa.out"
+
+comparison=$("$repo_root/benchmarks/compare_generation_registry_results.sh" \
+    "$comparison_dir/current.out" "$comparison_dir/baseline.out" \
+    "$comparison_dir/current-aa.out" "$comparison_dir/baseline-aa.out")
+printf '%s\n' "$comparison" | awk -F, '
+BEGIN {
+    expected_header = "workload,io_mode,threads,current_median_ops_per_sec,baseline_median_ops_per_sec,relative_abs_diff_pct,current_aa_max_spread_pct,baseline_aa_max_spread_pct,row_gate_pct,global_gate_pct,exceeds_row_gate,exceeds_global_gate"
+}
+NR == 1 {
+    if ($0 != expected_header) {
+        print "generation registry benchmark comparison contract: unexpected header: " $0 > "/dev/stderr"
+        failed = 1
+    }
+    next
+}
+{
+    rows++
+    if (NF != 12) {
+        print "generation registry benchmark comparison contract: expected 12 columns" > "/dev/stderr"
+        failed = 1
+        next
+    }
+    if ($11 == "yes") row_yes++
+    else if ($11 == "no") row_no++
+    else failed = 1
+    if ($12 == "yes") global_yes++
+    else if ($12 == "no") global_no++
+    else failed = 1
+}
+END {
+    if (rows != 10 || row_yes != 1 || row_no != 9 ||
+        global_yes != 1 || global_no != 9)
+        failed = 1
     exit failed ? 1 : 0
 }'

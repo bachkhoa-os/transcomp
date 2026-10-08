@@ -11,11 +11,15 @@
 #define MYFS_BENCH_TREE_HASH "unknown"
 #endif
 
+#define GC_WINDOW_TIMEOUT_NS UINT64_C(30000000000)
+
 enum
 {
     DEFAULT_REPETITIONS = 7,
     DEFAULT_WARMUP = 128,
     DEFAULT_ITERATIONS = 4000,
+    DEFAULT_GC_ITERATIONS = 1200000,
+    DEFAULT_MIN_GC_CYCLES = 20,
     DEFAULT_THRESHOLD_US = 1000,
     DEFAULT_SYNTHETIC_DELAY_US = 250,
     MAX_THREAD_VALUES = 32,
@@ -37,20 +41,33 @@ typedef enum
     IO_MODE_SYNTHETIC_DELAY,
 } io_mode_t;
 
+enum
+{
+    OPTION_GC_CPU = 1000,
+    OPTION_GC_ITERATIONS,
+    OPTION_MIN_GC_CYCLES,
+};
+
 struct options
 {
     char workdir[PATH_MAX];
     char cpu_text[256];
+    int foreground_cpus[CPU_SETSIZE];
+    size_t foreground_cpu_count;
+    int gc_cpu;
     size_t threads[MAX_THREAD_VALUES];
     size_t thread_count;
     size_t repetitions;
     size_t warmup;
     size_t iterations;
+    size_t gc_iterations;
     size_t gc_threads;
+    uint64_t min_gc_cycles;
     uint64_t threshold_us;
     uint64_t synthetic_delay_us;
     uint64_t seed;
     bool cpu_list_given;
+    bool gc_cpu_given;
     bool aa;
     bool short_run;
     bool run_real;
@@ -298,11 +315,14 @@ static void usage(const char *program)
 {
     printf("Usage: %s --workdir DIR [options]\n", program);
     puts("  --cpus LIST                 pin to an explicit CPU list/ranges");
+    puts("  --gc-cpu N                  pin the GC worker to a separate CPU");
     puts("  --threads LIST              worker counts (default 1,2,4,8,16)");
     puts("  --repetitions N             repetitions (default 7)");
     puts("  --warmup N                  warm-up operations/worker (default 128)");
-    puts("  --iterations N              measured operations/worker (default 4000)");
+    puts("  --iterations N              basic measured operations/worker (default 4000)");
+    puts("  --gc-iterations N           minimum GC foreground ops/worker (default 1200000)");
     puts("  --gc-threads N              concurrent GC workers (default 1)");
+    puts("  --min-gc-cycles N           required cycles/repetition (default 20)");
     puts("  --threshold-us N            delayed-op threshold (default 1000)");
     puts("  --synthetic-delay-us N      delay at wrapped GC I/O calls (default 250)");
     puts("  --gc-mode MODE              real, synthetic, or both (default both)");
@@ -320,7 +340,10 @@ static struct options parse_options(int argc, char **argv)
         .repetitions = DEFAULT_REPETITIONS,
         .warmup = DEFAULT_WARMUP,
         .iterations = DEFAULT_ITERATIONS,
+        .gc_iterations = DEFAULT_GC_ITERATIONS,
         .gc_threads = 1,
+        .min_gc_cycles = DEFAULT_MIN_GC_CYCLES,
+        .gc_cpu = -1,
         .threshold_us = DEFAULT_THRESHOLD_US,
         .synthetic_delay_us = DEFAULT_SYNTHETIC_DELAY_US,
         .seed = 25228,
@@ -330,11 +353,14 @@ static struct options parse_options(int argc, char **argv)
     static const struct option long_options[] = {
         {"workdir", required_argument, NULL, 'w'},
         {"cpus", required_argument, NULL, 'c'},
+        {"gc-cpu", required_argument, NULL, OPTION_GC_CPU},
         {"threads", required_argument, NULL, 't'},
         {"repetitions", required_argument, NULL, 'r'},
         {"warmup", required_argument, NULL, 'u'},
         {"iterations", required_argument, NULL, 'i'},
+        {"gc-iterations", required_argument, NULL, OPTION_GC_ITERATIONS},
         {"gc-threads", required_argument, NULL, 'g'},
+        {"min-gc-cycles", required_argument, NULL, OPTION_MIN_GC_CYCLES},
         {"threshold-us", required_argument, NULL, 'd'},
         {"synthetic-delay-us", required_argument, NULL, 's'},
         {"gc-mode", required_argument, NULL, 'm'},
@@ -363,6 +389,15 @@ static struct options parse_options(int argc, char **argv)
                 failf("--cpus value is too long");
             options.cpu_list_given = true;
             break;
+        case OPTION_GC_CPU:
+        {
+            uint64_t cpu = parse_u64(optarg, "--gc-cpu", true);
+            if (cpu >= CPU_SETSIZE)
+                failf("--gc-cpu exceeds CPU_SETSIZE: %s", optarg);
+            options.gc_cpu = (int)cpu;
+            options.gc_cpu_given = true;
+            break;
+        }
         case 't':
             parse_size_list(optarg, "--threads", options.threads,
                             &options.thread_count);
@@ -376,8 +411,16 @@ static struct options parse_options(int argc, char **argv)
         case 'i':
             options.iterations = parse_size(optarg, "--iterations", false);
             break;
+        case OPTION_GC_ITERATIONS:
+            options.gc_iterations = parse_size(optarg, "--gc-iterations",
+                                               false);
+            break;
         case 'g':
             options.gc_threads = parse_size(optarg, "--gc-threads", false);
+            break;
+        case OPTION_MIN_GC_CYCLES:
+            options.min_gc_cycles = parse_u64(optarg, "--min-gc-cycles",
+                                              false);
             break;
         case 'd':
             options.threshold_us = parse_u64(optarg, "--threshold-us", false);
@@ -439,7 +482,9 @@ static struct options parse_options(int argc, char **argv)
         options.repetitions = 1;
         options.warmup = 16;
         options.iterations = 5000;
+        options.gc_iterations = 5000;
         options.gc_threads = 1;
+        options.min_gc_cycles = 1;
         options.synthetic_delay_us = 50;
         options.run_real = true;
         options.run_synthetic = true;
@@ -513,17 +558,96 @@ static void format_cpu_set(const cpu_set_t *set, char *output,
         failf("effective CPU affinity is empty");
 }
 
-static void configure_affinity(const struct options *options,
+static bool cpu_set_is_subset(const cpu_set_t *candidate,
+                              const cpu_set_t *allowed)
+{
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+    {
+        if (CPU_ISSET(cpu, candidate) && !CPU_ISSET(cpu, allowed))
+            return false;
+    }
+    return true;
+}
+
+static bool read_thread_sibling_set(int cpu, cpu_set_t *siblings,
+                                    char text[128])
+{
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path),
+             "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",
+             cpu);
+    FILE *file = fopen(path, "r");
+    if (!file)
+    {
+        snprintf(text, 128, "unknown");
+        CPU_ZERO(siblings);
+        return false;
+    }
+    if (!fgets(text, 128, file))
+    {
+        fclose(file);
+        snprintf(text, 128, "unknown");
+        CPU_ZERO(siblings);
+        return false;
+    }
+    fclose(file);
+    text[strcspn(text, "\r\n")] = '\0';
+    parse_cpu_set(text, siblings);
+    return true;
+}
+
+static void configure_affinity(struct options *options,
                                char effective_text[1024])
 {
+    cpu_set_t original;
+    if (sched_getaffinity(0, sizeof(original), &original) != 0)
+        failf("sched_getaffinity: %s", strerror(errno));
+
     if (options->cpu_list_given)
     {
-        cpu_set_t requested;
-        parse_cpu_set(options->cpu_text, &requested);
-        if (sched_setaffinity(0, sizeof(requested), &requested) != 0)
+        cpu_set_t foreground;
+        parse_cpu_set(options->cpu_text, &foreground);
+        if (!cpu_set_is_subset(&foreground, &original))
+            failf("--cpus includes a CPU outside the process affinity mask");
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+        {
+            if (CPU_ISSET(cpu, &foreground))
+                options->foreground_cpus[options->foreground_cpu_count++] =
+                    cpu;
+        }
+
+        cpu_set_t process = foreground;
+        if (options->gc_cpu_given)
+        {
+            if (!CPU_ISSET(options->gc_cpu, &original))
+                failf("--gc-cpu %d is outside the process affinity mask",
+                      options->gc_cpu);
+            cpu_set_t siblings;
+            char sibling_text[128];
+            if (!read_thread_sibling_set(options->gc_cpu, &siblings,
+                                         sibling_text))
+                failf("cannot verify topology for --gc-cpu %d",
+                      options->gc_cpu);
+            for (size_t i = 0; i < options->foreground_cpu_count; i++)
+            {
+                if (CPU_ISSET(options->foreground_cpus[i], &siblings))
+                    failf("--gc-cpu %d shares a core/SMT sibling with "
+                          "foreground CPU %d",
+                          options->gc_cpu,
+                          options->foreground_cpus[i]);
+            }
+            CPU_SET(options->gc_cpu, &process);
+        }
+        if (sched_setaffinity(0, sizeof(process), &process) != 0)
             failf("sched_setaffinity(%s): %s", options->cpu_text,
                   strerror(errno));
+        if (!options->gc_cpu_given)
+            fprintf(stderr,
+                    "WARNING: GC worker shares the foreground CPU pool; "
+                    "use --gc-cpu for isolated GC interference runs\n");
     }
+    else if (options->gc_cpu_given)
+        failf("--gc-cpu requires an explicit --cpus foreground list");
     else
         fprintf(stderr, "WARNING: benchmark is unpinned; results may be noisy\n");
 
@@ -531,6 +655,31 @@ static void configure_affinity(const struct options *options,
     if (sched_getaffinity(0, sizeof(effective), &effective) != 0)
         failf("sched_getaffinity: %s", strerror(errno));
     format_cpu_set(&effective, effective_text, 1024);
+}
+
+static int foreground_cpu_for(const struct options *options, size_t index)
+{
+    if (options->foreground_cpu_count == 0)
+        return -1;
+    return options->foreground_cpus[index % options->foreground_cpu_count];
+}
+
+static void pin_current_thread(int cpu)
+{
+    if (cpu < 0)
+        return;
+    cpu_set_t singleton;
+    CPU_ZERO(&singleton);
+    CPU_SET(cpu, &singleton);
+    check_pthread(pthread_setaffinity_np(pthread_self(), sizeof(singleton),
+                                        &singleton),
+                  "pthread_setaffinity_np");
+    int actual = sched_getcpu();
+    if (actual < 0)
+        failf("sched_getcpu: %s", strerror(errno));
+    if (actual != cpu)
+        failf("worker affinity self-check: assigned CPU %d, running on %d",
+              cpu, actual);
 }
 
 static void wait_at_barrier(pthread_barrier_t *barrier)
@@ -705,6 +854,7 @@ struct basic_worker
 {
     struct basic_group *group;
     size_t index;
+    int assigned_cpu;
     myfs_file_handle_t handle;
     uint64_t control_state;
 };
@@ -737,6 +887,7 @@ static void *basic_worker_main(void *argument)
 {
     struct basic_worker *worker = argument;
     struct basic_group *group = worker->group;
+    pin_current_thread(worker->assigned_cpu);
     for (size_t i = 0; i < group->warmup; i++)
     {
         if (!basic_operation(worker))
@@ -780,6 +931,16 @@ static void calculate_latency(struct measurement *measurement,
         ? (double)delayed / (double)count : 0.0;
 }
 
+static size_t latency_sample_count(size_t threads, size_t iterations)
+{
+    if (iterations > SIZE_MAX / threads)
+        failf("latency sample count overflows size_t");
+    size_t count = threads * iterations;
+    if (count > SIZE_MAX / sizeof(uint64_t))
+        failf("latency sample allocation is too large");
+    return count;
+}
+
 static bool verify_handle_reclaimed(struct basic_worker *worker)
 {
     if (worker->group->workload == WORKLOAD_CONTROL)
@@ -805,7 +966,8 @@ static struct measurement run_basic_measurement(
         .iterations = options->iterations,
         .threshold_ns = options->threshold_us * UINT64_C(1000),
     };
-    size_t sample_count = threads * options->iterations;
+    size_t sample_count = latency_sample_count(threads,
+                                               options->iterations);
     group.latencies = calloc(sample_count, sizeof(*group.latencies));
     struct basic_worker *workers = calloc(threads, sizeof(*workers));
     pthread_t *thread_ids = calloc(threads, sizeof(*thread_ids));
@@ -822,6 +984,7 @@ static struct measurement run_basic_measurement(
     {
         workers[i].group = &group;
         workers[i].index = i;
+        workers[i].assigned_cpu = foreground_cpu_for(options, i);
         workers[i].control_state = options->seed ^
             (UINT64_C(0xa0761d6478bd642f) * (i + 1)) ^
             (UINT64_C(0xe7037ed1a0b428db) * (repetition + 1)) ^ arm;
@@ -1068,6 +1231,7 @@ struct gc_worker
 {
     struct gc_group *group;
     size_t index;
+    int assigned_cpu;
     char path[128];
     myfs_storage_t active;
     myfs_storage_t prepared;
@@ -1078,6 +1242,10 @@ struct gc_foreground
 {
     struct gc_group *group;
     size_t index;
+    int assigned_cpu;
+    uint64_t *latencies;
+    size_t latency_count;
+    size_t latency_capacity;
     myfs_file_handle_t handle;
     pthread_t thread;
 };
@@ -1090,13 +1258,13 @@ struct gc_group
     size_t gc_thread_count;
     pthread_barrier_t ready;
     pthread_barrier_t start;
-    uint64_t *latencies;
     atomic_uint_fast64_t operations;
     atomic_uint_fast64_t cycles;
     atomic_uint_fast64_t foreground_start_ns;
     struct gc_io_gate io_gate;
     atomic_bool stop;
     atomic_bool failed;
+    atomic_bool window_timed_out;
 };
 
 static bool register_persistent_handle(struct gc_foreground *foreground,
@@ -1157,10 +1325,26 @@ static bool wait_for_counter(atomic_size_t *counter, size_t target,
     return true;
 }
 
+static bool grow_gc_latency_buffer(struct gc_foreground *foreground)
+{
+    if (foreground->latency_capacity >
+        SIZE_MAX / 2 / sizeof(*foreground->latencies))
+        return false;
+    size_t new_capacity = foreground->latency_capacity * 2;
+    uint64_t *resized = realloc(foreground->latencies,
+                                new_capacity * sizeof(*resized));
+    if (!resized)
+        return false;
+    foreground->latencies = resized;
+    foreground->latency_capacity = new_capacity;
+    return true;
+}
+
 static void *gc_foreground_main(void *argument)
 {
     struct gc_foreground *foreground = argument;
     struct gc_group *group = foreground->group;
+    pin_current_thread(foreground->assigned_cpu);
     for (size_t i = 0; i < group->options->warmup; i++)
     {
         if (!persistent_registry_operation(foreground))
@@ -1187,18 +1371,34 @@ static void *gc_foreground_main(void *argument)
                                          &expected_start, monotonic_ns());
     atomic_store_explicit(&group->io_gate.release_io, true,
                           memory_order_release);
-    uint64_t *samples = group->latencies +
-        foreground->index * group->options->iterations;
     uint64_t completed = 0;
-    for (size_t i = 0; i < group->options->iterations; i++)
+    uint64_t deadline = monotonic_ns() + GC_WINDOW_TIMEOUT_NS;
+    while (foreground->latency_count < group->options->gc_iterations ||
+           atomic_load(&group->cycles) < group->options->min_gc_cycles)
     {
+        if (atomic_load(&group->failed))
+            break;
+        if (foreground->latency_count == foreground->latency_capacity &&
+            !grow_gc_latency_buffer(foreground))
+        {
+            atomic_store(&group->failed, true);
+            break;
+        }
         uint64_t start_ns = monotonic_ns();
         bool ok = persistent_registry_operation(foreground);
-        samples[i] = monotonic_ns() - start_ns;
+        uint64_t end_ns = monotonic_ns();
+        foreground->latencies[foreground->latency_count++] =
+            end_ns - start_ns;
         if (!ok)
             atomic_store(&group->failed, true);
         else
             completed++;
+        if (end_ns >= deadline)
+        {
+            atomic_store(&group->window_timed_out, true);
+            atomic_store(&group->failed, true);
+            break;
+        }
     }
     atomic_fetch_add(&group->operations, completed);
     return NULL;
@@ -1208,6 +1408,7 @@ static void *gc_worker_main(void *argument)
 {
     struct gc_worker *worker = argument;
     struct gc_group *group = worker->group;
+    pin_current_thread(worker->assigned_cpu);
     int ret = prepare_successor(worker->path, &worker->prepared);
     if (ret != 0)
         atomic_store(&group->failed, true);
@@ -1285,6 +1486,8 @@ static struct measurement run_gc_measurement(
     size_t threads, io_mode_t io_mode, const struct options *options,
     size_t repetition, unsigned arm)
 {
+    size_t minimum_sample_count = latency_sample_count(
+        threads, options->gc_iterations);
     destroy_generation_registry();
     destroy_lock_table();
     char root[PATH_MAX];
@@ -1308,19 +1511,19 @@ static struct measurement run_gc_measurement(
     check_pthread(pthread_barrier_init(&group.start, NULL,
                                       (unsigned)participant_count),
                   "pthread_barrier_init");
-    size_t sample_count = threads * options->iterations;
-    group.latencies = calloc(sample_count, sizeof(*group.latencies));
     struct gc_foreground *foregrounds = calloc(threads,
                                                sizeof(*foregrounds));
     struct gc_worker *gc_workers = calloc(options->gc_threads,
                                           sizeof(*gc_workers));
-    if (!group.latencies || !foregrounds || !gc_workers)
+    if (!foregrounds || !gc_workers)
         failf("allocation failed");
 
     for (size_t i = 0; i < options->gc_threads; i++)
     {
         gc_workers[i].group = &group;
         gc_workers[i].index = i;
+        gc_workers[i].assigned_cpu = options->gc_cpu_given
+            ? options->gc_cpu : -1;
         snprintf(gc_workers[i].path, sizeof(gc_workers[i].path),
                  "/bench-gc-%zu", i);
         if (initialize_gc_path(gc_workers[i].path,
@@ -1331,6 +1534,13 @@ static struct measurement run_gc_measurement(
     {
         foregrounds[i].group = &group;
         foregrounds[i].index = i;
+        foregrounds[i].assigned_cpu = foreground_cpu_for(options, i);
+        foregrounds[i].latency_capacity = options->gc_iterations;
+        foregrounds[i].latencies = calloc(
+            foregrounds[i].latency_capacity,
+            sizeof(*foregrounds[i].latencies));
+        if (!foregrounds[i].latencies)
+            failf("allocation failed");
         if (!register_persistent_handle(&foregrounds[i], options->seed))
             failf("failed to register foreground handle %zu", i);
     }
@@ -1371,7 +1581,29 @@ static struct measurement run_gc_measurement(
         .elapsed_ns = elapsed_ns,
         .gc_cycles = atomic_load(&group.cycles),
     };
-    uint64_t expected = (uint64_t)threads * options->iterations;
+    uint64_t expected = (uint64_t)threads * options->gc_iterations;
+    size_t sample_count = 0;
+    bool per_worker_minimum_ok = true;
+    for (size_t i = 0; i < threads; i++)
+    {
+        if (foregrounds[i].latency_count < options->gc_iterations)
+            per_worker_minimum_ok = false;
+        if (foregrounds[i].latency_count > SIZE_MAX - sample_count)
+            failf("latency sample count overflows size_t");
+        sample_count += foregrounds[i].latency_count;
+    }
+    if (sample_count > SIZE_MAX / sizeof(uint64_t))
+        failf("latency sample allocation is too large");
+    uint64_t *latencies = malloc(sample_count * sizeof(*latencies));
+    if (!latencies)
+        failf("allocation failed");
+    size_t sample_offset = 0;
+    for (size_t i = 0; i < threads; i++)
+    {
+        memcpy(latencies + sample_offset, foregrounds[i].latencies,
+               foregrounds[i].latency_count * sizeof(*latencies));
+        sample_offset += foregrounds[i].latency_count;
+    }
     bool cleanup_ok = true;
     for (size_t i = 0; i < threads; i++)
         cleanup_ok = unregister_persistent_handle(&foregrounds[i]) &&
@@ -1385,7 +1617,12 @@ static struct measurement run_gc_measurement(
         cleanup_ok = false;
     measurement.self_check = !atomic_load(&group.failed) &&
         !atomic_load(&group.io_gate.timed_out) && cleanup_ok &&
-        measurement.operations == expected && measurement.gc_cycles > 0 &&
+        !atomic_load(&group.window_timed_out) &&
+        measurement.operations >= expected &&
+        measurement.operations == sample_count &&
+        sample_count >= minimum_sample_count &&
+        per_worker_minimum_ok &&
+        measurement.gc_cycles >= options->min_gc_cycles &&
         foreground_start_ns > 0 &&
         atomic_load(&group.io_gate.io_entered) > 0 &&
         atomic_load(&group.io_gate.foreground_ready) == threads;
@@ -1397,20 +1634,21 @@ static struct measurement run_gc_measurement(
                 "GC self-check detail: failed=%d cleanup=%d operations=%" PRIu64
                 "/%" PRIu64 " cycles=%" PRIu64 " io_entered=%zu"
                 " foreground_ready=%zu timed_out=%d delayed_calls=%"
-                PRIuFAST64 "\n",
+                PRIuFAST64 " window_timed_out=%d samples=%zu\n",
                 atomic_load(&group.failed), cleanup_ok,
                 measurement.operations, expected, measurement.gc_cycles,
                 atomic_load(&group.io_gate.io_entered),
                 atomic_load(&group.io_gate.foreground_ready),
                 atomic_load(&group.io_gate.timed_out),
-                atomic_load(&synthetic_delay_calls));
+                atomic_load(&synthetic_delay_calls),
+                atomic_load(&group.window_timed_out), sample_count);
     measurement.operations_per_second = elapsed_ns
         ? (double)measurement.operations * 1e9 / (double)elapsed_ns : 0.0;
     measurement.per_thread_operations_per_second =
         measurement.operations_per_second / (double)threads;
     measurement.gc_cycles_per_second = gc_elapsed_ns
         ? (double)measurement.gc_cycles * 1e9 / (double)gc_elapsed_ns : 0.0;
-    calculate_latency(&measurement, group.latencies, sample_count,
+    calculate_latency(&measurement, latencies, sample_count,
                       options->threshold_us * UINT64_C(1000));
 
     check_pthread(pthread_barrier_destroy(&group.start),
@@ -1418,8 +1656,10 @@ static struct measurement run_gc_measurement(
     check_pthread(pthread_barrier_destroy(&group.ready),
                   "pthread_barrier_destroy");
     free(gc_workers);
+    for (size_t i = 0; i < threads; i++)
+        free(foregrounds[i].latencies);
     free(foregrounds);
-    free(group.latencies);
+    free(latencies);
     myfs_conf = NULL;
     destroy_generation_registry();
     destroy_lock_table();
@@ -1451,11 +1691,12 @@ static struct summary summarize(
     double *delayed = calloc(count, sizeof(*delayed));
     double *gc_rate = calloc(count, sizeof(*gc_rate));
     double *aa_spread = calloc(count, sizeof(*aa_spread));
+    uint64_t *operation_counts = calloc(count, sizeof(*operation_counts));
     uint64_t *p50 = calloc(count, sizeof(*p50));
     uint64_t *p99 = calloc(count, sizeof(*p99));
     uint64_t *p999 = calloc(count, sizeof(*p999));
     if (!ops || !per_thread || !delayed || !gc_rate || !aa_spread ||
-        !p50 || !p99 || !p999)
+        !operation_counts || !p50 || !p99 || !p999)
         failf("allocation failed");
     struct summary summary = {
         .workload = workload,
@@ -1464,7 +1705,6 @@ static struct summary summarize(
         .gc_threads = workload == WORKLOAD_GC_INTERFERENCE
             ? options->gc_threads : 0,
         .repetitions = count,
-        .operations = primary[0].operations,
         .self_check = true,
         .min_gc_cycles = UINT64_MAX,
     };
@@ -1474,6 +1714,7 @@ static struct summary summarize(
     for (size_t i = 0; i < count; i++)
     {
         ops[i] = primary[i].operations_per_second;
+        operation_counts[i] = primary[i].operations;
         per_thread[i] = primary[i].per_thread_operations_per_second;
         delayed[i] = primary[i].delayed_fraction;
         gc_rate[i] = primary[i].gc_cycles_per_second;
@@ -1497,9 +1738,12 @@ static struct summary summarize(
                 ? ops[i] : repeat[i].operations_per_second;
             aa_spread[i] = low > 0.0 ? (high - low) * 100.0 / low : 0.0;
             summary.self_check = summary.self_check && repeat[i].self_check;
+            if (repeat[i].gc_cycles < summary.min_gc_cycles)
+                summary.min_gc_cycles = repeat[i].gc_cycles;
         }
     }
     summary.median_ops = median_double(ops, count);
+    summary.operations = median_u64(operation_counts, count);
     summary.median_per_thread_ops = median_double(per_thread, count);
     summary.median_delayed_fraction = median_double(delayed, count);
     summary.median_gc_cycles_per_second = median_double(gc_rate, count);
@@ -1535,6 +1779,7 @@ static struct summary summarize(
     free(p99);
     free(p50);
     free(aa_spread);
+    free(operation_counts);
     free(gc_rate);
     free(delayed);
     free(per_thread);
@@ -1640,6 +1885,50 @@ static const char *filesystem_name(long type)
     }
 }
 
+static void print_cpu_topology_and_assignments(const struct options *options)
+{
+    cpu_set_t effective;
+    if (sched_getaffinity(0, sizeof(effective), &effective) != 0)
+        failf("sched_getaffinity: %s", strerror(errno));
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+    {
+        if (!CPU_ISSET(cpu, &effective))
+            continue;
+        cpu_set_t siblings;
+        char sibling_text[128];
+        (void)read_thread_sibling_set(cpu, &siblings, sibling_text);
+        sanitize_field(sibling_text);
+        printf("TOPOLOGY,cpu=%d,thread_siblings_list=%s\n",
+               cpu, sibling_text);
+    }
+
+    size_t maximum_threads = 0;
+    for (size_t i = 0; i < options->thread_count; i++)
+    {
+        if (options->threads[i] > maximum_threads)
+            maximum_threads = options->threads[i];
+    }
+    for (size_t worker = 0; worker < maximum_threads; worker++)
+    {
+        int cpu = foreground_cpu_for(options, worker);
+        if (cpu >= 0)
+            printf("ASSIGNMENT,role=foreground,worker=%zu,cpu=%d\n",
+                   worker, cpu);
+        else
+            printf("ASSIGNMENT,role=foreground,worker=%zu,cpu=inherited\n",
+                   worker);
+    }
+    for (size_t worker = 0; worker < options->gc_threads; worker++)
+    {
+        if (options->gc_cpu_given)
+            printf("ASSIGNMENT,role=gc,worker=%zu,cpu=%d\n",
+                   worker, options->gc_cpu);
+        else
+            printf("ASSIGNMENT,role=gc,worker=%zu,cpu=inherited\n",
+                   worker);
+    }
+}
+
 static void print_header(const struct options *options,
                          const char *effective_cpus)
 {
@@ -1672,16 +1961,36 @@ static void print_header(const struct options *options,
     printf("HOST,name=%s,kernel=%s,arch=%s,cpu=%s,filesystem=%s,fs_magic=0x%lx\n",
            host.nodename, host.release, host.machine, cpu_model, fs_name,
            (unsigned long)filesystem.f_type);
-    printf("AFFINITY,pinned=%s,cpus=%s\n",
-           options->cpu_list_given ? "true" : "false", effective_cpus);
+    char foreground_text[1024] = "unrestricted";
+    if (options->foreground_cpu_count > 0)
+    {
+        cpu_set_t foreground;
+        CPU_ZERO(&foreground);
+        for (size_t i = 0; i < options->foreground_cpu_count; i++)
+            CPU_SET(options->foreground_cpus[i], &foreground);
+        format_cpu_set(&foreground, foreground_text,
+                       sizeof(foreground_text));
+    }
+    char gc_text[32] = "inherited";
+    if (options->gc_cpu_given)
+        snprintf(gc_text, sizeof(gc_text), "%d", options->gc_cpu);
+    printf("AFFINITY,pinned=%s,foreground_cpus=%s,gc_cpu=%s,process_cpus=%s\n",
+           options->cpu_list_given ? "true" : "false", foreground_text,
+           gc_text, effective_cpus);
+    print_cpu_topology_and_assignments(options);
     printf("CONFIG,threads=%s,repetitions=%zu,warmup=%zu,iterations=%zu,"
-           "gc_threads=%zu,threshold_us=%" PRIu64
+           "gc_min_iterations=%zu,gc_threads=%zu,min_gc_cycles=%" PRIu64
+           ",threshold_us=%" PRIu64
            ",synthetic_delay_us=%" PRIu64 ",seed=%" PRIu64 ",aa=%s\n",
            thread_list, options->repetitions, options->warmup,
-           options->iterations, options->gc_threads, options->threshold_us,
+           options->iterations, options->gc_iterations, options->gc_threads,
+           options->min_gc_cycles, options->threshold_us,
            options->synthetic_delay_us, options->seed,
            options->aa ? "true" : "false");
     puts("SYNTHETIC,wrapped=fsync|rename|unlink|rmdir|readlink|lstat|link|symlink,scope=inside-run_generation_gc_locked");
+    puts("GC_WINDOW,stop=minimum-iterations-and-minimum-cycles,timeout_seconds=30");
+    puts("GC_LOCK_DUTY_CYCLE,status=not-measurable,reason=public-api-does-not-expose-lock-hold-intervals");
+    puts("METRIC,max_ns=informational");
     puts("MIXED,skipped,reason=public-api-no-shard-placement");
     puts("SELF_CHECK,registry_empty=inferred-from-balanced-public-lifecycle,victims=retired,owned_files=removed");
     if (options->repetitions < 7)
@@ -1711,13 +2020,15 @@ static void print_csv_row(const struct summary *summary)
 static void print_human_row(const struct summary *summary)
 {
     printf("%-16s %-15s %3zu  %12.0f [%12.0f,%12.0f] "
-           "p99=%9" PRIu64 "ns p99.9=%9" PRIu64
-           "ns max=%9" PRIu64 "ns delayed=%8.5f gc=%8.1f/s "
+           "p50=%9" PRIu64 "ns p99=%9" PRIu64
+           "ns p99.9=%9" PRIu64 "ns max_info=%9" PRIu64
+           "ns delayed=%8.5f gc=%8.1f/s "
            "A/Amax=%7.2f%%\n",
            workload_name(summary->workload), io_mode_name(summary->io_mode),
            summary->threads, summary->median_ops, summary->min_ops,
-           summary->max_ops, summary->median_p99_ns,
-           summary->median_p999_ns, summary->max_ns,
+           summary->max_ops, summary->median_p50_ns,
+           summary->median_p99_ns, summary->median_p999_ns,
+           summary->max_ns,
            summary->median_delayed_fraction,
            summary->median_gc_cycles_per_second,
            summary->aa_max_spread_pct);

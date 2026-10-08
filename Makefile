@@ -7,6 +7,10 @@ LIBS = `pkg-config fuse3 --cflags --libs` -lzstd -lz
 GENERATION_REGISTRY_BENCH_WRAP_FLAGS = -Wl,--wrap=fsync -Wl,--wrap=rename -Wl,--wrap=unlink -Wl,--wrap=rmdir -Wl,--wrap=readlink -Wl,--wrap=lstat -Wl,--wrap=link -Wl,--wrap=symlink
 GENERATION_REGISTRY_BENCH_ARGS ?=
 GENERATION_REGISTRY_BENCH_WORKDIR ?=
+GENERATION_REGISTRY_CURRENT_RESULT ?=
+GENERATION_REGISTRY_BASELINE_RESULT ?=
+GENERATION_REGISTRY_CURRENT_AA_RESULT ?=
+GENERATION_REGISTRY_BASELINE_AA_RESULT ?=
 
 # Định nghĩa các thư mục mã nguồn
 CORE_SRCS = src/core/path.c src/core/metadata.c src/core/compress.c src/core/compact.c src/core/chunkio.c src/core/chunkio_scratch.c src/core/lock.c
@@ -15,7 +19,7 @@ GUARD_SRCS = src/guards/guards.c
 
 SRCS = src/main.c $(CORE_SRCS) $(OPS_SRCS) $(GUARD_SRCS)
 
-.PHONY: all help test-help release run umount test test-unit test-generation-registry tsan-generation-registry tsan-file-ops test-lock test-lock-tsan test-chunkio-scratch test-chunkio-scratch-tsan bench bench-zstd-context bench-chunkio-scratch bench-lock-table build-generation-registry-bench build-generation-registry-baseline bench-generation-registry tsan-generation-registry-bench force-generation-registry-bench clean
+.PHONY: all help test-help release run umount test test-unit test-generation-registry tsan-generation-registry tsan-file-ops test-lock test-lock-tsan test-chunkio-scratch test-chunkio-scratch-tsan bench bench-zstd-context bench-chunkio-scratch bench-lock-table build-generation-registry-bench build-generation-registry-baseline bench-generation-registry compare-generation-registry-bench tsan-generation-registry-bench force-generation-registry-bench clean
 
 all: myfs
 
@@ -34,6 +38,7 @@ test-help:
 	@echo "  make build-generation-registry-bench  Build registry/GC microbenchmark"
 	@echo "  make build-generation-registry-baseline BASELINE_TREE=/path BASELINE_OUTPUT=/path/to/binary"
 	@echo "  make bench-generation-registry GENERATION_REGISTRY_BENCH_WORKDIR=/path [GENERATION_REGISTRY_BENCH_ARGS='...']"
+	@echo "  make compare-generation-registry-bench GENERATION_REGISTRY_{CURRENT,BASELINE,CURRENT_AA,BASELINE_AA}_RESULT=/path"
 	@echo "  make tsan-generation-registry-bench  Short registry/GC benchmark under ThreadSanitizer"
 	@echo "  make test                       Mounted FUSE integration suite"
 
@@ -162,13 +167,20 @@ bench-generation-registry: benchmarks/generation_registry_bench
 	@test -n "$(GENERATION_REGISTRY_BENCH_WORKDIR)" || { echo "GENERATION_REGISTRY_BENCH_WORKDIR=/real/filesystem/path is required" >&2; exit 2; }
 	@./benchmarks/generation_registry_bench --workdir "$(GENERATION_REGISTRY_BENCH_WORKDIR)" $(GENERATION_REGISTRY_BENCH_ARGS)
 
+compare-generation-registry-bench:
+	@test -n "$(GENERATION_REGISTRY_CURRENT_RESULT)" || { echo "GENERATION_REGISTRY_CURRENT_RESULT=/path is required" >&2; exit 2; }
+	@test -n "$(GENERATION_REGISTRY_BASELINE_RESULT)" || { echo "GENERATION_REGISTRY_BASELINE_RESULT=/path is required" >&2; exit 2; }
+	@test -n "$(GENERATION_REGISTRY_CURRENT_AA_RESULT)" || { echo "GENERATION_REGISTRY_CURRENT_AA_RESULT=/path is required" >&2; exit 2; }
+	@test -n "$(GENERATION_REGISTRY_BASELINE_AA_RESULT)" || { echo "GENERATION_REGISTRY_BASELINE_AA_RESULT=/path is required" >&2; exit 2; }
+	@./benchmarks/compare_generation_registry_results.sh \
+		"$(GENERATION_REGISTRY_CURRENT_RESULT)" \
+		"$(GENERATION_REGISTRY_BASELINE_RESULT)" \
+		"$(GENERATION_REGISTRY_CURRENT_AA_RESULT)" \
+		"$(GENERATION_REGISTRY_BASELINE_AA_RESULT)"
+
 tsan-generation-registry-bench:
 	$(CC) $(COMMON_CFLAGS) -g -O1 -fsanitize=thread -fno-omit-frame-pointer -DMYFS_BENCH_TREE_HASH='"$(shell git rev-parse --verify HEAD 2>/dev/null || echo unknown)-tsan"' $(GENERATION_REGISTRY_BENCH_WRAP_FLAGS) -o /tmp/myfs-generation-registry-bench-tsan benchmarks/generation_registry_bench.c $(CORE_SRCS) $(LIBS)
-	@workdir=$$(mktemp -d /tmp/myfs-generation-registry-bench-tsan.XXXXXX); \
-	trap 'rmdir "$$workdir"' EXIT; \
-	cpus=$$(awk '$$1 == "Cpus_allowed_list:" { print $$2; exit }' /proc/$$$$/status); \
-	cpu=$${cpus%%,*}; cpu=$${cpu%%-*}; \
-	TSAN_OPTIONS=halt_on_error=1 /tmp/myfs-generation-registry-bench-tsan --short --cpus "$$cpu" --workdir "$$workdir"
+	@TSAN_OPTIONS=halt_on_error=1 bash ./tests/test_generation_registry_benchmark_output.sh /tmp/myfs-generation-registry-bench-tsan
 
 clean:
 	@if mountpoint -q mountpoint 2>/dev/null; then \
