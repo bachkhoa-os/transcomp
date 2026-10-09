@@ -86,6 +86,7 @@ struct measurement
     uint64_t p99_ns;
     uint64_t p999_ns;
     uint64_t max_ns;
+    uint64_t delayed_operations;
     double delayed_fraction;
     uint64_t gc_cycles;
     double gc_cycles_per_second;
@@ -109,6 +110,10 @@ struct summary
     uint64_t median_p999_ns;
     uint64_t max_ns;
     double median_delayed_fraction;
+    uint64_t delayed_total;
+    uint64_t pooled_operations;
+    double pooled_delayed_fraction;
+    double delayed_per_gc_cycle;
     double median_gc_cycles_per_second;
     uint64_t min_gc_cycles;
     double aa_median_spread_pct;
@@ -330,6 +335,24 @@ static void usage(const char *program)
     puts("  --aa                        paired same-binary A/A measurements");
     puts("  --noise-floor-pct P         previously observed A/A gate");
     puts("  --short                     short output/TSan configuration");
+    puts("CSV populations (every measured operation is recorded; warmup is excluded):");
+    puts("  workload/io_mode/threads/gc_threads/repetitions: configuration identifiers/counts.");
+    puts("  operations: median operation count per primary repetition.");
+    puts("  median_ops_per_sec/median_per_thread_ops_per_sec: medians of primary repetition rates.");
+    puts("  min_ops_per_sec/max_ops_per_sec: minimum/maximum primary repetition rates.");
+    puts("  p50_ns/p99_ns/p999_ns: medians of primary repetition percentiles, not pooled percentiles.");
+    puts("  max_ns: maximum operation latency over all primary repetitions (informational).");
+    puts("  median_rep_delayed_fraction: median of primary repetition fractions strictly over threshold.");
+    puts("  delayed_total/pooled_operations: sums over all primary repetitions.");
+    puts("  pooled_delayed_fraction: delayed_total / pooled_operations.");
+    puts("  delayed_per_gc_cycle: delayed_total / summed completed primary GC cycles; zero without GC.");
+    puts("  gc_median_cycles_per_sec: median primary repetition GC rate (includes final cycle completion).");
+    puts("  gc_min_cycles: minimum completed cycles across primary and, with --aa, companion repetitions.");
+    puts("  aa_median_spread_pct/aa_max_spread_pct: median/maximum paired throughput spread, 100*(high-low)/low.");
+    puts("  noise_floor_pct: aa_max_spread_pct with --aa, supplied floor otherwise, or zero if unavailable.");
+    puts("  win_gate: aa-reference, exceeds-noise-floor (supplied floor), or unavailable.");
+    puts("  self_check: all primary and A/A companion repetition checks pass.");
+    puts("  A/A companions contribute only to spread, gc_min_cycles and self_check; other columns use primary repetitions.");
 }
 
 static struct options parse_options(int argc, char **argv)
@@ -927,6 +950,7 @@ static void calculate_latency(struct measurement *measurement,
         if (latencies[i] > threshold_ns)
             delayed++;
     }
+    measurement->delayed_operations = delayed;
     measurement->delayed_fraction = count
         ? (double)delayed / (double)count : 0.0;
 }
@@ -1711,8 +1735,16 @@ static struct summary summarize(
     summary.min_ops = primary[0].operations_per_second;
     summary.max_ops = primary[0].operations_per_second;
     summary.max_ns = primary[0].max_ns;
+    uint64_t pooled_gc_cycles = 0;
     for (size_t i = 0; i < count; i++)
     {
+        if (primary[i].operations > UINT64_MAX - summary.pooled_operations ||
+            primary[i].delayed_operations > UINT64_MAX - summary.delayed_total ||
+            primary[i].gc_cycles > UINT64_MAX - pooled_gc_cycles)
+            failf("pooled measurement count overflows uint64_t");
+        summary.pooled_operations += primary[i].operations;
+        summary.delayed_total += primary[i].delayed_operations;
+        pooled_gc_cycles += primary[i].gc_cycles;
         ops[i] = primary[i].operations_per_second;
         operation_counts[i] = primary[i].operations;
         per_thread[i] = primary[i].per_thread_operations_per_second;
@@ -1746,6 +1778,10 @@ static struct summary summarize(
     summary.operations = median_u64(operation_counts, count);
     summary.median_per_thread_ops = median_double(per_thread, count);
     summary.median_delayed_fraction = median_double(delayed, count);
+    summary.pooled_delayed_fraction = summary.pooled_operations
+        ? (double)summary.delayed_total / (double)summary.pooled_operations : 0.0;
+    summary.delayed_per_gc_cycle = pooled_gc_cycles
+        ? (double)summary.delayed_total / (double)pooled_gc_cycles : 0.0;
     summary.median_gc_cycles_per_second = median_double(gc_rate, count);
     summary.median_p50_ns = median_u64(p50, count);
     summary.median_p99_ns = median_u64(p99, count);
@@ -1991,6 +2027,7 @@ static void print_header(const struct options *options,
     puts("GC_WINDOW,stop=minimum-iterations-and-minimum-cycles,timeout_seconds=30");
     puts("GC_LOCK_DUTY_CYCLE,status=not-measurable,reason=public-api-does-not-expose-lock-hold-intervals");
     puts("METRIC,max_ns=informational");
+    puts("LATENCY_POPULATION,recorded=every-measured-operation,warmup=excluded,pooled=primary-repetitions");
     puts("MIXED,skipped,reason=public-api-no-shard-placement");
     puts("SELF_CHECK,registry_empty=inferred-from-balanced-public-lifecycle,victims=retired,owned_files=removed");
     if (options->repetitions < 7)
@@ -2002,7 +2039,8 @@ static void print_csv_row(const struct summary *summary)
 {
     printf("%s,%s,%zu,%zu,%zu,%" PRIu64
            ",%.3f,%.3f,%.3f,%.3f,%" PRIu64 ",%" PRIu64
-           ",%" PRIu64 ",%" PRIu64 ",%.9f,%.3f,%" PRIu64
+           ",%" PRIu64 ",%" PRIu64 ",%.9f,%" PRIu64 ",%" PRIu64
+           ",%.9f,%.9f,%.3f,%" PRIu64
            ",%.6f,%.6f,%.6f,%s,%s\n",
            workload_name(summary->workload), io_mode_name(summary->io_mode),
            summary->threads, summary->gc_threads, summary->repetitions,
@@ -2011,6 +2049,8 @@ static void print_csv_row(const struct summary *summary)
            summary->median_p50_ns, summary->median_p99_ns,
            summary->median_p999_ns, summary->max_ns,
            summary->median_delayed_fraction,
+           summary->delayed_total, summary->pooled_operations,
+           summary->pooled_delayed_fraction, summary->delayed_per_gc_cycle,
            summary->median_gc_cycles_per_second, summary->min_gc_cycles,
            summary->aa_median_spread_pct, summary->aa_max_spread_pct,
            summary->noise_floor_pct, summary->win_gate,
@@ -2022,14 +2062,16 @@ static void print_human_row(const struct summary *summary)
     printf("%-16s %-15s %3zu  %12.0f [%12.0f,%12.0f] "
            "p50=%9" PRIu64 "ns p99=%9" PRIu64
            "ns p99.9=%9" PRIu64 "ns max_info=%9" PRIu64
-           "ns delayed=%8.5f gc=%8.1f/s "
+           "ns pooled_delayed=%.9f delayed_total=%" PRIu64
+           " delayed_per_gc_cycle=%.9f gc=%8.1f/s "
            "A/Amax=%7.2f%%\n",
            workload_name(summary->workload), io_mode_name(summary->io_mode),
            summary->threads, summary->median_ops, summary->min_ops,
            summary->max_ops, summary->median_p50_ns,
            summary->median_p99_ns, summary->median_p999_ns,
            summary->max_ns,
-           summary->median_delayed_fraction,
+           summary->pooled_delayed_fraction, summary->delayed_total,
+           summary->delayed_per_gc_cycle,
            summary->median_gc_cycles_per_second,
            summary->aa_max_spread_pct);
 }
@@ -2085,7 +2127,25 @@ int main(int argc, char **argv)
     }
 
     puts("CSV_BEGIN");
-    puts("workload,io_mode,threads,gc_threads,repetitions,operations,median_ops_per_sec,min_ops_per_sec,max_ops_per_sec,median_per_thread_ops_per_sec,p50_ns,p99_ns,p999_ns,max_ns,delayed_fraction,gc_median_cycles_per_sec,gc_min_cycles,aa_median_spread_pct,aa_max_spread_pct,noise_floor_pct,win_gate,self_check");
+    /* CSV populations: every measured operation has a latency; warmup is excluded.
+     * workload/io_mode/threads/gc_threads/repetitions identify the configuration.
+     * operations and median_* rates are medians across primary repetitions;
+     * min_ops_per_sec/max_ops_per_sec are extrema of their throughput rates.
+     * p50_ns/p99_ns/p999_ns are medians of per-repetition percentiles, whereas
+     * max_ns is the maximum latency across all primary repetitions (informational).
+     * median_rep_delayed_fraction is the median per-repetition fraction strictly
+     * over threshold. delayed_total and pooled_operations sum primary counts;
+     * pooled_delayed_fraction divides these sums. delayed_per_gc_cycle divides
+     * delayed_total by summed primary completed GC cycles (zero without GC).
+     * gc_median_cycles_per_sec is the median primary GC rate, including completion
+     * of the final cycle. gc_min_cycles is the minimum across primary and A/A
+     * companion repetitions. aa_* spreads are median/max of paired throughput
+     * spreads, 100*(high-low)/low. noise_floor_pct is the A/A maximum, supplied
+     * floor, or zero if unavailable; win_gate identifies that source. self_check
+     * requires every primary/companion check to pass. A/A companions affect only
+     * spreads, gc_min_cycles and self_check; all other columns use primary runs.
+     */
+    puts("workload,io_mode,threads,gc_threads,repetitions,operations,median_ops_per_sec,min_ops_per_sec,max_ops_per_sec,median_per_thread_ops_per_sec,p50_ns,p99_ns,p999_ns,max_ns,median_rep_delayed_fraction,delayed_total,pooled_operations,pooled_delayed_fraction,delayed_per_gc_cycle,gc_median_cycles_per_sec,gc_min_cycles,aa_median_spread_pct,aa_max_spread_pct,noise_floor_pct,win_gate,self_check");
     for (size_t i = 0; i < summary_count; i++)
         print_csv_row(&summaries[i]);
     puts("CSV_END");

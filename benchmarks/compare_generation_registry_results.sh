@@ -88,7 +88,7 @@ function describe_key(key) {
 }
 
 BEGIN {
-    expected_header = "workload,io_mode,threads,gc_threads,repetitions,operations,median_ops_per_sec,min_ops_per_sec,max_ops_per_sec,median_per_thread_ops_per_sec,p50_ns,p99_ns,p999_ns,max_ns,delayed_fraction,gc_median_cycles_per_sec,gc_min_cycles,aa_median_spread_pct,aa_max_spread_pct,noise_floor_pct,win_gate,self_check"
+    expected_header = "workload,io_mode,threads,gc_threads,repetitions,operations,median_ops_per_sec,min_ops_per_sec,max_ops_per_sec,median_per_thread_ops_per_sec,p50_ns,p99_ns,p999_ns,max_ns,median_rep_delayed_fraction,delayed_total,pooled_operations,pooled_delayed_fraction,delayed_per_gc_cycle,gc_median_cycles_per_sec,gc_min_cycles,aa_median_spread_pct,aa_max_spread_pct,noise_floor_pct,win_gate,self_check"
 
     role_name[1] = "current"
     role_name[2] = "baseline"
@@ -142,8 +142,8 @@ BEGIN {
 
     row_count[input_role]++
     row_number = row_count[input_role]
-    if (NF != 22) {
-        fail(input_role ": expected 22 columns, got " NF \
+    if (NF != 26) {
+        fail(input_role ": expected 26 columns, got " NF \
              " in CSV row " row_number)
         next
     }
@@ -167,17 +167,17 @@ BEGIN {
              row_number ": " $7)
         valid = 0
     }
-    if (!nonnegative_number($19)) {
+    if (!nonnegative_number($23)) {
         fail(input_role ": invalid aa_max_spread_pct in CSV row " \
-             row_number ": " $19)
+             row_number ": " $23)
         valid = 0
     }
-    if ($22 != "pass") {
+    if ($26 != "pass") {
         fail(input_role ": self-check did not pass in CSV row " row_number)
         valid = 0
     }
     if ((input_role == "current-aa" || input_role == "baseline-aa") &&
-        $21 != "aa-reference") {
+        $25 != "aa-reference") {
         fail(input_role ": CSV row " row_number \
              " is not an A/A reference")
         valid = 0
@@ -196,7 +196,7 @@ BEGIN {
     key_io_mode[key] = $2
     key_threads[key] = $3
     median[input_role, key] = $7 + 0
-    aa_max_spread[input_role, key] = $19 + 0
+    aa_max_spread[input_role, key] = $23 + 0
 
     if (input_role == "current")
         current_order[++current_rows] = key

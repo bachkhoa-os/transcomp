@@ -100,7 +100,7 @@ function note_prefix(prefix, name) {
         header_count[name]++
 }
 BEGIN {
-    expected_header = "workload,io_mode,threads,gc_threads,repetitions,operations,median_ops_per_sec,min_ops_per_sec,max_ops_per_sec,median_per_thread_ops_per_sec,p50_ns,p99_ns,p999_ns,max_ns,delayed_fraction,gc_median_cycles_per_sec,gc_min_cycles,aa_median_spread_pct,aa_max_spread_pct,noise_floor_pct,win_gate,self_check"
+    expected_header = "workload,io_mode,threads,gc_threads,repetitions,operations,median_ops_per_sec,min_ops_per_sec,max_ops_per_sec,median_per_thread_ops_per_sec,p50_ns,p99_ns,p999_ns,max_ns,median_rep_delayed_fraction,delayed_total,pooled_operations,pooled_delayed_fraction,delayed_per_gc_cycle,gc_median_cycles_per_sec,gc_min_cycles,aa_median_spread_pct,aa_max_spread_pct,noise_floor_pct,win_gate,self_check"
     rule = "Rule: do not report a difference as a win unless it exceeds the observed A/A spread."
     split("control scalability hot-path", non_gc_workloads, " ")
     split("real synthetic-delay", gc_modes, " ")
@@ -116,6 +116,7 @@ BEGIN {
     note_prefix("GC_LOCK_DUTY_CYCLE,status=not-measurable,", "gc_duty_cycle")
     note_prefix("GC_WINDOW,stop=minimum-iterations-and-minimum-cycles,timeout_seconds=30", "gc_window")
     note_prefix("METRIC,max_ns=informational", "max_metric")
+    note_prefix("LATENCY_POPULATION,recorded=every-measured-operation,warmup=excluded,pooled=primary-repetitions", "latency_population")
     note_prefix("CONFIG,", "config")
     note_prefix("MIXED,skipped,reason=public-api-no-shard-placement", "mixed")
     note_prefix("SELF_CHECK,registry_empty=inferred-from-balanced-public-lifecycle,victims=retired,owned_files=removed", "self_check_scope")
@@ -174,8 +175,8 @@ BEGIN {
     }
 
     rows++
-    if (NF != 22) {
-        fail("expected 22 columns, got " NF " in row " rows)
+    if (NF != 26) {
+        fail("expected 26 columns, got " NF " in row " rows)
         next
     }
 
@@ -194,11 +195,13 @@ BEGIN {
         fail("non-positive repetition count in row " rows)
     if (!nonnegative_integer(operations) || operations + 0 <= 0)
         fail("non-positive operation count in row " rows)
-    if (!nonnegative_integer($17))
+    if (!nonnegative_integer($21))
         fail("non-integer gc_min_cycles in row " rows)
+    if (!nonnegative_integer($16) || !nonnegative_integer($17) || $17 + 0 <= 0)
+        fail("invalid pooled counts in row " rows)
 
-    for (column = 7; column <= 20; column++) {
-        if (column != 17 && !nonnegative_number($column))
+    for (column = 7; column <= 24; column++) {
+        if (column != 21 && !nonnegative_number($column))
             fail("invalid numeric column " column " in row " rows)
     }
     for (column = 7; column <= 10; column++) {
@@ -210,10 +213,19 @@ BEGIN {
     if ($11 + 0 > $12 + 0 || $12 + 0 > $13 + 0 || $13 + 0 > $14 + 0)
         fail("latency percentiles are out of order in row " rows)
     if ($15 + 0 > 1)
-        fail("delayed_fraction is greater than one in row " rows)
-    if ($21 != "aa-reference")
-        fail("unexpected win_gate in row " rows ": " $21)
-    if ($22 != "pass")
+        fail("median_rep_delayed_fraction is greater than one in row " rows)
+    if ($16 + 0 > $17 + 0 || $18 + 0 > 1)
+        fail("invalid pooled delayed fraction/counts in row " rows)
+    fraction_error = $18 - $16 / $17
+    if (fraction_error < -0.000000000501 || fraction_error > 0.000000000501)
+        fail("pooled fraction does not equal delayed_total/pooled_operations in row " rows)
+    if (repetitions == 1 && ($17 != operations || $15 != $18))
+        fail("single primary repetition differs from pooled population in row " rows)
+    if (($14 + 0 > 1000000) != ($16 + 0 > 0))
+        fail("pooled delayed count disagrees with max_ns/threshold in row " rows)
+    if ($25 != "aa-reference")
+        fail("unexpected win_gate in row " rows ": " $25)
+    if ($26 != "pass")
         fail("self-check did not pass in row " rows)
 
     if (workload == "control" || workload == "scalability" || workload == "hot-path") {
@@ -221,15 +233,17 @@ BEGIN {
             fail("unexpected I/O mode for " workload ": " io_mode)
         if (gc_threads + 0 != 0)
             fail("non-GC workload has GC threads in row " rows)
-        if ($16 + 0 != 0 || $17 + 0 != 0)
+        if ($20 + 0 != 0 || $21 + 0 != 0 || $19 + 0 != 0)
             fail("non-GC workload has non-zero GC metrics in row " rows)
     } else if (workload == "gc-interference") {
         if (io_mode != "real" && io_mode != "synthetic-delay")
             fail("unexpected GC I/O mode " io_mode)
         if (gc_threads + 0 <= 0)
             fail("GC workload has no GC threads in row " rows)
-        if (!positive_number($16) || $17 + 0 <= 0)
+        if (!positive_number($20) || $21 + 0 <= 0)
             fail("GC workload did not complete a cycle in row " rows)
+        if (($16 + 0 > 0) != ($19 + 0 > 0) || $19 + 0 > $16 + 0)
+            fail("invalid delayed_per_gc_cycle in row " rows)
     } else {
         fail("unknown workload " workload)
     }
@@ -263,6 +277,8 @@ END {
         fail("expected one GC measurement-window line")
     if (header_count["max_metric"] != 1)
         fail("expected one informational max-latency marker")
+    if (header_count["latency_population"] != 1)
+        fail("expected one full latency population marker")
     if (header_count["config"] != 1)
         fail("expected one CONFIG header")
     if (header_count["mixed"] != 1)
@@ -313,7 +329,7 @@ awk -F, -v OFS=, '
 awk -F, -v OFS=, '
     $0 == "CSV_BEGIN" { in_csv = 1; print; next }
     in_csv && !header_seen { header_seen = 1; print; next }
-    in_csv && NF == 22 { $19 = "0.500000" }
+    in_csv && NF == 26 { $23 = "0.500000" }
     { print }
 ' "$comparison_dir/baseline.out" >"$comparison_dir/current-aa.out"
 cp "$comparison_dir/current-aa.out" "$comparison_dir/baseline-aa.out"
