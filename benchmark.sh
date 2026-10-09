@@ -681,10 +681,10 @@ ANALYZE_EOF
 section "BM10: Append-Only Write Pattern"
 # =============================================================================
 # Nhiều ứng dụng thực tế (log writer, database WAL) chỉ append.
-# Do overhead của chunk-alignment khi append nhỏ so với bulk write.
+# So sánh chi phí append nhỏ với bulk write, không tách riêng từng nguồn overhead.
 # Pattern C giảm xuống còn 1024 x 1KB (thay vì 65536) để chạy trong thời gian hợp lý.
 
-log "--- Pattern A: 1 lan ghi 64MB (bulk, ly tuong cho chunk 64KB) ---"
+log "--- Pattern A: ghi bulk 64MB bằng dd bs=4M (repack theo window_size) ---"
 python3 -c "
 import sys, string
 chars = (string.ascii_letters + string.digits + ' \n').encode()
@@ -696,7 +696,7 @@ rm -f "$MOUNT/bm_append_bulk.bin"
 log "  Bulk write 64MB:      ${WRITE_BULK:-N/A}"
 
 log ""
-log "--- Pattern B: 1024 lần append 64KB (mỗi lần bằng đúng 1 chunk) ---"
+log "--- Pattern B: 1024 lần append 64KB (số chunk phụ thuộc window_size) ---"
 python3 -c "
 chars = b'abcdefghijklmnopqrstuvwxyz0123456789 \n'
 chunk = bytes([chars[i % len(chars)] for i in range(64 * 1024)])
@@ -723,8 +723,9 @@ rm -f "$MOUNT/bm_append_chunk.bin" "$MOUNT/bm_append_chunk2.bin"
 log "  Append 1024x64KB:     ${WRITE_CHUNK:-N/A}"
 
 log ""
-log "--- Pattern C: 1024 lan append 1KB (sub-chunk, RMW moi append) ---"
-# Ghi truoc 1 chunk day de moi append 1KB la partial overwrite (RMW)
+log "--- Pattern C: 1024 lan append ~1KB (RMW khi chạm cửa sổ có dữ liệu cũ) ---"
+# Seed 64KB; append có thể bắt đầu cửa sổ mới hoặc merge cửa sổ đuôi,
+# tùy window_size hiện tại và offset, không phải lần nào cũng RMW.
 python3 -c "
 chars = b'abcdefghijklmnopqrstuvwxyz0123456789 \n'
 seed = bytes([chars[i % len(chars)] for i in range(64 * 1024)])
@@ -746,7 +747,7 @@ ELAPSED_MS_1KB=$(( (END_NS - START_NS) / 1000000 ))
 SIZE_1KB_MB=1  # ~1024 * 1KB = 1MB
 WRITE_1KB=$(python3 -c "print(f'{$SIZE_1KB_MB * 1000 / $ELAPSED_MS_1KB:.1f} MB/s')")
 AVG_RMW_MS=$(python3 -c "print(f'{$ELAPSED_MS_1KB / 1024:.2f}')")
-sleep 0.5  # đợi release/compact xử lý xong để đọc meta ổn định
+sleep 0.5  # cho worker thời gian chạy; không xác nhận compact đã xong hay meta bất biến
 if read_metadata_stats "$BACKING/bm_append_1kb.bin.meta"; then
     PACK_DISK=$(stat -c%s "$BACKING/bm_append_1kb.bin.data")
     PACK_STATS=$(python3 -c "print(f'{$META_CHUNKS} chunks | logical {$META_LOGICAL_SIZE/1024:.0f}KB | disk {$PACK_DISK/1024:.0f}KB | ratio {$META_LOGICAL_SIZE/max($PACK_DISK,1):.2f}x')")
@@ -756,17 +757,17 @@ fi
 rm -f "$MOUNT/bm_append_1kb.bin"
 log "  Append 1024x1KB:      ${WRITE_1KB:-N/A}  (avg ${AVG_RMW_MS} ms/write)"
 log "  Chunk packing:        ${PACK_STATS}"
-log "                        (trước 64KB packing: ~1025 chunk nhỏ, ratio kém hơn đáng kể)"
+log "                        (trước packing: ~1025 chunk nhỏ; snapshot hiện tại tùy window_size/compact)"
 
 log ""
 log "+--------------------------------+------------------+------------------------------------------+"
 log "| Pattern                        | Throughput       | Ghi chú                                  |"
 log "+--------------------------------+------------------+------------------------------------------+"
-log "| $(printf '%-31s| %-17s| %-41s|' "Bulk write 64MB (1 call)"    "${WRITE_BULK:-N/A}"  "Optimization: chunk-granularity writes")"
-log "| $(printf '%-31s| %-17s| %-41s|' "Append 1024x64KB (chunk-OK)" "${WRITE_CHUNK:-N/A}" "Best case: 1 write fills 1 chunk")"
-log "| $(printf '%-31s| %-17s| %-41s|' "Append 1024x1KB (sub-chunk)" "${WRITE_1KB:-N/A}"   "Worst case: every append triggers RMW")"
+log "| $(printf '%-31s| %-17s| %-41s|' "Bulk write 64MB (dd bs=4M)"    "${WRITE_BULK:-N/A}"  "Includes sync; not one write syscall")"
+log "| $(printf '%-31s| %-17s| %-41s|' "Append 1024x64KB" "${WRITE_CHUNK:-N/A}" "Chunk count depends on window_size")"
+log "| $(printf '%-31s| %-17s| %-41s|' "Append 1024x1KB" "${WRITE_1KB:-N/A}"   "RMW only when merging an existing window")"
 log "+--------------------------------+------------------+------------------------------------------+"
-log "| $(printf '%-31s| %-17s| %-41s|' "RMW avg latency (1KB write)"  "${AVG_RMW_MS:-N/A} ms"  "Derived from Pattern C")"
+log "| $(printf '%-31s| %-17s| %-41s|' "Append avg latency (~1KB)"  "${AVG_RMW_MS:-N/A} ms"  "Pattern C elapsed / 1024, not isolated RMW")"
 log "+--------------------------------+------------------+------------------------------------------+"
 
 log ""
@@ -784,24 +785,24 @@ bulk, chunk, kb1, rmw_ms = [parse(a) for a in sys.argv[1:]]
 if bulk and chunk:
     pct = (1 - chunk/bulk)*100
     factor = bulk/chunk
-    print(f'  Bulk vs Chunk-aligned: chunk-aligned chậm hơn {factor:.1f}x ({pct:.1f}% overhead)')
-    print(f'    -> Overhead đến từ: flush() per-write + FUSE round-trip per-call')
+    print(f'  Bulk vs Append 64KB: append chậm hơn {factor:.1f}x ({pct:.1f}% overhead)')
+    print(f'    -> Các lượt flush()/FUSE per-call và repack góp vào chi phí; phép đo không tách riêng')
 
 if bulk and kb1:
     factor = bulk/kb1 if kb1 > 0 else float('inf')
     print(f'  Bulk vs Sub-chunk 1KB: sub-chunk chậm hơn {factor:.1f}x')
     if rmw_ms:
-        print(f'    -> Mỗi append 1KB phải thực hiện full RMW (~{rmw_ms:.2f} ms/write)')
-        print(f'    -> RMW: đọc chunk cũ -> giải nén -> patch -> nén lại -> ghi mới -> cập nhật meta')
+        print(f'    -> Trung bình toàn vòng append ~{rmw_ms:.2f} ms/write, không phải latency RMW riêng')
+        print(f'    -> Khi merge cửa sổ cũ: đọc/giải nén -> patch -> nén lại -> ghi mới -> cập nhật meta')
 
 if chunk and kb1:
     factor = chunk/kb1 if kb1 > 0 else float('inf')
-    print(f'  Chunk-aligned vs Sub-chunk: chunk-aligned nhanh hơn {factor:.1f}x')
+    print(f'  Append 64KB vs Append ~1KB: append 64KB nhanh hơn {factor:.1f}x')
 
 print()
 print('  [KẾT LUẬN]')
-print('  Ứng dụng nén buffer data đến >= 64KB trước khi write vào myfs.')
-print('  Sub-chunk write liên tục là anti-pattern với chunk-based compression FS.')
+print('  Batch write có thể giảm số syscall; cửa sổ repack là window_size của generation, không cố định 64KB.')
+print('  Append nhỏ có thể cần merge cửa sổ đuôi; phép đo này không tách riêng chi phí đó.')
 print('  Use case phù hợp nhất: sequential log, file dump, media encoding output.')
 ANALYZE_EOF
 

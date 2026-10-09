@@ -1,5 +1,9 @@
 #include "myfs.h"
 
+#ifdef MYFS_TEST_FAILPOINTS
+#include "core/lock_test.h"
+#endif
+
 /*
  * lock.c — per-path locking.
  *
@@ -9,8 +13,11 @@
  * protects only that shard's buckets, links, and reference counts. It must
  * always be released before waiting for a path mutex.
  *
- * System-wide lock ordering (never reverse):
- *   path lock -> registry mutex / compaction queue mutex / cache lock
+ * System-wide nested lock ordering (never reverse):
+ *   path lock -> cache_lock -> generation-registry shard
+ * A path lock may also take a registry shard directly, and fast handle reads
+ * take cache_lock -> registry shard without a path lock. compact_queue_mu is
+ * released before waiting for a path lock; it is not part of this nesting.
  *
  * Future operations that need more than one path lock (for example rename)
  * must deduplicate identical paths, then acquire distinct paths in ascending
@@ -56,6 +63,38 @@ struct lock_shard
 static struct lock_shard lock_shards[MYFS_LOCK_SHARD_COUNT];
 static pthread_once_t lock_table_once = PTHREAD_ONCE_INIT;
 static int lock_table_init_status;
+
+#ifdef MYFS_TEST_FAILPOINTS
+static pthread_mutex_t lock_test_hook_mu = PTHREAD_MUTEX_INITIALIZER;
+static myfs_lock_test_acquire_fail_hook_fn lock_test_acquire_fail_hook;
+static void *lock_test_acquire_fail_hook_context;
+
+void myfs_lock_test_set_acquire_fail_hook(
+    myfs_lock_test_acquire_fail_hook_fn hook, void *context)
+{
+    if (pthread_mutex_lock(&lock_test_hook_mu) != 0)
+        return;
+    lock_test_acquire_fail_hook = hook;
+    lock_test_acquire_fail_hook_context = context;
+    pthread_mutex_unlock(&lock_test_hook_mu);
+}
+
+static bool lock_test_should_fail_acquire(const char *path)
+{
+    if (pthread_mutex_lock(&lock_test_hook_mu) != 0)
+        return false;
+    bool fail = lock_test_acquire_fail_hook &&
+        lock_test_acquire_fail_hook(
+            path, lock_test_acquire_fail_hook_context);
+    if (fail)
+    {
+        lock_test_acquire_fail_hook = NULL;
+        lock_test_acquire_fail_hook_context = NULL;
+    }
+    pthread_mutex_unlock(&lock_test_hook_mu);
+    return fail;
+}
+#endif
 
 static uint64_t hash_path(const char *path, size_t length)
 {
@@ -169,6 +208,14 @@ myfs_file_lock_t *myfs_lock_file(const char *path)
     size_t length = strnlen(path, PATH_MAX);
     if (length == PATH_MAX)
         return NULL;
+
+#ifdef MYFS_TEST_FAILPOINTS
+    /* Run a blocking test hook before taking a lock-table shard.  A true
+     * result is consumed atomically so exactly one matching acquisition can
+     * be forced to fail. */
+    if (lock_test_should_fail_acquire(path))
+        return NULL;
+#endif
 
     uint64_t hash = hash_path(path, length);
     size_t shard_index = shard_index_for_hash(hash);

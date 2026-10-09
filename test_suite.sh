@@ -375,12 +375,11 @@ ACTUAL_SIZE=$(stat -c%s "$MOUNT/tc14_append.txt")
 assert_eq "TC14.4 — logical size sau 20 lần append" "$EXPECTED_SIZE" "$ACTUAL_SIZE"
 
 # =============================================================================
-section "TC15: Remount nhiều lần — persistence"
+section "TC15: Đọc lặp lại — nội dung và metadata nhất quán"
 # =============================================================================
 
-# Test này chỉ chạy được nếu có quyền unmount (cần FUSE đang chạy)
-# Kiểm tra data persist sau khi đọc từ cold cache (không remount thực sự,
-# nhưng verify metadata đồng bộ bằng cách đọc lại nhiều lần liên tiếp)
+# Cần FUSE đang mount; test không unmount/remount hay ép cold cache.
+# Đọc lại nhiều lần rồi đối chiếu logical_size trong backing metadata.
 
 echo "PERSIST TEST" > "$MOUNT/tc15_persist.txt"
 
@@ -445,13 +444,14 @@ printf 'ZZ' | dd of="$MOUNT/tc17_edges.txt" bs=1 seek=8 conv=notrunc 2>/dev/null
 assert_content "TC17.2 — overwrite cuối file" "XYCDEFGHZZ" "$MOUNT/tc17_edges.txt"
 
 # =============================================================================
-section "TC18: Garbage collection — compact sau RMW"
+section "TC18: Garbage collection — compact sau ghi đè"
 # =============================================================================
 
 # Compact được kiểm tra bằng cách: sau nhiều lần ghi đè lên cùng file,
-# kích thước đĩa không được tăng quá 2x kích thước logic (compact giữ nó ở mức hợp lý).
-# File ngẫu nhiên 512KB là blob không nén được (raw), mỗi RMW tạo orphan ~512KB.
-# Compact chạy trong myfs_release() của mỗi descriptor — nên kích thước đĩa ổn định.
+# kích thước đĩa tại thời điểm kiểm tra không vượt 2x kích thước đĩa ban đầu.
+# File ngẫu nhiên 512KB gần như không nén được; mỗi lần ghi đè toàn file tạo waste.
+# myfs_release() chạy GC đồng bộ rồi schedule compact sau khi nhả lock;
+# compact chạy ở worker, hoặc đồng bộ nếu worker không chạy/đang dừng.
 
 dd if=/dev/urandom bs=512K count=1 of="$MOUNT/tc18_gc.bin" 2>/dev/null
 LOGICAL=$(stat -c%s "$MOUNT/tc18_gc.bin")
@@ -462,12 +462,12 @@ for i in $(seq 1 5); do
     dd if=/dev/urandom bs=512K count=1 of="$MOUNT/tc18_gc.bin" conv=notrunc 2>/dev/null
 done
 
-# Compaction giờ chạy trên background worker — chờ worker xử lý xong queue
+# Cho background worker thời gian chạy; sleep cố định không chứng minh queue đã hết.
 sleep 2
 SIZE_FINAL=$(stat -c%s "$BACKING/tc18_gc.bin.data")
  
-# Sau compact chạy liên tục, disk size không được > 2x initial
-# (nếu compact không chạy, size sẽ là 6x initial)
+# Kiểm tra snapshot disk size <= 2x initial, không phải xác nhận worker đã xong.
+# Nếu không compact, sáu lượt ghi raw toàn file có thể tích lũy khoảng 6x initial.
 if [ "$SIZE_FINAL" -le "$((SIZE_INITIAL * 2))" ]; then
     ok "TC18.1 — compact giữ disk ổn định (initial=${SIZE_INITIAL} final=${SIZE_FINAL})"
 else
@@ -730,11 +730,11 @@ else
 fi
 
 # =============================================================================
-section "TC23: Chunk packing — 1MB ghi 4KB/lần → chunk 64KB"
+section "TC23: Chunk packing — 1MB ghi 4KB/lần theo window_size"
 # =============================================================================
 
-# Trước packing: 256 write call = 256 chunk nhỏ. Sau packing: các append gộp
-# vào chunk đuôi của cửa sổ hiện tại → đúng 16 chunk 64KB head-aligned.
+# Các append được gộp theo window_size của generation; kiểm tra số chunk
+# và head-alignment theo window_size lưu trong metadata, không cố định 64KB.
 rm -f "$MOUNT/tc23_pack.bin"
 python3 -c "
 import os
@@ -868,8 +868,8 @@ print('OK' if data == expect else 'BAD len=%d' % len(data))
 ")
 assert_eq "TC27.1 — đọc file legacy unpacked (tolerant tier)" "OK" "$CONTENT_OK"
 
-# release của lần đọc trên kích hoạt compaction migration (file chưa packed
-# được repack bất kể waste); chờ chút cho release xử lý xong.
+# release của lần đọc trên schedule compaction migration (file chưa packed
+# được repack bất kể waste); sleep chỉ cho worker thời gian chạy, không chứng minh đã xong.
 sleep 1
 PACKED=$(python3 -c "
 import sys
@@ -946,16 +946,17 @@ print('OK' if all(s == 64*8192 for s in sizes) else 'BAD %r' % sizes)
 assert_eq "TC28.2 — logical size cả 4 file = 512KB" "OK" "$SIZES_OK"
 
 # =============================================================================
-section "TC29: Background compaction — thu hồi waste không chặn release"
+section "TC29: Background compaction — kiểm tra thu hồi waste sau release"
 # =============================================================================
 
-# Ghi đè nhiều lần tạo orphan blob; release chỉ enqueue, worker thu hồi sau.
+# Ghi đè nhiều lần tạo waste; release chạy GC đồng bộ rồi schedule compact.
+# Compact thường chạy ở worker; fallback đồng bộ nếu worker không chạy/đang dừng.
 rm -f "$MOUNT/tc29_bg.bin"
 dd if=/dev/urandom bs=256K count=1 of="$MOUNT/tc29_bg.bin" 2>/dev/null
 for i in 1 2 3; do
     dd if=/dev/urandom bs=256K count=1 of="$MOUNT/tc29_bg.bin" conv=notrunc 2>/dev/null
 done
-sleep 2   # chờ worker xử lý queue
+sleep 2   # cho worker thời gian chạy, không chứng minh queue đã xử lý hết
 LOGICAL=$(stat -c%s "$MOUNT/tc29_bg.bin")
 DISK=$(stat -c%s "$BACKING/tc29_bg.bin.data")
 if [ "$DISK" -le "$((LOGICAL * 2))" ]; then

@@ -5,7 +5,7 @@
  * chunkio.c — engine I/O mức chunk dùng chung cho write path, truncate,
  * read và compaction. Hợp nhất ba đoạn logic trước đây bị lặp ở file.c và
  * compact.c: nạp+verify+giải nén payload, nén+append blob, và repack nội
- * dung vào các cửa sổ 64KB (bất biến packing).
+ * dung vào các cửa sổ theo kích thước của generation (bất biến packing).
  */
 
 static int pread_all(int fd, void *buf, size_t size, off_t offset)
@@ -49,8 +49,8 @@ static int pwrite_all(int fd, const void *buf, size_t size, off_t offset)
 }
 
 /*
- * Kiểm tra bất biến packing: mọi chunk bắt đầu đúng tại ranh giới cửa sổ
- * 64KB, không rỗng, không vượt quá cửa sổ, và offset tăng nghiêm ngặt
+ * Kiểm tra bất biến packing: mọi chunk bắt đầu đúng tại ranh giới window_size
+ * của generation, không rỗng, không vượt quá cửa sổ, và offset tăng nghiêm ngặt
  * (⇒ không chồng lấn, không vắt qua cửa sổ). Derive tại thời điểm load thay
  * vì persist một flag — flag có thể stale sau crash, còn derive tự lành.
  */
@@ -187,8 +187,9 @@ int myfs_blob_append(int fd, off_t *eof, const char *payload, size_t len,
 
 /*
  * Repack: ghép nội dung của các chunk [first_idx, first_idx+consumed) và
- * patch (nếu có) vào các cửa sổ 64KB trong [region_lo, region_hi), ghi mỗi
- * cửa sổ không rỗng thành một blob mới qua dst_fd (head-aligned: chunk mới
+ * patch (nếu có) vào các cửa sổ kích thước window_size trong
+ * [region_lo, region_hi), ghi mỗi cửa sổ không rỗng thành một blob mới qua
+ * dst_fd (head-aligned: chunk mới
  * luôn bắt đầu tại ranh giới cửa sổ, hole đầu cửa sổ materialize thành zero).
  * Cửa sổ hoàn toàn rỗng không tạo chunk — sparse được giữ nguyên.
  * Trả mảng entry mới qua out_entries/out_count (caller free + splice + sync).
@@ -228,7 +229,8 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
     uint32_t count = 0;
     myfs_chunkio_scratch_lease_t window_lease = {0};
     char *win_buf = NULL;
-    /* Cache payload của chunk vắt qua nhiều cửa sổ (legacy) — giải nén 1 lần. */
+    /* Cache payload của chunk vắt qua nhiều cửa sổ đích (layout legacy hoặc
+     * adaptive shrink) — giải nén 1 lần. */
     int64_t cached_idx = -1;
     myfs_chunkio_scratch_lease_t cached_lease = {0};
     char *cached_payload = NULL;
@@ -239,7 +241,8 @@ int myfs_repack_windows(int src_fd, int dst_fd, off_t *eof,
         off_t win_end = win + (off_t)window_size;
 
         /* Nguồn dữ liệu kế tiếp từ vị trí win — cho phép nhảy qua các cửa sổ
-         * trống của file sparse thay vì memset 64KB vô ích cho từng cửa sổ. */
+         * trống của file sparse thay vì memset window_size byte vô ích cho
+         * từng cửa sổ. */
         off_t next_data = region_hi;
         if (patch && patch_len > 0 && patch_off + (off_t)patch_len > win)
         {

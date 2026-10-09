@@ -1,0 +1,59 @@
+GENERATION_REGISTRY_BENCHMARK,version=1
+TREE,hash=7f8f335b7a00fc4d928475fa9d947d3a3187b00a,kind=real-public-api
+HOST,name=Colleen,kernel=6.17.0-41-generic,arch=x86_64,cpu=12th Gen Intel(R) Core(TM) i5-12450H,filesystem=ext,fs_magic=0xef53
+AFFINITY,pinned=true,foreground_cpus=0;2;4;6,gc_cpu=8,process_cpus=0;2;4;6;8
+TOPOLOGY,cpu=0,thread_siblings_list=0-1
+TOPOLOGY,cpu=2,thread_siblings_list=2-3
+TOPOLOGY,cpu=4,thread_siblings_list=4-5
+TOPOLOGY,cpu=6,thread_siblings_list=6-7
+TOPOLOGY,cpu=8,thread_siblings_list=8
+ASSIGNMENT,role=foreground,worker=0,cpu=0
+ASSIGNMENT,role=foreground,worker=1,cpu=2
+ASSIGNMENT,role=foreground,worker=2,cpu=4
+ASSIGNMENT,role=foreground,worker=3,cpu=6
+ASSIGNMENT,role=gc,worker=0,cpu=8
+CONFIG,threads=1;2;4,repetitions=7,warmup=128,iterations=200000,gc_min_iterations=100000,gc_threads=1,min_gc_cycles=20,threshold_us=1000,synthetic_delay_us=250,seed=25228,aa=false
+SYNTHETIC,wrapped=fsync|rename|unlink|rmdir|readlink|lstat|link|symlink,scope=inside-run_generation_gc_locked
+GC_WINDOW,stop=minimum-iterations-and-minimum-cycles,timeout_seconds=30
+GC_LOCK_DUTY_CYCLE,status=not-measurable,reason=public-api-does-not-expose-lock-hold-intervals
+METRIC,max_ns=informational
+LATENCY_POPULATION,recorded=every-measured-operation,warmup=excluded,pooled=primary-repetitions
+MIXED,skipped,reason=public-api-no-shard-placement
+SELF_CHECK,registry_empty=inferred-from-balanced-public-lifecycle,victims=retired,owned_files=removed
+CSV_BEGIN
+workload,io_mode,threads,gc_threads,repetitions,operations,median_ops_per_sec,min_ops_per_sec,max_ops_per_sec,median_per_thread_ops_per_sec,p50_ns,p99_ns,p999_ns,max_ns,median_rep_delayed_fraction,delayed_total,pooled_operations,pooled_delayed_fraction,delayed_per_gc_cycle,gc_median_cycles_per_sec,gc_min_cycles,aa_median_spread_pct,aa_max_spread_pct,noise_floor_pct,win_gate,self_check
+control,none,1,0,7,200000,3973860.344,3959582.639,4029822.297,3973860.344,214,268,302,308959,0.000000000,0,1400000,0.000000000,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+control,none,2,0,7,400000,7763883.230,7729792.728,7789480.867,3881941.615,214,320,394,90609,0.000000000,0,2800000,0.000000000,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+control,none,4,0,7,800000,14573230.328,10822867.339,15372114.308,3643307.582,214,399,465,3018736,0.000000000,9,5600000,0.000001607,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+scalability,none,1,0,7,200000,758031.245,731368.631,761342.259,758031.245,1260,1747,6017,520517,0.000000000,0,1400000,0.000000000,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+scalability,none,2,0,7,400000,517975.426,513397.171,528058.228,258987.713,2194,15776,26849,1257569,0.000000000,5,2800000,0.000001786,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+scalability,none,4,0,7,800000,433616.296,417917.645,444109.032,108404.074,7738,31237,45933,3202808,0.000023750,117,5600000,0.000020893,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+hot-path,none,1,0,7,200000,765219.032,756054.579,767691.268,765219.032,1248,1850,5515,546337,0.000000000,0,1400000,0.000000000,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+hot-path,none,2,0,7,400000,587389.280,575420.592,599775.009,293694.640,1259,20508,42264,3055873,0.000005000,23,2800000,0.000008214,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+hot-path,none,4,0,7,800000,470970.907,453565.555,481837.613,117742.727,3086,53183,276814,3725507,0.000045000,313,5600000,0.000055893,0.000000000,0.000,0,0.000000,0.000000,0.000000,unavailable,pass
+gc-interference,real,1,1,7,285791,1665602.439,1646550.824,1688074.815,1665602.439,369,515,752,4732970,0.000069981,140,1998930,0.000070037,0.952380952,114.158,21,0.000000,0.000000,0.000000,unavailable,pass
+gc-interference,real,2,1,7,449897,2582266.522,2423424.184,2651034.217,1291133.261,463,944,1867,5152122,0.000088909,280,3113956,0.000089918,1.904761905,113.155,21,0.000000,0.000000,0.000000,unavailable,pass
+gc-interference,real,4,1,7,540398,2509621.636,2035929.894,2833340.162,627405.409,582,3227,8732,7984019,0.000161599,623,3824159,0.000162912,3.643274854,103.997,22,0.000000,0.000000,0.000000,unavailable,pass
+gc-interference,synthetic-delay,1,1,7,289232,967948.146,933710.019,1013817.922,967948.146,369,515,764,12045664,0.000069149,140,2016538,0.000069426,0.952380952,66.458,21,0.000000,0.000000,0.000000,unavailable,pass
+gc-interference,synthetic-delay,2,1,7,427327,1441919.726,1431171.438,1555170.103,720959.863,487,1034,1917,14115059,0.000093605,280,3021869,0.000092658,1.904761905,68.022,21,0.000000,0.000000,0.000000,unavailable,pass
+gc-interference,synthetic-delay,4,1,7,532570,1427449.165,1334472.229,1501531.048,356862.291,601,3334,8951,12335279,0.000165619,619,3726945,0.000166088,3.458100559,66.316,25,0.000000,0.000000,0.000000,unavailable,pass
+CSV_END
+SUMMARY_BEGIN
+Medians with throughput spread [min,max]:
+control          none              1       3973860 [     3959583,     4029822] p50=      214ns p99=      268ns p99.9=      302ns max_info=   308959ns pooled_delayed=0.000000000 delayed_total=0 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+control          none              2       7763883 [     7729793,     7789481] p50=      214ns p99=      320ns p99.9=      394ns max_info=    90609ns pooled_delayed=0.000000000 delayed_total=0 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+control          none              4      14573230 [    10822867,    15372114] p50=      214ns p99=      399ns p99.9=      465ns max_info=  3018736ns pooled_delayed=0.000001607 delayed_total=9 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+scalability      none              1        758031 [      731369,      761342] p50=     1260ns p99=     1747ns p99.9=     6017ns max_info=   520517ns pooled_delayed=0.000000000 delayed_total=0 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+scalability      none              2        517975 [      513397,      528058] p50=     2194ns p99=    15776ns p99.9=    26849ns max_info=  1257569ns pooled_delayed=0.000001786 delayed_total=5 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+scalability      none              4        433616 [      417918,      444109] p50=     7738ns p99=    31237ns p99.9=    45933ns max_info=  3202808ns pooled_delayed=0.000020893 delayed_total=117 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+hot-path         none              1        765219 [      756055,      767691] p50=     1248ns p99=     1850ns p99.9=     5515ns max_info=   546337ns pooled_delayed=0.000000000 delayed_total=0 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+hot-path         none              2        587389 [      575421,      599775] p50=     1259ns p99=    20508ns p99.9=    42264ns max_info=  3055873ns pooled_delayed=0.000008214 delayed_total=23 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+hot-path         none              4        470971 [      453566,      481838] p50=     3086ns p99=    53183ns p99.9=   276814ns max_info=  3725507ns pooled_delayed=0.000055893 delayed_total=313 delayed_per_gc_cycle=0.000000000 gc=     0.0/s A/Amax=   0.00%
+gc-interference  real              1       1665602 [     1646551,     1688075] p50=      369ns p99=      515ns p99.9=      752ns max_info=  4732970ns pooled_delayed=0.000070037 delayed_total=140 delayed_per_gc_cycle=0.952380952 gc=   114.2/s A/Amax=   0.00%
+gc-interference  real              2       2582267 [     2423424,     2651034] p50=      463ns p99=      944ns p99.9=     1867ns max_info=  5152122ns pooled_delayed=0.000089918 delayed_total=280 delayed_per_gc_cycle=1.904761905 gc=   113.2/s A/Amax=   0.00%
+gc-interference  real              4       2509622 [     2035930,     2833340] p50=      582ns p99=     3227ns p99.9=     8732ns max_info=  7984019ns pooled_delayed=0.000162912 delayed_total=623 delayed_per_gc_cycle=3.643274854 gc=   104.0/s A/Amax=   0.00%
+gc-interference  synthetic-delay   1        967948 [      933710,     1013818] p50=      369ns p99=      515ns p99.9=      764ns max_info= 12045664ns pooled_delayed=0.000069426 delayed_total=140 delayed_per_gc_cycle=0.952380952 gc=    66.5/s A/Amax=   0.00%
+gc-interference  synthetic-delay   2       1441920 [     1431171,     1555170] p50=      487ns p99=     1034ns p99.9=     1917ns max_info= 14115059ns pooled_delayed=0.000092658 delayed_total=280 delayed_per_gc_cycle=1.904761905 gc=    68.0/s A/Amax=   0.00%
+gc-interference  synthetic-delay   4       1427449 [     1334472,     1501531] p50=      601ns p99=     3334ns p99.9=     8951ns max_info= 12335279ns pooled_delayed=0.000166088 delayed_total=619 delayed_per_gc_cycle=3.458100559 gc=    66.3/s A/Amax=   0.00%
+Rule: do not report a difference as a win unless it exceeds the observed A/A spread.
+SUMMARY_END

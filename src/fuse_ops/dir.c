@@ -227,7 +227,7 @@ int myfs_mknod(const char *path, mode_t mode, dev_t rdev)
     return 0;
 }
 
-/* Cập nhật timestamp truy cập/sửa đổi của file. Hiện tại thao tác này chưa được ánh xạ. */
+/* Stub utimens đã đăng ký: hiện bỏ qua thay đổi timestamp và trả về thành công. */
 int myfs_utimens(const char *path, const struct timespec tv[2],
                  struct fuse_file_info *fi)
 {
@@ -251,9 +251,9 @@ int myfs_mkdir(const char *path, mode_t mode)
 }
 
 /*
- * Xoá file logic bằng cách xoá cả dữ liệu .data lẫn metadata .meta.
- * Hàm cố tình bỏ qua ENOENT để thao tác trở thành idempotent, tức là an toàn
- * ngay cả khi một trong hai file đã không còn tồn tại.
+ * Xoá file logic: storage generation bỏ .current và các alias tương thích, rồi
+ * mark tất cả generation đã unlink để GC; open reference hoãn thu hồi vật lý.
+ * Storage legacy xoá trực tiếp .data/.meta và bỏ qua ENOENT.
  */
 static int myfs_unlink_locked(const char *path)
 {
@@ -269,6 +269,13 @@ static int myfs_unlink_locked(const char *path)
         int recovery_ret = recover_generations_for_path_locked(path, &storage);
         if (recovery_ret != 0)
             LOG("[WARN] unlink: generation recovery returned %d\n", recovery_ret);
+
+        /* Cấp phát record trước khi xoá namespace. Nghĩa vụ alias vẫn giữ
+         * nguyên tới khi cả pointer/alias được xoá và fsync thành công; lỗi
+         * giữa chừng không cấp quyền GC dựa trên việc thiếu .current. */
+        ret = mark_generation_for_gc_locked(&storage, true);
+        if (ret != 0)
+            return ret;
 
         char current_path[PATH_MAX];
         char data_alias[PATH_MAX];
@@ -291,7 +298,7 @@ static int myfs_unlink_locked(const char *path)
         if (ret != 0)
             return ret;
 
-        ret = mark_generation_for_gc_locked(&storage, false);
+        ret = mark_generations_unlinked_locked(path);
         if (ret != 0)
             return ret;
         return run_generation_gc_locked(path);
@@ -316,7 +323,13 @@ static int myfs_unlink_locked(const char *path)
         return -errno;
     }
 
-    return fsync_parent_path(data_path);
+    ret = fsync_parent_path(data_path);
+    if (ret != 0)
+        return ret;
+    ret = mark_generations_unlinked_locked(path);
+    if (ret != 0)
+        return ret;
+    return run_generation_gc_locked(path);
 }
 
 int myfs_unlink(const char *path)

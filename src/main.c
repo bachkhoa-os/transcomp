@@ -9,8 +9,9 @@ void *myfs_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
 {
     (void)conn;
     cfg->kernel_cache = 1;
-    /* Compaction/GC chạy trên worker thread riêng — release() chỉ enqueue.
-     * Nếu start fail, schedule_compaction tự fallback về chạy đồng bộ. */
+    /* release() chạy generation GC đủ điều kiện đồng bộ, rồi chỉ schedule
+     * compaction cho worker riêng. Nếu start fail, scheduling tự fallback về
+     * chạy đồng bộ. */
     start_compaction_worker();
     LOG("[DEBUG] FUSE init called\n");
     return fuse_get_context()->private_data;

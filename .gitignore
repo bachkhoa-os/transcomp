@@ -21,6 +21,7 @@ tests/test_file_ops
 tests/test_metadata
 tests/test_zstd_context
 tests/test_lock
+tests/test_generation_registry
 benchmarks/zstd_context_bench
 benchmarks/lock_table_bench
 tests/test_meta_inspect
