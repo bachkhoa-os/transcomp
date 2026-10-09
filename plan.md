@@ -136,7 +136,7 @@ Depends on Phases 1–4. The cost gate and periodic trigger are independent and 
 
 ### Change description
 
-Reuse the existing tolerant linear-scan path for old or unpacked source layouts. Repack the complete logical content into one window size in a new v2 generation, sync it, and publish through the existing atomic symlink mechanism. Handles may temporarily refer to different generations—and therefore different window sizes—but each handle’s descriptor/map/window bundle remains internally consistent. Old storage is reclaimed only after its last pinned handle closes.
+Reuse the existing tolerant linear-scan path for old or unpacked source layouts. Repack the complete logical content into one window size in a new v2 generation, sync it, and publish through the existing atomic symlink mechanism. Handles may temporarily refer to different generations—and therefore different window sizes—but each handle’s descriptor/map/window bundle remains internally consistent. After durable publication, old storage becomes eligible for GC when its remaining registry references reach zero: writable live handoff transfers references before those handles close, while read-only handles pin the old generation until release.
 
 ### Acceptance criterion
 
