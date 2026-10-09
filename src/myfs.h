@@ -251,6 +251,9 @@ unsigned generation_writer_refs_locked(const myfs_storage_t *storage);
 unsigned generation_open_refs_locked(const myfs_storage_t *storage);
 int mark_generation_for_gc_locked(const myfs_storage_t *storage,
                                   bool install_aliases);
+/* Caller giữ path lock; chỉ gọi sau khi xoá namespace và fsync parent thành
+ * công. Huỷ nghĩa vụ alias của các generation cũ, không suy luận từ ENOENT. */
+int mark_generations_unlinked_locked(const char *path);
 /* GC các generation pending của một path (caller giữ file lock của path đó);
  * path == NULL quét tất cả shard và chỉ hợp lệ khi registry users đã quiesce. */
 int run_generation_gc_locked(const char *path);

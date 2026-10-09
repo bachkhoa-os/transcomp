@@ -103,6 +103,7 @@ struct myfs_generation_record
     enum generation_gc_state gc_state;
     uint64_t gc_claim_id;
     bool install_aliases;
+    bool namespace_unlinked;
     uint64_t path_hash;
     size_t shard_index;
     size_t bucket_index;
@@ -237,6 +238,16 @@ static void compact_test_failpoint(const char *path, const char *name,
 }
 #endif
 
+static bool generation_record_matches_storage(
+    const struct myfs_generation_record *record, const myfs_storage_t *storage)
+{
+    if (!storage_generation_equal(&record->storage, storage))
+        return false;
+    /* A missing legacy pair is not the identity of a newly created pair. */
+    return !storage->is_legacy ||
+        ((record->storage.data_ino != 0) == (storage->data_ino != 0));
+}
+
 static struct myfs_generation_record *find_generation_record_locked(
     struct generation_registry_shard *shard, size_t bucket_index,
     const myfs_storage_t *storage)
@@ -244,7 +255,7 @@ static struct myfs_generation_record *find_generation_record_locked(
     for (struct myfs_generation_record *record = shard->buckets[bucket_index];
          record; record = record->next)
     {
-        if (storage_generation_equal(&record->storage, storage))
+        if (generation_record_matches_storage(record, storage))
             return record;
     }
     return NULL;
@@ -277,12 +288,20 @@ static void insert_generation_record_locked(
 
 static struct myfs_generation_record *get_generation_record_locked(
     const struct generation_registry_location *location,
-    const myfs_storage_t *storage)
+    const myfs_storage_t *storage, bool new_legacy_incarnation)
 {
-    struct myfs_generation_record *record = find_generation_record_locked(
-        location->shard, location->bucket_index, storage);
-    if (record)
-        return record;
+    struct myfs_generation_record *record;
+    for (record = location->shard->buckets[location->bucket_index];
+         record; record = record->next)
+    {
+        /* An unlinked legacy inode can be reused after its last close.  A
+         * namespace open or alias-repair obligation belongs to the new
+         * incarnation, not that record (including missing-pair candidates). */
+        if (generation_record_matches_storage(record, storage) &&
+            !(new_legacy_incarnation && storage->is_legacy &&
+              record->namespace_unlinked))
+            return record;
+    }
 
     record = allocate_generation_record(location, storage);
     if (!record)
@@ -323,7 +342,7 @@ int register_generation_handle_locked(myfs_file_handle_t *handle)
     if (status != 0)
         return -status;
     struct myfs_generation_record *record = get_generation_record_locked(
-        &location, &handle->storage);
+        &location, &handle->storage, true);
     if (!record)
     {
         pthread_mutex_unlock(&location.shard->mu);
@@ -674,7 +693,7 @@ int mark_generation_for_gc_locked(const myfs_storage_t *storage,
     if (status != 0)
         return -status;
     struct myfs_generation_record *record = get_generation_record_locked(
-        &location, storage);
+        &location, storage, install_aliases);
     if (!record)
     {
         pthread_mutex_unlock(&location.shard->mu);
@@ -682,7 +701,36 @@ int mark_generation_for_gc_locked(const myfs_storage_t *storage,
     }
     if (record->gc_state == GENERATION_GC_NONE)
         record->gc_state = GENERATION_GC_PENDING;
-    record->install_aliases = record->install_aliases || install_aliases;
+    if (!record->namespace_unlinked)
+        record->install_aliases = record->install_aliases || install_aliases;
+    pthread_mutex_unlock(&location.shard->mu);
+    return 0;
+}
+
+/* Caller holds the path lock and has durably removed .current and both
+ * aliases.  This cancels alias work for every older incarnation too, without
+ * allocating after namespace deletion.  Records created on path reuse do not
+ * inherit this authority; recovery cannot re-enable these alias obligations. */
+int mark_generations_unlinked_locked(const char *path)
+{
+    struct generation_registry_location location;
+    int status = generation_registry_location_for_path(path, &location);
+    if (status != 0)
+        return -status;
+    status = pthread_mutex_lock(&location.shard->mu);
+    if (status != 0)
+        return -status;
+    for (struct myfs_generation_record *record =
+             location.shard->buckets[location.bucket_index];
+         record; record = record->next)
+    {
+        if (strcmp(record->storage.logical_path, path) != 0)
+            continue;
+        record->namespace_unlinked = true;
+        record->install_aliases = false;
+        if (record->gc_state == GENERATION_GC_NONE)
+            record->gc_state = GENERATION_GC_PENDING;
+    }
     pthread_mutex_unlock(&location.shard->mu);
     return 0;
 }
@@ -776,6 +824,7 @@ struct generation_gc_work
     myfs_storage_t victim;
     unsigned open_refs_at_claim;
     bool install_aliases;
+    bool namespace_unlinked;
     bool has_legacy_refs;
 };
 
@@ -903,6 +952,7 @@ static int claim_generation_gc_batch(
                     .victim = record->storage,
                     .open_refs_at_claim = record->open_refs,
                     .install_aliases = record->install_aliases,
+                    .namespace_unlinked = record->namespace_unlinked,
                     .has_legacy_refs =
                         generation_has_legacy_refs_for_path_locked(
                             shard, bucket_index,
@@ -928,7 +978,11 @@ static struct generation_gc_result perform_generation_gc_io(
     if (ret != 0)
         return (struct generation_gc_result){GENERATION_GC_RETRY, ret};
 
-    if (storage_generation_equal(&work->victim, &active))
+    /* Explicitly unlinked legacy records retire bookkeeping only: their pair
+     * was removed by unlink and may now belong to a different incarnation.
+     * Never relax active-generation protection for generation directories. */
+    if (!(work->namespace_unlinked && work->victim.is_legacy) &&
+        storage_generation_equal(&work->victim, &active))
     {
         LOG("[ERROR] GC refused to remove active generation %s for %s\n",
             work->victim.generation_id, work->victim.logical_path);
@@ -955,7 +1009,8 @@ static struct generation_gc_result perform_generation_gc_io(
             return (struct generation_gc_result){GENERATION_GC_RETRY, ret};
     }
 
-    if (work->victim.is_legacy && !work->install_aliases)
+    if (work->victim.is_legacy && !work->install_aliases &&
+        !work->namespace_unlinked)
         return (struct generation_gc_result){GENERATION_GC_RETRY, -EIO};
 
     if (work->open_refs_at_claim > 0)
@@ -991,9 +1046,12 @@ static int finalize_generation_gc_work(
     int status = pthread_mutex_lock(&shard->mu);
     if (status != 0)
         return -status;
-    struct myfs_generation_record *record = find_generation_record_locked(
-        shard, work->bucket_index, &work->victim);
-    if (record != work->record || !record ||
+    /* A recreated legacy file can reuse (dev, ino).  Validate the claimed
+     * record itself, not the first equal-looking record in the bucket. */
+    struct myfs_generation_record *record = shard->buckets[work->bucket_index];
+    while (record && record != work->record)
+        record = record->next;
+    if (!record ||
         record->gc_state != GENERATION_GC_CLAIMED ||
         record->gc_claim_id != work->claim_id)
     {
@@ -1010,7 +1068,8 @@ static int finalize_generation_gc_work(
             record->gc_state = GENERATION_GC_PENDING;
             ret = -EBUSY;
         }
-        else if (record->install_aliases != work->install_aliases)
+        else if (record->install_aliases != work->install_aliases ||
+                 record->namespace_unlinked != work->namespace_unlinked)
         {
             record->gc_state = GENERATION_GC_PENDING;
             ret = -EAGAIN;

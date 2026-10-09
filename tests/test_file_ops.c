@@ -1404,6 +1404,613 @@ static void test_live_writer_is_rebound_after_periodic_resize(const char *dir)
     myfs_conf = NULL;
 }
 
+static void assert_unlink_absent(const char *name)
+{
+    struct stat st;
+    assert(lstat(name, &st) == -1 && errno == ENOENT);
+}
+
+static void assert_unlink_namespace_absent(const char *path)
+{
+    char name[PATH_MAX];
+    build_current_path(name, path);
+    assert_unlink_absent(name);
+    build_data_path(name, path);
+    assert_unlink_absent(name);
+    build_meta_path(name, path);
+    assert_unlink_absent(name);
+    struct stat st;
+    assert(myfs_getattr(path, &st, NULL) == -ENOENT);
+}
+
+static void assert_unlink_retired(const myfs_storage_t *storage)
+{
+    assert_unlink_absent(storage->generation_dir);
+    assert_unlink_absent(storage->marker_path);
+    assert_unlink_absent(storage->data_path);
+    assert_unlink_absent(storage->meta_path);
+    assert(myfs_generation_registry_test_snapshot(storage, NULL) == -ENOENT);
+}
+
+static void create_unlink_generation(const char *path,
+                                     myfs_storage_t *storage,
+                                     struct fuse_file_info *writer)
+{
+    assert(create_generation_storage(path, 0600, storage) == 0);
+    myfs_inode_t inode = {.window_size = CHUNK_SIZE};
+    inode.chunk_map.fully_packed = true;
+    assert(save_chunk_map_for_storage(storage, &inode) == 0);
+    assert(publish_generation(path, storage) == 0);
+    assert(install_generation_aliases(path, storage) == 0);
+    writer->flags = O_RDWR;
+    assert(myfs_open(path, writer) == 0);
+    assert(myfs_write(path, "unlink-payload", 14, 0, writer) == 14);
+}
+
+static void assert_unlink_read(const char *path, struct fuse_file_info *reader,
+                                const char *expected)
+{
+    char output[14];
+    assert(myfs_read(path, output, sizeof(output), 0, reader) == sizeof(output));
+    assert(memcmp(output, expected, sizeof(output)) == 0);
+}
+
+static int run_unlink_gc(const char *path)
+{
+    myfs_file_lock_t *lock = myfs_lock_file(path);
+    assert(lock != NULL);
+    int ret = run_generation_gc_locked(path);
+    myfs_unlock_file(lock);
+    return ret;
+}
+
+static void compact_with_unlink_reader(const char *path,
+                                       struct fuse_file_info *writer,
+                                       struct fuse_file_info *reader,
+                                       const myfs_storage_t *old_storage,
+                                       myfs_storage_t *active)
+{
+    /* Real, incompressible full-window overwrites exceed the compactor's
+     * minimum waste threshold without fabricating backing-file contents. */
+    unsigned char block[CHUNK_SIZE];
+    uint32_t seed = UINT32_C(25228);
+    for (size_t i = 0; i < sizeof(block); i++)
+    {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        block[i] = (unsigned char)seed;
+    }
+    for (int i = 0; i < 2; i++)
+        assert(myfs_write(path, (const char *)block, sizeof(block), CHUNK_SIZE,
+                          writer) == sizeof(block));
+    myfs_file_handle_t *handle = (myfs_file_handle_t *)(uintptr_t)writer->fh;
+    assert(handle->cached_inode.chunk_map.chunks[1].raw_size == CHUNK_SIZE);
+    reader->flags = O_RDONLY;
+    assert(myfs_open(path, reader) == 0);
+    /* The worker is stopped: release completes actual compaction through the
+     * synchronous fallback, so no sleep is used as evidence of publication. */
+    assert(myfs_release(path, writer) == 0);
+    assert(resolve_storage(path, active) == 0);
+    assert(!active->is_legacy);
+    assert(!storage_generation_equal(old_storage, active));
+    struct myfs_generation_registry_test_snapshot old =
+        registry_snapshot(old_storage);
+    assert(old.open_refs == 1);
+    assert(old.gc_state == MYFS_GENERATION_GC_TEST_PENDING);
+    assert(old.install_aliases);
+    assert_unlink_read(path, reader, "unlink-payload");
+}
+
+static void test_unlink_retires_precompaction_reader_generation(const char *dir)
+{
+    struct myfs_config conf = {0};
+    assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+           (int)sizeof(conf.root));
+    myfs_conf = &conf;
+    const char *path = "/unlink-old-reader";
+    myfs_storage_t old_storage, active, unrelated;
+    struct fuse_file_info writer = {0}, reader = {0}, other_writer = {0};
+    create_unlink_generation(path, &old_storage, &writer);
+    create_unlink_generation("/unrelated", &unrelated, &other_writer);
+    compact_with_unlink_reader(path, &writer, &reader, &old_storage, &active);
+    int unlink_ret = myfs_unlink(path);
+    assert_unlink_namespace_absent(path);
+    assert_unlink_read(path, &reader, "unlink-payload");
+    assert(access(old_storage.generation_dir, F_OK) == 0);
+    assert(myfs_release(path, &reader) == 0);
+    int gc_ret = run_unlink_gc(path);
+    struct stat st;
+    bool leaked = lstat(old_storage.generation_dir, &st) == 0;
+    fprintf(stderr, "UNLINK_OLD_READER unlink=%d gc=%d retired=%d\n",
+            unlink_ret, gc_ret, !leaked);
+    assert(!leaked && "retired generation must be reclaimed after last reader closes");
+    assert(unlink_ret == 0 && "successful namespace unlink must report success");
+    assert(gc_ret == 0);
+    assert_unlink_retired(&old_storage);
+    assert_unlink_retired(&active);
+    assert_unlink_read("/unrelated", &other_writer, "unlink-payload");
+    assert(access(unrelated.generation_dir, F_OK) == 0);
+    assert(myfs_release("/unrelated", &other_writer) == 0);
+    assert(myfs_unlink("/unrelated") == 0);
+    assert_unlink_retired(&unrelated);
+    assert(rmdir(dir) == 0); /* No hidden generation or owner-marker leaks. */
+    myfs_conf = NULL;
+    puts("UNLINK_GC D PASS: old reader survives unlink; both generations retire; unrelated storage untouched");
+}
+
+static void test_unlink_current_generation_handles(void)
+{
+    for (int mode = 0; mode < 3; mode++)
+    {
+        char dir[] = "/tmp/myfs-unlink-current-XXXXXX";
+        assert(mkdtemp(dir) != NULL);
+        struct myfs_config conf = {0};
+        assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+               (int)sizeof(conf.root));
+        myfs_conf = &conf;
+        const char *path = "/current";
+        myfs_storage_t storage;
+        struct fuse_file_info writer = {0}, reader = {.flags = O_RDONLY};
+        create_unlink_generation(path, &storage, &writer);
+        if (mode != 2)
+            assert(myfs_release(path, &writer) == 0);
+        if (mode == 1)
+            assert(myfs_open(path, &reader) == 0);
+        assert(myfs_unlink(path) == 0);
+        assert_unlink_namespace_absent(path);
+        assert(run_unlink_gc(path) == 0);
+        if (mode != 0)
+        {
+            struct fuse_file_info *pinned = mode == 1 ? &reader : &writer;
+            struct myfs_generation_registry_test_snapshot snapshot =
+                registry_snapshot(&storage);
+            assert(snapshot.open_refs == 1);
+            assert(snapshot.gc_state == MYFS_GENERATION_GC_TEST_PENDING);
+            assert(!snapshot.install_aliases);
+            assert(access(storage.generation_dir, F_OK) == 0);
+            assert_unlink_read(path, pinned, "unlink-payload");
+            if (mode == 2)
+            {
+                assert(myfs_write(path, "X", 1, 0, pinned) == 1);
+                assert_unlink_read(path, pinned, "Xnlink-payload");
+                assert_unlink_namespace_absent(path);
+            }
+            assert(myfs_release(path, pinned) == 0);
+        }
+        assert(run_unlink_gc(path) == 0);
+        assert_unlink_retired(&storage);
+        assert_unlink_namespace_absent(path);
+        assert(rmdir(dir) == 0);
+        myfs_conf = NULL;
+        printf("UNLINK_GC %c PASS: current generation mode=%d retires only after last handle\n",
+               'A' + mode, mode);
+    }
+}
+
+static void test_unlink_path_reuse_preserves_new_file(void)
+{
+    /* Exercise both new legacy storage and a new generation, including the
+     * recovery scan that used to OR alias obligations back into old records. */
+    for (int generation = 0; generation < 2; generation++)
+    {
+        char dir[] = "/tmp/myfs-unlink-reuse-XXXXXX";
+        assert(mkdtemp(dir) != NULL);
+        struct myfs_config conf = {0};
+        assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+               (int)sizeof(conf.root));
+        myfs_conf = &conf;
+        const char *path = "/reused";
+        myfs_storage_t old_storage, active, new_storage;
+        struct fuse_file_info writer = {0}, reader = {0}, new_writer = {0};
+        create_unlink_generation(path, &old_storage, &writer);
+        compact_with_unlink_reader(path, &writer, &reader, &old_storage,
+                                   &active);
+        assert(myfs_unlink(path) == 0);
+        assert_unlink_namespace_absent(path);
+        if (generation)
+            create_unlink_generation(path, &new_storage, &new_writer);
+        else
+        {
+            new_writer.flags = O_RDWR;
+            assert(myfs_create(path, 0600, &new_writer) == 0);
+            new_storage = ((myfs_file_handle_t *)(uintptr_t)new_writer.fh)->storage;
+        }
+        assert(myfs_write(path, "new-incarnation", 15, 0, &new_writer) == 15);
+        char data_alias[PATH_MAX], meta_alias[PATH_MAX];
+        build_data_path(data_alias, path);
+        build_meta_path(meta_alias, path);
+        struct stat data_before, meta_before, after;
+        assert(stat(data_alias, &data_before) == 0);
+        assert(stat(meta_alias, &meta_before) == 0);
+        struct stat visible;
+        assert(myfs_getattr(path, &visible, NULL) == 0);
+        assert(visible.st_size == 15);
+        assert(!registry_snapshot(&old_storage).install_aliases);
+        assert_unlink_read(path, &reader, "unlink-payload");
+        assert(access(old_storage.generation_dir, F_OK) == 0);
+        assert(myfs_release(path, &reader) == 0);
+        for (int i = 0; i < 3; i++)
+            assert(run_unlink_gc(path) == 0);
+        assert_unlink_retired(&old_storage);
+        assert_unlink_retired(&active);
+        assert(stat(data_alias, &after) == 0);
+        assert(after.st_dev == data_before.st_dev &&
+               after.st_ino == data_before.st_ino);
+        assert(stat(meta_alias, &after) == 0);
+        assert(after.st_dev == meta_before.st_dev &&
+               after.st_ino == meta_before.st_ino);
+        myfs_storage_t resolved;
+        assert(resolve_storage(path, &resolved) == 0);
+        assert(storage_generation_equal(&resolved, &new_storage));
+        char output[15];
+        assert(myfs_read(path, output, sizeof(output), 0, &new_writer) == 15);
+        assert(memcmp(output, "new-incarnation", sizeof(output)) == 0);
+        assert(myfs_release(path, &new_writer) == 0);
+        assert(myfs_unlink(path) == 0);
+        if (generation)
+            assert_unlink_retired(&new_storage);
+        assert_unlink_namespace_absent(path);
+        assert(rmdir(dir) == 0);
+        myfs_conf = NULL;
+        printf("UNLINK_GC E PASS: old GC preserves new %s data, aliases and identity\n",
+               generation ? "generation" : "legacy file");
+    }
+}
+
+struct unlink_gc_error
+{
+    enum myfs_generation_gc_test_stage stage;
+    int error;
+    unsigned calls;
+};
+
+static int unlink_gc_error_hook(enum myfs_generation_gc_test_stage stage,
+                                const myfs_storage_t *storage, void *context)
+{
+    (void)storage;
+    struct unlink_gc_error *error = context;
+    if (stage != error->stage)
+        return 0;
+    error->calls++;
+    return error->error;
+}
+
+static void test_unlink_gc_resolution_and_removal_retries(void)
+{
+    const int errors[] = {-ENOENT, -EIO, -EACCES};
+    for (size_t i = 0; i < 4; i++)
+    {
+        char dir[] = "/tmp/myfs-unlink-retry-XXXXXX";
+        assert(mkdtemp(dir) != NULL);
+        struct myfs_config conf = {0};
+        assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+               (int)sizeof(conf.root));
+        myfs_conf = &conf;
+        const char *path = "/retry";
+        myfs_storage_t storage;
+        struct fuse_file_info writer = {0}, reader = {.flags = O_RDONLY};
+        create_unlink_generation(path, &storage, &writer);
+        assert(myfs_release(path, &writer) == 0);
+        assert(myfs_open(path, &reader) == 0);
+        assert(myfs_unlink(path) == 0);
+        struct unlink_gc_error error = {
+            .stage = i < 3 ? MYFS_GENERATION_GC_TEST_BEFORE_RESOLVE
+                           : MYFS_GENERATION_GC_TEST_BEFORE_REMOVE,
+            .error = i < 3 ? errors[i] : -EIO,
+        };
+        myfs_generation_registry_test_set_gc_hook(unlink_gc_error_hook, &error);
+        assert(myfs_release(path, &reader) == 0);
+        for (int retry = 0; retry < 2; retry++)
+        {
+            assert(run_unlink_gc(path) == error.error);
+            struct myfs_generation_registry_test_snapshot snapshot =
+                registry_snapshot(&storage);
+            assert(snapshot.open_refs == 0);
+            assert(snapshot.gc_state == MYFS_GENERATION_GC_TEST_PENDING);
+            assert(!snapshot.install_aliases);
+            assert(access(storage.generation_dir, F_OK) == 0);
+        }
+        assert(error.calls >= 3);
+        myfs_generation_registry_test_set_gc_hook(NULL, NULL);
+        for (int retry = 0; retry < 2; retry++)
+            assert(run_unlink_gc(path) == 0);
+        assert_unlink_retired(&storage);
+        assert_unlink_namespace_absent(path);
+        assert(rmdir(dir) == 0);
+        myfs_conf = NULL;
+        printf("UNLINK_GC F/G PASS: stage=%d error=%d retains PENDING, retry retires idempotently\n",
+               error.stage, error.error);
+    }
+}
+
+static void test_missing_or_corrupt_pointer_is_not_unlink_authority(void)
+{
+    char dir[] = "/tmp/myfs-unlink-corruption-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    struct myfs_config conf = {0};
+    assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+           (int)sizeof(conf.root));
+    myfs_conf = &conf;
+    const char *path = "/corrupt";
+    myfs_storage_t old_storage, active;
+    struct fuse_file_info writer = {0}, reader = {0};
+    create_unlink_generation(path, &old_storage, &writer);
+    compact_with_unlink_reader(path, &writer, &reader, &old_storage, &active);
+    char current[PATH_MAX];
+    build_current_path(current, path);
+    assert(unlink(current) == 0); /* Not a successful myfs_unlink transaction. */
+    assert(run_unlink_gc(path) == -EIO);
+    assert(registry_snapshot(&old_storage).install_aliases);
+    assert(access(old_storage.generation_dir, F_OK) == 0);
+    assert(symlink("malformed-target", current) == 0);
+    assert(myfs_unlink(path) == -EIO);
+    assert(run_unlink_gc(path) == -EIO);
+    assert(publish_generation(path, &active) == 0);
+    int marker = open(active.marker_path, O_RDWR | O_CLOEXEC);
+    assert(marker >= 0);
+    char original;
+    assert(pread(marker, &original, 1, 0) == 1);
+    assert(pwrite(marker, "X", 1, 0) == 1);
+    assert(myfs_unlink(path) == -EIO);
+    assert(run_unlink_gc(path) == -EIO);
+    assert(access(active.generation_dir, F_OK) == 0);
+    assert(access(old_storage.generation_dir, F_OK) == 0);
+    assert(pwrite(marker, &original, 1, 0) == 1);
+    assert(fsync(marker) == 0);
+    assert(close(marker) == 0);
+    char saved_meta[PATH_MAX];
+    assert(snprintf(saved_meta, sizeof(saved_meta), "%s/saved-meta", dir) <
+           (int)sizeof(saved_meta));
+    assert(rename(active.meta_path, saved_meta) == 0);
+    assert(mkdir(active.meta_path, 0700) == 0);
+    myfs_storage_t resolved;
+    assert(resolve_storage(path, &resolved) == -EIO);
+    assert(myfs_unlink(path) == -EIO);
+    assert(run_unlink_gc(path) == -EIO);
+    assert(registry_snapshot(&old_storage).install_aliases);
+    assert(access(active.generation_dir, F_OK) == 0);
+    assert(access(old_storage.generation_dir, F_OK) == 0);
+    assert(rmdir(active.meta_path) == 0);
+    assert(rename(saved_meta, active.meta_path) == 0);
+    myfs_file_lock_t *lock = myfs_lock_file(path);
+    assert(lock != NULL);
+    assert(mark_generation_for_gc_locked(&active, true) == 0);
+    myfs_unlock_file(lock);
+    assert(run_unlink_gc(path) == -EBUSY);
+    assert(myfs_unlink(path) == 0);
+    assert_unlink_read(path, &reader, "unlink-payload");
+    assert(myfs_release(path, &reader) == 0);
+    assert(run_unlink_gc(path) == 0);
+    assert_unlink_retired(&old_storage);
+    assert_unlink_retired(&active);
+    assert_unlink_namespace_absent(path);
+    assert(rmdir(dir) == 0);
+    myfs_conf = NULL;
+    puts("UNLINK_GC F PASS: missing/corrupt pointer, owner and active metadata do not authorize GC; active victim protected");
+}
+
+static void test_unlink_legacy_reader_and_recreated_aliases(void)
+{
+    char dir[] = "/tmp/myfs-unlink-legacy-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    struct myfs_config conf = {0};
+    assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+           (int)sizeof(conf.root));
+    myfs_conf = &conf;
+    const char *path = "/legacy";
+    struct fuse_file_info writer = {.flags = O_RDWR}, reader = {0};
+    assert(myfs_create(path, 0600, &writer) == 0);
+    assert(myfs_write(path, "unlink-payload", 14, 0, &writer) == 14);
+    myfs_storage_t old_storage =
+        ((myfs_file_handle_t *)(uintptr_t)writer.fh)->storage;
+    myfs_storage_t active;
+    compact_with_unlink_reader(path, &writer, &reader, &old_storage, &active);
+    assert(myfs_unlink(path) == 0);
+    assert_unlink_namespace_absent(path);
+    assert(registry_snapshot(&old_storage).open_refs == 1);
+    assert(!registry_snapshot(&old_storage).install_aliases);
+    assert_unlink_read(path, &reader, "unlink-payload");
+    struct fuse_file_info replacement = {.flags = O_RDWR};
+    assert(myfs_create(path, 0600, &replacement) == 0);
+    assert(myfs_write(path, "new-incarnation", 15, 0, &replacement) == 15);
+    myfs_storage_t new_storage =
+        ((myfs_file_handle_t *)(uintptr_t)replacement.fh)->storage;
+    assert(myfs_release(path, &reader) == 0);
+    assert(run_unlink_gc(path) == 0);
+    assert(myfs_generation_registry_test_snapshot(&old_storage, NULL) == -ENOENT);
+    assert_unlink_retired(&active);
+    char output[15];
+    assert(myfs_read(path, output, sizeof(output), 0, &replacement) == 15);
+    assert(memcmp(output, "new-incarnation", sizeof(output)) == 0);
+    struct stat st;
+    assert(stat(new_storage.data_path, &st) == 0 &&
+           st.st_ino == new_storage.data_ino);
+    assert(myfs_release(path, &replacement) == 0);
+    assert(myfs_unlink(path) == 0);
+    assert_unlink_namespace_absent(path);
+    assert(rmdir(dir) == 0);
+    myfs_conf = NULL;
+    puts("UNLINK_GC H PASS: pinned legacy descriptors survive unlink; bookkeeping GC never deletes replacement aliases");
+}
+
+static void test_unlink_partial_failure_does_not_cancel_alias_work(void)
+{
+    char dir[] = "/tmp/myfs-unlink-partial-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    struct myfs_config conf = {0};
+    assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+           (int)sizeof(conf.root));
+    myfs_conf = &conf;
+    const char *path = "/partial";
+    myfs_storage_t old_storage, active;
+    struct fuse_file_info writer = {0}, reader = {0};
+    create_unlink_generation(path, &old_storage, &writer);
+    compact_with_unlink_reader(path, &writer, &reader, &old_storage, &active);
+    char meta_alias[PATH_MAX];
+    build_meta_path(meta_alias, path);
+    assert(unlink(meta_alias) == 0);
+    assert(mkdir(meta_alias, 0700) == 0);
+    /* Recovery cannot replace this directory with an alias.  Unlink removes
+     * .current, then fails on the directory: no durable-unlink authority. */
+    assert(myfs_unlink(path) == -EISDIR);
+    assert(registry_snapshot(&old_storage).install_aliases);
+    assert(registry_snapshot(&active).install_aliases);
+    /* Recovery also queued a missing legacy-pair candidate; the active-pair
+     * guard rejects that first, before the generation alias -EIO guard. */
+    assert(run_unlink_gc(path) == -EBUSY);
+    assert(access(active.generation_dir, F_OK) == 0);
+    assert(access(old_storage.generation_dir, F_OK) == 0);
+    assert_unlink_read(path, &reader, "unlink-payload");
+    assert(rmdir(meta_alias) == 0);
+    /* Retry the actual unlink transaction, now on the absent-pointer legacy
+     * branch.  A successful parent sync authorizes cancellation and GC. */
+    assert(myfs_unlink(path) == 0);
+    assert_unlink_namespace_absent(path);
+    assert(myfs_release(path, &reader) == 0);
+    assert(run_unlink_gc(path) == 0);
+    assert_unlink_retired(&old_storage);
+    assert_unlink_retired(&active);
+    assert(rmdir(dir) == 0);
+    myfs_conf = NULL;
+    puts("UNLINK_GC G PASS: partial unlink error preserves storage/alias obligation; successful retry retires");
+}
+
+static void test_unlink_legacy_identity_reuse_after_gc_failure(void)
+{
+    char dir[] = "/tmp/myfs-unlink-inode-reuse-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    struct myfs_config conf = {0};
+    assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+           (int)sizeof(conf.root));
+    myfs_conf = &conf;
+    const char *path = "/identity";
+    struct fuse_file_info writer = {.flags = O_RDWR};
+    assert(myfs_create(path, 0600, &writer) == 0);
+    assert(myfs_write(path, "unlink-payload", 14, 0, &writer) == 14);
+    myfs_storage_t old_storage =
+        ((myfs_file_handle_t *)(uintptr_t)writer.fh)->storage;
+    struct fuse_file_info old_reader = {.flags = O_RDONLY};
+    assert(myfs_open(path, &old_reader) == 0);
+    assert(myfs_release(path, &writer) == 0);
+    char saved_data[PATH_MAX], saved_meta[PATH_MAX];
+    assert(snprintf(saved_data, sizeof(saved_data), "%s/held-data", dir) <
+           (int)sizeof(saved_data));
+    assert(snprintf(saved_meta, sizeof(saved_meta), "%s/held-meta", dir) <
+           (int)sizeof(saved_meta));
+    /* Retain hardlinks solely to make inode identity reuse deterministic,
+     * rather than depending on an allocator to recycle the same inode. */
+    assert(link(old_storage.data_path, saved_data) == 0);
+    assert(link(old_storage.meta_path, saved_meta) == 0);
+    struct unlink_gc_error error = {
+        .stage = MYFS_GENERATION_GC_TEST_BEFORE_RESOLVE, .error = -EIO,
+    };
+    myfs_generation_registry_test_set_gc_hook(unlink_gc_error_hook, &error);
+    assert(myfs_unlink(path) == -EIO); /* Namespace removed; only GC failed. */
+    assert(error.calls > 0);
+    assert(!registry_snapshot(&old_storage).install_aliases);
+    assert_unlink_read(path, &old_reader, "unlink-payload");
+    assert(myfs_release(path, &old_reader) == 0);
+    assert(registry_snapshot(&old_storage).open_refs == 0);
+    assert(link(saved_data, old_storage.data_path) == 0);
+    assert(link(saved_meta, old_storage.meta_path) == 0);
+    struct fuse_file_info replacement = {.flags = O_RDWR};
+    assert(myfs_open(path, &replacement) == 0);
+    myfs_file_handle_t *handle =
+        (myfs_file_handle_t *)(uintptr_t)replacement.fh;
+    assert(handle->storage.data_ino == old_storage.data_ino);
+    assert(registry_snapshot(&handle->storage).gc_state ==
+           MYFS_GENERATION_GC_TEST_NONE);
+    myfs_generation_registry_test_set_gc_hook(NULL, NULL);
+    assert(run_unlink_gc(path) == 0);
+    /* Equal-looking new record stays registered; old claim must finalize
+     * its original pointer, not the first matching (dev, ino) record. */
+    assert(registry_snapshot(&handle->storage).open_refs == 1);
+    assert(registry_snapshot(&handle->storage).gc_state ==
+           MYFS_GENERATION_GC_TEST_NONE);
+    struct fuse_file_info reader = {0};
+    myfs_storage_t active;
+    myfs_storage_t replacement_storage = handle->storage;
+    compact_with_unlink_reader(path, &replacement, &reader, &replacement_storage,
+                               &active);
+    assert_unlink_read(path, &reader, "unlink-payload");
+    assert(registry_snapshot(&old_storage).install_aliases);
+    assert(myfs_release(path, &reader) == 0);
+    assert(myfs_generation_registry_test_snapshot(&old_storage, NULL) == -ENOENT);
+    assert(myfs_unlink(path) == 0);
+    assert_unlink_retired(&active);
+    assert(unlink(saved_data) == 0);
+    assert(unlink(saved_meta) == 0);
+    assert(rmdir(dir) == 0);
+    myfs_conf = NULL;
+    puts("UNLINK_GC E/H PASS: equal legacy inode registration starts fresh; old claim finalizes; new compaction installs aliases");
+}
+
+static void test_unlink_missing_pair_record_does_not_poison_recovery(void)
+{
+    char dir[] = "/tmp/myfs-unlink-missing-pair-XXXXXX";
+    assert(mkdtemp(dir) != NULL);
+    struct myfs_config conf = {0};
+    assert(snprintf(conf.root, sizeof(conf.root), "%s", dir) <
+           (int)sizeof(conf.root));
+    myfs_conf = &conf;
+    const char *path = "/missing-pair";
+    myfs_storage_t missing, old_storage, replacement;
+    assert(resolve_storage(path, &missing) == 0);
+    assert(missing.is_legacy && missing.data_ino == 0);
+    assert(create_generation_storage(path, 0600, &old_storage) == 0);
+    myfs_inode_t inode = {.window_size = CHUNK_SIZE};
+    inode.chunk_map.fully_packed = true;
+    assert(save_chunk_map_for_storage(&old_storage, &inode) == 0);
+    assert(publish_generation(path, &old_storage) == 0);
+    struct unlink_gc_error error = {
+        .stage = MYFS_GENERATION_GC_TEST_BEFORE_RESOLVE, .error = -EIO,
+    };
+    myfs_generation_registry_test_set_gc_hook(unlink_gc_error_hook, &error);
+    myfs_file_lock_t *lock = myfs_lock_file(path);
+    assert(lock != NULL);
+    assert(recover_generations_for_path_locked(path, &old_storage) == -EIO);
+    myfs_unlock_file(lock);
+    assert(registry_snapshot(&missing).install_aliases);
+    assert(myfs_unlink(path) == -EIO); /* Durable unlink; GC retry retained. */
+    assert(!registry_snapshot(&missing).install_aliases);
+
+    struct fuse_file_info writer = {.flags = O_RDWR};
+    assert(myfs_create(path, 0600, &writer) == 0);
+    myfs_storage_t legacy = ((myfs_file_handle_t *)(uintptr_t)writer.fh)->storage;
+    assert(registry_snapshot(&legacy).open_refs == 1);
+    assert(registry_snapshot(&legacy).gc_state == MYFS_GENERATION_GC_TEST_NONE);
+    assert(registry_snapshot(&missing).open_refs == 0);
+    assert(myfs_release(path, &writer) == 0);
+    assert(myfs_unlink(path) == -EIO);
+
+    assert(create_generation_storage(path, 0600, &replacement) == 0);
+    assert(save_chunk_map_for_storage(&replacement, &inode) == 0);
+    assert(publish_generation(path, &replacement) == 0); /* No aliases yet. */
+    myfs_generation_registry_test_set_gc_hook(NULL, NULL);
+    lock = myfs_lock_file(path);
+    assert(lock != NULL);
+    assert(recover_generations_for_path_locked(path, &replacement) == 0);
+    myfs_unlock_file(lock);
+    assert_unlink_retired(&old_storage);
+    assert(myfs_generation_registry_test_snapshot(&missing, NULL) == -ENOENT);
+    char data_alias[PATH_MAX], meta_alias[PATH_MAX];
+    build_data_path(data_alias, path);
+    build_meta_path(meta_alias, path);
+    struct stat alias, target;
+    assert(stat(data_alias, &alias) == 0);
+    assert(stat(replacement.data_path, &target) == 0);
+    assert(alias.st_dev == target.st_dev && alias.st_ino == target.st_ino);
+    assert(stat(meta_alias, &alias) == 0);
+    assert(stat(replacement.meta_path, &target) == 0);
+    assert(alias.st_dev == target.st_dev && alias.st_ino == target.st_ino);
+    assert(myfs_unlink(path) == 0);
+    assert_unlink_retired(&replacement);
+    assert(rmdir(dir) == 0);
+    myfs_conf = NULL;
+    puts("UNLINK_GC E/H PASS: missing-pair record cannot infect new opens or suppress new alias recovery");
+}
+
 int main(void)
 {
     char template[] = "/tmp/myfs-file-ops-test-XXXXXX";
@@ -1466,6 +2073,18 @@ int main(void)
     char *release_gc_dir = mkdtemp(release_gc_template);
     assert(release_gc_dir != NULL);
     test_release_gc_does_not_block_old_generation_fast_read(release_gc_dir);
+    char unlink_old_template[] = "/tmp/myfs-unlink-old-reader-XXXXXX";
+    char *unlink_old_dir = mkdtemp(unlink_old_template);
+    assert(unlink_old_dir != NULL);
+    test_unlink_retires_precompaction_reader_generation(unlink_old_dir);
+    test_unlink_current_generation_handles();
+    test_unlink_path_reuse_preserves_new_file();
+    test_unlink_gc_resolution_and_removal_retries();
+    test_missing_or_corrupt_pointer_is_not_unlink_authority();
+    test_unlink_legacy_reader_and_recreated_aliases();
+    test_unlink_partial_failure_does_not_cancel_alias_work();
+    test_unlink_legacy_identity_reuse_after_gc_failure();
+    test_unlink_missing_pair_record_does_not_poison_recovery();
     destroy_generation_registry();
     destroy_lock_table();
     return 0;
