@@ -4,6 +4,19 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 benchmark=${1:-$repo_root/benchmarks/generation_registry_bench}
 
+# --short uses one repetition, so check rare-stall pooling separately with
+# deterministic inputs to the real benchmark aggregation implementation.
+fixture_dir=$(mktemp -d "${TMPDIR:-/tmp}/generation-registry-benchmark-metrics.XXXXXX")
+trap 'rm -rf -- "$fixture_dir"' EXIT
+read -r -a fixture_cc <<< "${CC:-gcc}"
+read -r -a fixture_fuse_cflags <<< "$(pkg-config --cflags fuse3)"
+"${fixture_cc[@]}" -Wall -Werror -Wno-format-truncation -pthread \
+    -I"$repo_root/src" "${fixture_fuse_cflags[@]}" -O2 \
+    -ffunction-sections -fdata-sections \
+    "$repo_root/tests/test_generation_registry_benchmark_metrics.c" \
+    -Wl,--gc-sections -o "$fixture_dir/pooled-metrics"
+"$fixture_dir/pooled-metrics"
+
 allowed_cpus=
 if [ -r "/proc/$$/status" ]; then
     allowed_cpus=$(awk '$1 == "Cpus_allowed_list:" { print $2; exit }' "/proc/$$/status")
@@ -62,7 +75,7 @@ if [ "$topology_available" = true ]; then
 fi
 
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/generation-registry-benchmark-output.XXXXXX")
-trap 'rm -rf -- "$workdir"' EXIT
+trap 'rm -rf -- "$fixture_dir" "$workdir"' EXIT
 
 benchmark_args=(--short --aa --cpus "$first_cpu" --gc-iterations 5000
     --min-gc-cycles 1 --workdir "$workdir")
