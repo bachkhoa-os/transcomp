@@ -247,7 +247,7 @@ Không thấy serialization hay lock contention. Đây là instrument chính cho
 
 Campaign pooled-metrics ngày 2026-10-09 đo candidate `743c2b467041994cc64dbcc2714a8952fe406f1e` với snapshot `origin/main` tại `7f8f335b7a00fc4d928475fa9d947d3a3187b00a`. Host: Intel Core i5-12450H, ext4. Set A pin foreground `0,2,4,6`, GC `8`; set B pin foreground `1,3,5,7`, GC `9`. Cặp `0/1`, `2/3`, `4/5`, `6/7` là SMT siblings: A/B không phải hai nhóm core vật lý độc lập; GC không dùng SMT sibling của foreground. Mỗi bên chạy thread count `1,2,4`, bảy primary repetitions, warmup 128 operation/thread; basic workload 200000 iteration/thread. GC foreground chạy ít nhất 100000 operation/thread **và** ít nhất 20 completed GC cycles/repetition, nên count thực tế có thể lớn hơn. Threshold strict `> 1000 µs` (`> 1000000 ns`), synthetic delay 250 µs/call, seed 25228. Normal runs và A/A runs riêng được lưu cho cả hai tree; các commit test/docs sau campaign không phải lần đo performance mới.
 
-Nguồn: các raw artifact cục bộ `/tmp/grb-pooled-set{A,B}-{current,main,current-aa,main-aa}.out` của campaign này, không được version-control cùng README.
+Nguồn: [raw outputs đã lưu trong repository](benchmarks/results/2026-10-09-generation-registry-pooled/), gồm tám file `grb-pooled-set{A,B}-{current,main,current-aa,main-aa}.out`. [Manifest](benchmarks/results/2026-10-09-generation-registry-pooled/manifest.md) ghi cấu hình, source revisions và giới hạn; [SHA256SUMS](benchmarks/results/2026-10-09-generation-registry-pooled/SHA256SUMS) xác minh bản lưu byte-for-byte với originals.
 
 Median throughput, đơn vị **operation/s tổng**; một operation là transaction/loop nêu trên. Tỷ số là current / baseline: >1 nghĩa là throughput đo được cao hơn, <1 là thấp hơn.
 
