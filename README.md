@@ -241,6 +241,110 @@ Không thấy serialization hay lock contention. Đây là instrument chính cho
 
 `benchmark.sh` end-to-end được chạy baseline/candidate năm lần xen kẽ với cold-cache đã xác minh. Mọi chênh lệch median đều nhỏ hơn spread min–max ngay trong cùng một phía; cả control ext4 không liên quan cũng dao động mạnh (ví dụ ext4 write 211–461 MB/s). Vì noise floor của host lớn hơn ngưỡng 5%, gate end-to-end được báo cáo **inconclusive**, không phải pass/fail. Hai control thuần Zstd vẫn ổn định qua cả hai lần so sánh: compress −0.04%/−0.67%, decompress +0.16%/+0.35%, không cho thấy regression tính toán.
 
+### Generation registry / GC microbenchmark (pooled metrics)
+
+`generation_registry_bench` gọi public API thật, không mount FUSE và không dùng `benchmark.sh` hay test hooks. Bốn workload: **control** chỉ chạy vòng tính toán CPU, không gọi registry/GC trong measured loop; **scalability** register → snapshot → bump epoch → unregister trên path riêng của mỗi thread; **hot-path** chạy cùng transaction trên một path chung; **gc-interference** snapshot/bump epoch trên path không liên quan trong khi background thread liên tục tạo/thu hồi generation thật. Các registry workload vẫn gồm path/cache locks của caller, không phải phép đo riêng thời gian registry mutex. Mode `real` dùng filesystem I/O thật; `synthetic-delay` vẫn dùng I/O thật nhưng thêm delay yêu cầu tại các syscall được wrap bên trong GC. Tải GC liên tục này không đại diện cho tần suất GC production thông thường.
+
+Campaign pooled-metrics ngày 2026-10-09 đo candidate `743c2b467041994cc64dbcc2714a8952fe406f1e` với snapshot `origin/main` tại `7f8f335b7a00fc4d928475fa9d947d3a3187b00a`. Host: Intel Core i5-12450H, ext4. Set A pin foreground `0,2,4,6`, GC `8`; set B pin foreground `1,3,5,7`, GC `9`. Cặp `0/1`, `2/3`, `4/5`, `6/7` là SMT siblings: A/B không phải hai nhóm core vật lý độc lập; GC không dùng SMT sibling của foreground. Mỗi bên chạy thread count `1,2,4`, bảy primary repetitions, warmup 128 operation/thread; basic workload 200000 iteration/thread. GC foreground chạy ít nhất 100000 operation/thread **và** ít nhất 20 completed GC cycles/repetition, nên count thực tế có thể lớn hơn. Threshold strict `> 1000 µs` (`> 1000000 ns`), synthetic delay 250 µs/call, seed 25228. Normal runs và A/A runs riêng được lưu cho cả hai tree; các commit test/docs sau campaign không phải lần đo performance mới.
+
+Nguồn: các raw artifact cục bộ `/tmp/grb-pooled-set{A,B}-{current,main,current-aa,main-aa}.out` của campaign này, không được version-control cùng README.
+
+Median throughput, đơn vị **operation/s tổng**; một operation là transaction/loop nêu trên. Tỷ số là current / baseline: >1 nghĩa là throughput đo được cao hơn, <1 là thấp hơn.
+
+| Workload | Set / threads | Baseline | Current | Current / baseline |
+|---|---|---:|---:|---:|
+| Distinct paths | A / 2 | 517,975 | 1,452,712 | 2.805× |
+| Distinct paths | A / 4 | 433,616 | 2,620,246 | 6.043× |
+| Distinct paths | B / 2 | 507,407 | 1,446,853 | 2.851× |
+| Distinct paths | B / 4 | 446,372 | 2,595,749 | 5.815× |
+| Same-path hot-path | A / 4 | 470,971 | 447,765 | 0.951× |
+| Same-path hot-path | B / 4 | 465,890 | 452,790 | 0.972× |
+
+Distinct-path scaling tăng trong các dòng trên, nhưng same-path hot-path có regression throughput quan sát được. Dòng hot-path B / 4 không vượt A/A spread của chính dòng đó; không kết luận mọi chênh lệch nhỏ là regression đã xác lập.
+
+GC-interference, bốn foreground threads: **p99.9 (µs)**, baseline → current; đây là median của percentile từng repetition, không phải percentile pooled.
+
+| Set | I/O mode | Baseline p99.9 | Current p99.9 |
+|---|---|---:|---:|
+| A | Real ext4 | 8.732 | 3.663 |
+| A | Synthetic-delay trên ext4 | 8.951 | 3.696 |
+| B | Real ext4 | 11.274 | 3.236 |
+| B | Synthetic-delay trên ext4 | 11.901 | 3.030 |
+
+Các case GC đại diện, bốn foreground threads, pooled qua bảy primary repetitions. Fraction dưới đây là tỷ lệ 0–1, không phải phần trăm; denominator là operation count thực tế, không phải `iterations × threads × repetitions`.
+
+| Case | Tree | delayed_total / pooled_operations | pooled_delayed_fraction | delayed_per_gc_cycle |
+|---|---|---:|---:|---:|
+| A / real | Baseline | 623 / 3,824,159 | 0.000162912 | 3.643274854 |
+| A / real | Current | 16 / 7,683,635 | 0.000002082 | 0.108843537 |
+| B / synthetic-delay | Baseline | 662 / 2,908,335 | 0.000227622 | 3.343434343 |
+| B / synthetic-delay | Current | 1 / 14,037,798 | 0.000000071 | 0.006802721 |
+
+Định nghĩa population trong CSV (mọi measured operation có một latency observation; warmup bị loại, A/A companion không vào primary pooled totals):
+
+| Metric | Định nghĩa |
+|---|---|
+| `median_rep_delayed_fraction` | Median của fraction từng primary repetition, chỉ đếm latency strict > threshold; có thể bằng 0 dù pooled có delayed operation |
+| `delayed_total` | Tổng operation strict > threshold qua các primary repetitions |
+| `pooled_operations` | Tổng operation count thực đo qua các primary repetitions |
+| `pooled_delayed_fraction` | `delayed_total / pooled_operations`; denominator 0 trả về 0 |
+| `delayed_per_gc_cycle` | `delayed_total / tổng completed primary GC cycles`; không có GC trả về 0 theo quy ước |
+| `max_ns` | Latency lớn nhất qua tất cả primary repetitions, đơn vị ns; informational |
+| `p50_ns`, `p99_ns`, `p999_ns` | Median của p50/p99/p99.9 từng primary repetition, đơn vị ns, không phải pooled percentile |
+
+Median-per-repetition và pooled metrics mô tả population khác nhau. Completed GC cycles dùng cửa sổ toàn run: GC bắt đầu trước foreground measured interval và cycle cuối có thể hoàn tất sau foreground kết thúc; vì vậy denominator của `delayed_per_gc_cycle` **không khớp hoàn toàn cửa sổ foreground**, và metric này không chứng minh từng delay do GC gây ra. Public API không cung cấp lock-hold intervals để đo registry lock duty cycle.
+
+**Tái lập** (Bash, từ repo root trên ext4; cần các build dependencies ở trên). Build cùng benchmark source với current core và baseline core thật trong worktree ngoài repo; giữ hash baseline để `origin/main` thay đổi không làm đổi phép so sánh. `TREE,hash=` trong output ghi tree thực sự được build. Các lệnh dưới đây tái lập campaign, không phải đã chạy lại khi viết tài liệu:
+
+```bash
+registry_artifacts=$(mktemp -d /tmp/myfs-registry-results.XXXXXX)
+git worktree add --detach "$registry_artifacts/baseline-tree" \
+    7f8f335b7a00fc4d928475fa9d947d3a3187b00a
+make build-generation-registry-bench
+make build-generation-registry-baseline \
+    BASELINE_TREE="$registry_artifacts/baseline-tree" \
+    BASELINE_OUTPUT="$registry_artifacts/baseline-bench"
+./benchmarks/generation_registry_bench --help
+
+registry_workdir=$(mktemp -d "$PWD/.registry-bench-io.XXXXXX")
+findmnt -T "$registry_workdir" -o TARGET,SOURCE,FSTYPE
+# Xác nhận ext4; không dùng /tmp nếu filesystem đó là tmpfs.
+registry_args=(--workdir "$registry_workdir" --threads 1,2,4
+    --iterations 200000 --gc-iterations 100000 --min-gc-cycles 20
+    --repetitions 7 --warmup 128 --gc-threads 1 --threshold-us 1000
+    --synthetic-delay-us 250 --gc-mode both --seed 25228)
+for registry_set in A B; do
+    if [[ $registry_set == A ]]; then
+        registry_cpus=0,2,4,6; registry_gc_cpu=8
+    else
+        registry_cpus=1,3,5,7; registry_gc_cpu=9
+    fi
+    for registry_role in current baseline current-aa baseline-aa; do
+        case $registry_role in
+            current*) registry_binary=./benchmarks/generation_registry_bench ;;
+            baseline*) registry_binary="$registry_artifacts/baseline-bench" ;;
+        esac
+        registry_aa=()
+        case $registry_role in *-aa) registry_aa=(--aa) ;; esac
+        timeout 300 "$registry_binary" "${registry_args[@]}" \
+            --cpus "$registry_cpus" --gc-cpu "$registry_gc_cpu" \
+            "${registry_aa[@]}" \
+            >"$registry_artifacts/$registry_set-$registry_role.out" \
+            2>"$registry_artifacts/$registry_set-$registry_role.stderr"
+    done
+    ./benchmarks/compare_generation_registry_results.sh \
+        "$registry_artifacts/$registry_set-current.out" \
+        "$registry_artifacts/$registry_set-baseline.out" \
+        "$registry_artifacts/$registry_set-current-aa.out" \
+        "$registry_artifacts/$registry_set-baseline-aa.out" \
+        >"$registry_artifacts/$registry_set-comparison.csv"
+done
+```
+
+`--aa` đo cặp cùng binary, thứ tự primary/companion xen kẽ; spread là `100 × (high − low) / low`. Comparison script lấy throughput normal runs rồi so absolute difference với A/A gate của chính workload/mode/thread-count và global gate. Max paired A/A spread qua mọi dòng là **29.07% (A)** và **53.58% (B)**; chỉ dùng global max sẽ che khác biệt giữa các dòng. `noise_floor_pct=0` với `win_gate=unavailable` ở normal run không phải bằng chứng noise bằng 0. A/A riêng cho từng tree cho thấy variability; giữa các lần chạy vẫn có drift, nên chênh lệch nhỏ có thể inconclusive và throughput gate không phải kiểm định latency percentile.
+
+**Giới hạn:** OS scheduling/preemption ảnh hưởng latency maxima. Control đo noise của host nhưng không cho phép gán chính xác từng stall cho GC: riêng control baseline A / 4 đã có 9 / 5,600,000 operation vượt 1 ms, còn `delayed_per_gc_cycle=0` chỉ là quy ước vì không chạy GC. Current tree vẫn có operation vượt 1 ms như bảng pooled ở trên. Các số là quan sát trong workload/pinning này, không tự chứng minh nguyên nhân; tỷ số GC-interference throughput **không phải production speedup**, và kết quả **không xác lập performance FUSE end-to-end**.
+
 ---
 
 ## Known limitations
