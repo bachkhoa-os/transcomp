@@ -27,3 +27,8 @@ benchmarks/lock_table_bench
 tests/test_meta_inspect
 benchmarks/meta_inspect
 benchmark-results/*
+/myfs-roadmap-2026-10-10-en.md
+/benchmarks/chunkio_scratch_bench
+/benchmarks/generation_registry_bench
+/tests/test_chunkio_scratch
+/tests/test_chunkio_scratch_integration
