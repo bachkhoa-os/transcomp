@@ -37,11 +37,14 @@ cache controls or baselines are used by the smoke path.
 Exit 0 means the requested action succeeded, 1 means error/invalid trial,
 and argparse uses 2 for invalid syntax. JSON includes retained artifact paths.
 
-Opt-in single-trial measurement (<=32768 records; no repetitions):
+Opt-in single-trial measurement (default 32768, maximum 1048576 records;
+no repetitions). Smoke and both OFFLINE self-tests remain <=32768 records:
   measure-prepare --parent DIR --canonical-parent DIR --backend ext4|myfs
                   --expected-device MAJOR:MINOR [--records 32768 --seed 20261010]
                   [--daemon FILE --build-provenance OWNED_JSON_FILE]
                   [--application-cpus LIST --daemon-cpus LIST] [--materialize]
+                  [--staging-seconds S --verification-seconds S]
+                  [--overall-seconds S]
   measure-run ARTIFACT_DIRECTORY
   measure-self-test --parent DIR --canonical-parent DIR [--records 100]
   verify ARTIFACT_DIRECTORY; cleanup ARTIFACT_DIRECTORY
@@ -57,11 +60,33 @@ residency, crash durability, isolated FUSE cost or compression savings.
 Without it st_blocks can be affected by delayed allocation. Source and
 executable fingerprints must remain unchanged between preparation and run.
 Provided build provenance is cross-checked, not cryptographically attested.
+
+Measurement deadlines remain positive and <=300 seconds per operation.
+Staging/verification default to --io-seconds (30); io also bounds canonical
+generation and accounting. The overall active prepare+run budget defaults
+to 900 seconds, maximum 900; idle time between CLI invocations is excluded.
+Recommended full-size settings: readiness 15, application/staging/verification/
+shutdown/io 120, overall 900. They are opt-in, never larger smoke defaults.
+Full-size input is 134217797 bytes including header, with the existing seed
+and generator unchanged. No full-size workload is implied by preparation help.
+
+Capacity reservations are estimates, not allocation caps: backing requires
+1 GiB retained headroom + 64 MiB evidence + 8*input bytes; canonical storage
+requires 1 GiB retained headroom + 64 MiB allowance + 2*input bytes (input
+plus conservative output).
+If both share a device in OFFLINE mode, combine their data reservations.
+MemAvailable requires 2 GiB, plus 2*input bytes for canonical tmpfs storage.
+Checkpoints enforce a separate 64 MiB artifact budget using no-follow,
+unique-inode apparent/allocated observations; child logs remain <=1 MiB.
+No automatic canonical reuse, archiving or historical deletion. One new
+canonical bundle per trial is retained; repeated full-size use requires
+capacity planning. Guards are observations, not hard instantaneous limits.
 """
 
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -125,10 +150,15 @@ def read_json(path):
         return json.load(stream)
 
 
-def summary(path):
+def summary(path, guard=None):
     digest, count, lines = hashlib.sha256(), 0, 0
     with Path(path).open("rb", buffering=fixture.BUFFER_BYTES) as stream:
-        while chunk := stream.read(fixture.BUFFER_BYTES):
+        while True:
+            if guard is not None:
+                guard()
+            chunk = stream.read(fixture.BUFFER_BYTES)
+            if not chunk:
+                break
             digest.update(chunk)
             count += len(chunk)
             lines += chunk.count(b"\n")
@@ -632,8 +662,10 @@ class Trial:
             info = path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
                 raise TrialError("canonical artifact is not an owned regular file")
-            result[name] = dict(summary(path), identity={"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid})
+            result[name] = dict(self.canonical_summary(path), identity={"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid})
         return result
+
+    canonical_summary = staticmethod(summary)
 
     def check_canonical(self):
         if self.canonical_snapshot() != self.state["canonical"]:
@@ -835,6 +867,56 @@ class Trial:
 
 
 MEASUREMENT_SCHEMA = "myfs-m0-measurement-v1"
+MEASUREMENT_MAX_RECORDS = 1048576
+EVIDENCE_BUDGET_BYTES = 64 * 1024**2
+
+
+def measurement_limits(records, *, readiness_seconds=10, application_seconds=30,
+                       shutdown_seconds=30, io_seconds=30, staging_seconds=None,
+                       verification_seconds=None, overall_seconds=900):
+    """Validate before paths/allocation; integer records never silently truncate."""
+    if (not isinstance(records, int) or isinstance(records, bool)
+            or not 0 <= records <= MEASUREMENT_MAX_RECORDS):
+        raise TrialError("measurement records must be an integer in 0..1048576")
+    deadlines = {"readiness": readiness_seconds, "application": application_seconds,
+                 "shutdown": shutdown_seconds, "io": io_seconds,
+                 "staging": io_seconds if staging_seconds is None else staging_seconds,
+                 "verification": io_seconds if verification_seconds is None else verification_seconds}
+    for name, value in dict(deadlines, overall=overall_seconds).items():
+        maximum = 900 if name == "overall" else 300
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not 0 < value <= maximum or not math.isfinite(value)):
+            raise TrialError(f"invalid measurement {name} deadline; require finite 0 < seconds <= {maximum}")
+    return {"records": records, "input_bytes": 69 + records * 128,
+            "size_class": "smoke-sized" if records <= MAX_RECORDS else "larger-measurement",
+            "deadlines_seconds": deadlines, "overall_seconds": overall_seconds}
+
+
+def measurement_capacity(input_bytes, *, canonical_tmpfs, same_device):
+    """Streaming workload estimate; generated output is bounded by input size.
+
+    8*input covers logical files, temporary generations/compaction and metadata;
+    it is not a proven worst-case physical allocation bound. 64 MiB per-trial
+    evidence comfortably exceeds observed M0-D3 runner logs/states, while its
+    separate campaign canonical archive is NOT generated by this runner.
+    """
+    canonical_data = 2 * input_bytes
+    return {"input_bytes": input_bytes, "output_upper_estimate_bytes": input_bytes,
+            "retained_headroom_bytes": 1024**3, "evidence_budget_bytes": EVIDENCE_BUDGET_BYTES,
+            "backing_required_bytes": 1024**3 + EVIDENCE_BUDGET_BYTES + 8 * input_bytes
+                                      + (canonical_data if same_device else 0),
+            "canonical_required_bytes": 1024**3 + EVIDENCE_BUDGET_BYTES + canonical_data,
+            "memory_required_bytes": 2 * 1024**3 + (canonical_data if canonical_tmpfs else 0),
+            "limitation": "conservative reservation estimate, not a hard allocation or instantaneous resource bound; "
+                          "MemAvailable does not establish effective cgroup/RLIMIT capacity"}
+
+
+GENERATION_CODE = (
+    "import sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); "
+    "import m0_fixture as f; root=Path(sys.argv[2]); "
+    "f.generate_csv(root/'input.csv',root/'input.manifest.json',int(sys.argv[3]),int(sys.argv[4])); "
+    "f.write_expected(root/'input.csv',root/'expected.csv')"
+)
 
 
 def metric(value, unit, source, population, interval, evidence, reason=None):
@@ -1201,10 +1283,25 @@ class MeasurementTrial(Trial):
     schema = MEASUREMENT_SCHEMA
 
     def __init__(self, artifacts, anchor, state, processes=None, mounts=None, clock=None, host=None):
+        limits = state["limits"]
+        measurement_limits(limits["records"], overall_seconds=limits.get("overall_seconds", 900),
+                           **{k + "_seconds": v for k, v in limits["deadlines_seconds"].items()})
+        if (state["backend"] == "offline-check" and limits["records"] > MAX_RECORDS
+                or limits.get("evidence_bytes", EVIDENCE_BUDGET_BYTES) != EVIDENCE_BUDGET_BYTES
+                or not isinstance(limits["log_bytes_per_child"], int)
+                or not 1024 <= limits["log_bytes_per_child"] <= 1024**2):
+            raise TrialError("invalid persisted measurement limits")
+        consumed = state.get("budget", {}).get("consumed_seconds", 0)
+        if (not isinstance(consumed, (int, float)) or isinstance(consumed, bool)
+                or consumed < 0 or not math.isfinite(consumed)):
+            raise TrialError("invalid persisted overall budget consumption")
         clock = clock or Clock()
         super().__init__(artifacts, anchor, state, processes or AccountingProcesses(clock),
                          mounts or MeasurementMounts(state.get("affinities", {}).get("daemon")), clock)
         self.host = host or MeasurementHost()
+        self._budget_start = self._budget_end = None
+        self._io_kind = None
+        self._io_end = None
 
     @property
     def canonical_directory(self):
@@ -1216,13 +1313,19 @@ class MeasurementTrial(Trial):
                 application_affinity=None, daemon_affinity=None, materialize=False,
                 processes=None, mounts=None, host=None, clock=None,
                 readiness_seconds=10, application_seconds=30, shutdown_seconds=30,
-                io_seconds=30, log_bytes=1024**2):
-        deadlines = {"readiness": readiness_seconds, "application": application_seconds,
-                     "shutdown": shutdown_seconds, "io": io_seconds}
-        if backend not in ("ext4", "myfs", "offline-check") or not 0 <= records <= MAX_RECORDS:
-            raise TrialError("invalid measurement backend or record limit (0..32768)")
-        if any(not 0 < v <= 300 for v in deadlines.values()) or not 1024 <= log_bytes <= 1024**2:
+                io_seconds=30, staging_seconds=None, verification_seconds=None,
+                overall_seconds=900, log_bytes=1024**2):
+        config = measurement_limits(records, readiness_seconds=readiness_seconds,
+            application_seconds=application_seconds, shutdown_seconds=shutdown_seconds,
+            io_seconds=io_seconds, staging_seconds=staging_seconds,
+            verification_seconds=verification_seconds, overall_seconds=overall_seconds)
+        deadlines = config["deadlines_seconds"]
+        if backend not in ("ext4", "myfs", "offline-check") or (backend == "offline-check" and records > MAX_RECORDS):
+            raise TrialError("invalid backend; OFFLINE self-test record limit remains 0..32768")
+        if not isinstance(log_bytes, int) or isinstance(log_bytes, bool) or not 1024 <= log_bytes <= 1024**2:
             raise TrialError("invalid measurement deadline/log limit")
+        clock = clock or Clock()
+        preparation_start = clock.now()
         if backend != "offline-check" and not expected_device:
             raise TrialError("measurement requires explicit expected backing device major:minor")
         if backend == "myfs" and (daemon is None or build_provenance is None):
@@ -1250,7 +1353,11 @@ class MeasurementTrial(Trial):
                            "application": str(workspace / "application"), "backing": str(workspace / "backing")},
                  "canonical_root": str(canonical), "expected_device": expected_device,
                  "limits": {"records": records, "deadlines_seconds": deadlines, "log_bytes_per_child": log_bytes,
+                            "overall_seconds": overall_seconds, "evidence_bytes": EVIDENCE_BUDGET_BYTES,
                             "helper_termination_grace_seconds": 2, "accounting_entries": 4096},
+                 "fixture_size": {k: config[k] for k in ("records", "input_bytes", "size_class")},
+                 "budget": {"consumed_seconds": 0, "events": [],
+                            "scope": "active preparation plus execution; excludes idle between invocations and guarded cleanup"},
                  "seed": seed, "source": measurement_source(), "daemon": None, "canonical": {},
                  "phases": [], "validations": [], "children": [], "mounts": [], "commands": [],
                  "logical": None, "outcome": "created", "error": None,
@@ -1275,6 +1382,7 @@ class MeasurementTrial(Trial):
             "actual offline execution" if backend == "offline-check" else "actual")
         trial.save()
         try:
+            trial.begin_budget("prepare", preparation_start)
             def preflight():
                 trial.no_mounts()
                 trial.check_paths()
@@ -1304,8 +1412,17 @@ class MeasurementTrial(Trial):
             trial.phase("preflight", preflight)
             def generate():
                 trial.resource_guard()
-                manifest = fixture.generate_csv(canonical / "input.csv", canonical / "input.manifest.json", records, seed)
-                expected = fixture.write_expected(canonical / "input.csv", canonical / "expected.csv")
+                deadline = trial.deadline("io")
+                command = [sys.executable, "-B", "-c", GENERATION_CODE, str(Path(__file__).parent),
+                           str(canonical), str(records), str(seed)]
+                state["commands"].append(command)
+                result = trial.processes.run(command, artifacts / "canonical-preparation.log", log_bytes, deadline)
+                if result["exit_status"] != 0 or trial.clock.now() >= deadline:
+                    raise TrialError("canonical preparation failed/timeout; partial fixture unvalidated")
+                manifest = read_json(canonical / "input.manifest.json")
+                expected = summary(canonical / "expected.csv")
+                if manifest["byte_count"] != config["input_bytes"] or manifest["record_count"] != records:
+                    raise TrialError("canonical generator size mismatch")
                 state["canonical"] = trial.canonical_snapshot()
                 state["fixture_manifest"] = manifest
                 state["logical"] = {"input_rows": records, "input_bytes": manifest["byte_count"],
@@ -1321,6 +1438,8 @@ class MeasurementTrial(Trial):
             trial.save()
         except (OSError, ValueError, TrialError) as error:
             trial.fail(error)
+        finally:
+            trial.finish_budget()
         return trial
 
     def check_paths(self, mounted=False):
@@ -1375,20 +1494,111 @@ class MeasurementTrial(Trial):
                 raise TrialError("canonical references must be outside the tested filesystem/device")
 
     def resource_guard(self):
-        required_disk = 1024**3 + 64 * 1024**2 + 8 * (69 + self.state["limits"]["records"] * 128)
-        for path in (self.workspace, self.canonical_directory):
-            observation = dict(self.host.resources(path), path=str(path), monotonic=self.clock.now(),
-                               required_disk_bytes=required_disk, required_memory_bytes=2 * 1024**3)
+        plan = measurement_capacity(69 + self.state["limits"]["records"] * 128,
+            canonical_tmpfs=self.state["canonical_device"]["fstype"] == "tmpfs",
+            same_device=self.state["device"]["device"] == self.state["canonical_device"]["device"])
+        self.state["capacity_plan"] = plan
+        for role, path, required in (("backing", self.workspace, plan["backing_required_bytes"]),
+                                    ("canonical", self.canonical_directory, plan["canonical_required_bytes"])):
+            try:
+                values = self.host.resources(path)
+            except (OSError, ValueError) as error:
+                values = {"available_disk_bytes": None, "available_memory_bytes": None,
+                          "reason": str(error), "evidence": self.host.evidence}
+            observation = dict(values, path=str(path), role=role, monotonic=self.clock.now(),
+                               required_disk_bytes=required, required_memory_bytes=plan["memory_required_bytes"])
             self.state["resource_observations"].append(observation)
-            if observation["available_disk_bytes"] < required_disk:
-                raise TrialError("insufficient user-accessible disk space")
-            if observation["available_memory_bytes"] < 2 * 1024**3:
+            if any(observation.get(k) is None for k in ("available_disk_bytes", "available_memory_bytes")):
+                observation.setdefault("reason", "required capacity observation unavailable")
+                raise TrialError(f"{role} capacity observation unavailable")
+            if observation["available_disk_bytes"] < required:
+                raise TrialError(f"insufficient {role} user-accessible disk space")
+            if observation["available_memory_bytes"] < plan["memory_required_bytes"]:
                 raise TrialError("insufficient available memory")
+        self.check_budget()
+
+    def begin_budget(self, action, start=None):
+        # Persist accumulated active time, not an absolute monotonic deadline
+        # which would incorrectly consume time while the user reviews preparation.
+        budget = self.state.setdefault("budget", {"consumed_seconds": 0, "events": [],
+            "scope": "legacy preparation not budgeted; active execution only"})
+        self._budget_start = self.clock.now() if start is None else start
+        self._budget_end = self._budget_start + self.state["limits"].get("overall_seconds", 900) - budget["consumed_seconds"]
+        budget["events"].append({"action": action, "start_monotonic": self._budget_start,
+                                 "deadline_monotonic": self._budget_end, "end_monotonic": None})
+        self.check_budget()
+
+    def finish_budget(self):
+        if self._budget_start is not None:
+            end = self.clock.now()
+            budget = self.state["budget"]
+            budget["consumed_seconds"] += end - self._budget_start
+            budget["events"][-1]["end_monotonic"] = end
+            self._budget_start = self._budget_end = None
+            if (budget["consumed_seconds"] >= self.state["limits"].get("overall_seconds", 900)
+                    and self.state["outcome"] in ("prepared", "passed")):
+                self.fail(TrialError("overall active trial timeout during final bookkeeping; evidence retained"))
+            self.save()
+
+    def check_budget(self):
+        if self._budget_end is not None and self.clock.now() >= self._budget_end:
+            raise TrialError("overall active trial timeout; evidence retained")
+        if self._io_end is not None and self.clock.now() >= self._io_end:
+            raise TrialError(f"{self._io_kind} timeout; includes canonical integrity checks")
+
+    def canonical_summary(self, path):
+        return summary(path, self.check_budget)
+
+    def deadline(self, name):
+        self.check_budget()
+        if name == "io" and self._io_kind is not None:
+            name = "staging" if self._io_kind == "stage" else "verification"
+        deadlines = self.state["limits"]["deadlines_seconds"]
+        end = self.clock.now() + deadlines.get(name, deadlines["io"])
+        return min([end, *[v for v in (self._budget_end, self._io_end) if v is not None]])
+
+    def check_evidence_budget(self):
+        # Only the separate artifact tree, never backing storage while the app
+        # runs. This checkpoint scan uses the same no-follow/inode safeguards.
+        self.check_paths(mounted=self.mount_identity is not None)
+        start = self.clock.now()
+        try:
+            observed = account_owned_tree(self.artifacts, self.anchor["identities"]["artifacts"],
+                                          self.deadline("io"), self.clock)
+            value = max(observed["regular_apparent_bytes"], observed["allocated_bytes"])
+            self.state["evidence_usage"] = metric(value, "bytes", "no-follow artifact inventory; max(apparent, allocated)",
+                str(self.artifacts), [start, self.clock.now()], self.state["evidence"])
+        except (OSError, TrialError) as error:
+            self.state["evidence_usage"] = metric(None, "bytes", "no-follow artifact inventory",
+                str(self.artifacts), None, self.state["evidence"], str(error))
+            raise
+        if value > self.state["limits"].get("evidence_bytes", EVIDENCE_BUDGET_BYTES):
+            raise TrialError("trial evidence budget exhausted; retain all artifacts")
+
+    def io(self, kind):
+        self._io_kind = kind
+        try:
+            self._io_end = self.deadline("io")
+            self.check_device()
+            self.resource_guard()
+            result = super().io(kind)
+            self.check_budget()
+            return result
+        finally:
+            self._io_kind = None
+            self._io_end = None
 
     def phase(self, name, action):
         self.observe_daemon(name + ":start")
+        def guarded():
+            self.check_budget()
+            self.check_evidence_budget()
+            value = action()
+            self.check_budget()
+            self.check_evidence_budget()
+            return value
         try:
-            return super().phase(name, action)
+            return super().phase(name, guarded)
         finally:
             phase = self.state["phases"][-1]
             phase["duration_seconds"] = phase["end_monotonic"] - phase["start_monotonic"]
@@ -1512,6 +1722,7 @@ class MeasurementTrial(Trial):
         self.no_mounts()
         self.check_paths()
         self.check_device()
+        self.resource_guard()
         if any(c.get("exit_status") is None for c in self.state["children"]):
             raise TrialError("post-exit accounting refused: child exit unconfirmed")
         if any(not m["unmounted"] or m["daemon_exit_status"] != 0 for m in self.state["mounts"]):
@@ -1557,6 +1768,7 @@ class MeasurementTrial(Trial):
         self.state["outcome"] = "running"
         self.save()
         try:
+            self.begin_budget("run")
             self.no_mounts()
             self.check_paths()
             self.check_canonical()
@@ -1593,6 +1805,7 @@ class MeasurementTrial(Trial):
                 self.not_applicable("verification_shutdown", "no daemon")
             self.phase("post_exit_storage_accounting", self.storage_accounting)
             self.check_canonical()
+            self.check_budget()
             daemon = self.state["measurements"]["daemon_lifecycles"]
             self.state["measurements"]["daemon"] = {
                 name: metric(sum(d[name]["value"] for d in daemon) if daemon and all(d[name]["value"] is not None for d in daemon) else None,
@@ -1604,7 +1817,6 @@ class MeasurementTrial(Trial):
                 for name in ("user_seconds", "system_seconds")}
             self.state["outcome"] = "passed"
             self.save()
-            return True
         except (OSError, ValueError, TrialError) as error:
             try:
                 self.record_daemon_warnings()
@@ -1615,7 +1827,9 @@ class MeasurementTrial(Trial):
                 self.state["storage"] = {"allocated_bytes": None, "regular_apparent_bytes": None,
                                          "reason": "accounting incomplete: " + str(error), "errors": [str(error)]}
             self.fail(error)
-            return False
+        finally:
+            self.finish_budget()
+        return self.state["outcome"] == "passed"
 
     def verify(self):
         if self.state["backend"] not in ("ext4", "offline-check"):
@@ -1684,7 +1898,8 @@ def main(argv=None):
         command = commands.add_parser(name)
         command.add_argument("--parent", type=Path, required=True)
         command.add_argument("--canonical-parent", type=Path, required=True)
-        command.add_argument("--records", type=int, default=100 if name == "measure-self-test" else MAX_RECORDS)
+        command.add_argument("--records", type=int, default=100 if name == "measure-self-test" else MAX_RECORDS,
+                             help="0..1048576 for measurement (default 32768); OFFLINE self-test 0..32768 (default 100)")
         command.add_argument("--seed", type=int, default=fixture.DEFAULT_SEED)
         command.add_argument("--materialize", action="store_true")
         if name == "measure-prepare":
@@ -1696,6 +1911,11 @@ def main(argv=None):
             command.add_argument("--daemon-cpus", type=cpu_list)
         for limit, default in (("readiness", 10), ("application", 30), ("shutdown", 30), ("io", 30)):
             command.add_argument(f"--{limit}-seconds", type=float, default=default)
+        for name in ("staging", "verification"):
+            command.add_argument(f"--{name}-seconds", type=float, default=None,
+                                 help="measurement only; defaults to --io-seconds; finite 0 < seconds <=300")
+        command.add_argument("--overall-seconds", type=float, default=900,
+                             help="active prepare+run budget; finite 0 < seconds <=900; excludes review idle")
     args = parser.parse_args(argv)
     trial = None
     try:
@@ -1706,7 +1926,8 @@ def main(argv=None):
                 daemon=getattr(args, "daemon", None), build_provenance=getattr(args, "build_provenance", None),
                 application_affinity=getattr(args, "application_cpus", None), daemon_affinity=getattr(args, "daemon_cpus", None),
                 materialize=args.materialize, **{name + "_seconds": getattr(args, name + "_seconds")
-                                               for name in ("readiness", "application", "shutdown", "io")})
+                                               for name in ("readiness", "application", "shutdown", "io",
+                                                            "staging", "verification", "overall")})
             passed = trial.state["outcome"] == "prepared"
             if args.command == "measure-self-test" and passed:
                 passed = trial.execute()

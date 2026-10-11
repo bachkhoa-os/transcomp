@@ -519,6 +519,17 @@ class MeasurementProcesses(FakeProcesses):
         return code
 
     def run(self, command, log, limit, deadline):
+        if "generate_csv" in command[3]:
+            root, records, seed = command[-3:]
+            # A hard test-side tripwire: no test may allocate the full fixture.
+            if int(records) > 32768:
+                raise AssertionError("offline full-size fixture generation forbidden")
+            root = Path(root)
+            fixture.generate_csv(root / "input.csv", root / "input.manifest.json", int(records), int(seed))
+            fixture.write_expected(root / "input.csv", root / "expected.csv")
+            self.clock.value += .5
+            Path(log).write_text("MOCKED bounded fixture helper\n")
+            return {"exit_status": 0, "evidence": "mocked"}
         if "account_owned_tree" in command[3]:
             root, identity, result, materialize = command[-4:]
             value = runner.account_owned_tree(Path(root), json.loads(identity),
@@ -1029,6 +1040,314 @@ class MeasurementTests(unittest.TestCase):
                 with self.assertRaises(runner.TrialError):
                     processes.launch(["MOCKED"], self.parent / "never-launched.log", 4096)
         launch.assert_not_called()
+
+
+class FullMeasurementTests(unittest.TestCase):
+    """Full-size boundaries are mocked; actual fixture generation stays tiny."""
+    setUp = MeasurementTests.setUp
+    tearDown = MeasurementTests.tearDown
+    prepare = MeasurementTests.prepare
+    failed = MeasurementTests.failed
+
+    def test_measurement_size_boundaries_without_generation(self):
+        for records, size, profile in ((0, 69, "smoke-sized"),
+                                       (32768, 4194373, "smoke-sized"),
+                                       (1048576, 134217797, "larger-measurement")):
+            with self.subTest(records=records), mock.patch.object(
+                    fixture, "generate_csv", side_effect=AssertionError("no boundary fixture generation")):
+                config = runner.measurement_limits(records)
+                self.assertEqual(config["input_bytes"], size)
+                self.assertEqual(config["size_class"], profile)
+
+    def test_bad_counts_refused_before_creating_or_generating(self):
+        before = list(self.parent.iterdir())
+        for records in (-1, 1048577, 2**200, True, 1.5, "1048576", None):
+            with self.subTest(records=records), mock.patch.object(
+                    fixture, "generate_csv", side_effect=AssertionError("expensive generation reached")):
+                with self.assertRaises(runner.TrialError):
+                    runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.canonical_parent,
+                        backend="ext4", expected_device="259:7", records=records)
+        self.assertEqual(list(self.parent.iterdir()), before)
+
+    def test_full_size_not_enabled_for_offline_self_test_or_smoke(self):
+        with mock.patch.object(fixture, "generate_csv", side_effect=AssertionError("full generation reached")):
+            for cls, backend, extra in ((runner.Trial, "offline-directory", {}),
+                    (runner.MeasurementTrial, "offline-check", {"canonical_parent": self.canonical_parent})):
+                with self.subTest(backend=backend), self.assertRaises(runner.TrialError):
+                    cls.prepare(self.parent, backend=backend, records=1048576, **extra)
+
+    def test_separate_full_size_deadlines_and_bounded_values(self):
+        config = runner.measurement_limits(1048576, readiness_seconds=15, application_seconds=120,
+            staging_seconds=120, verification_seconds=120, shutdown_seconds=120,
+            io_seconds=120, overall_seconds=900)
+        self.assertEqual(config["deadlines_seconds"], {"readiness": 15, "application": 120,
+            "staging": 120, "verification": 120, "shutdown": 120, "io": 120})
+        self.assertEqual(config["overall_seconds"], 900)
+        for field in ("readiness", "application", "staging", "verification", "shutdown", "io", "overall"):
+            for value in (0, -1, float("nan"), float("inf"), 901, True):
+                with self.subTest(field=field, value=value), self.assertRaises(runner.TrialError):
+                    runner.measurement_limits(1048576, **{field + "_seconds": value})
+
+    def test_io_deadline_fallback_preserves_existing_measurement_contract(self):
+        trial = self.prepare(io_seconds=18)
+        self.assertEqual(trial.state["limits"]["deadlines_seconds"], {
+            "readiness": 10, "application": 30, "shutdown": 30,
+            "io": 18, "staging": 18, "verification": 18})
+        self.assertTrue(trial.execute(), trial.state.get("error"))
+
+    def test_full_size_capacity_model_has_separate_reservations(self):
+        plan = runner.measurement_capacity(134217797, canonical_tmpfs=True, same_device=False)
+        self.assertEqual(plan["backing_required_bytes"], 2214593064)
+        self.assertEqual(plan["canonical_required_bytes"], 1409286282)
+        self.assertEqual(plan["memory_required_bytes"], 2415919242)
+        self.assertEqual(plan["retained_headroom_bytes"], 1073741824)
+        self.assertIn("estimate", plan["limitation"])
+
+    def test_insufficient_canonical_capacity_before_generation(self):
+        original = self.host.resources
+        def resources(path):
+            result = original(path)
+            if self.canonical_parent in path.parents:
+                result["available_disk_bytes"] = 1
+            return result
+        self.host.resources = resources
+        with mock.patch.object(fixture, "generate_csv", side_effect=AssertionError("allocation reached")):
+            trial = self.prepare()
+        self.assertEqual(trial.state["outcome"], "failed")
+        self.assertIn("canonical", trial.state["error"])
+        self.assertTrue(trial.artifacts.exists())
+
+    def test_capacity_loss_between_preparation_and_execution(self):
+        trial = self.prepare()
+        self.host.free = 1
+        self.failed(trial, "disk")
+        self.assertFalse((trial.root / "input.csv").exists())
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_capacity_loss_after_staging_prevents_application_launch(self):
+        trial = self.prepare()
+        original = trial.io
+        def stage_then_lose_capacity(kind):
+            value = original(kind)
+            if kind == "stage":
+                self.host.free = 1
+            return value
+        trial.io = stage_then_lose_capacity
+        self.failed(trial, "disk")
+        self.assertFalse((trial.root / "output.csv").exists())
+
+    def test_missing_capacity_observation_retained_as_null(self):
+        trial = self.prepare()
+        self.host.resources = lambda path: {"available_disk_bytes": None,
+            "available_memory_bytes": None, "reason": "MOCKED endpoint unavailable", "evidence": "mocked"}
+        self.failed(trial, "unavailable")
+        observation = trial.state["resource_observations"][-1]
+        self.assertIsNone(observation["available_disk_bytes"])
+        self.assertIn("unavailable", observation["reason"])
+
+    def test_evidence_budget_exhaustion_retains_sparse_evidence(self):
+        trial = self.prepare()
+        path = trial.artifacts / "oversized-evidence"
+        with path.open("xb") as stream:
+            stream.truncate(64 * 1024**2 + 1)  # sparse; no large data allocation
+        self.failed(trial, "evidence budget")
+        self.assertTrue(path.exists())
+        self.assertGreater(trial.state["evidence_usage"]["value"], 64 * 1024**2)
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_overall_budget_expiry_retains_evidence(self):
+        trial = self.prepare(overall_seconds=2)
+        self.failed(trial, "timeout")
+        self.assertFalse((trial.root / "output.csv").exists())
+        self.assertTrue(trial.state["budget"]["events"])
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_prepare_and_run_share_budget_but_idle_time_is_excluded(self):
+        trial = self.prepare(overall_seconds=30)
+        consumed = trial.state["budget"]["consumed_seconds"]
+        self.clock.value += 10000  # user review between CLI invocations is not active trial time
+        self.assertTrue(trial.execute(), trial.state.get("error"))
+        self.assertGreater(trial.state["budget"]["consumed_seconds"], consumed)
+        self.assertLess(trial.state["budget"]["consumed_seconds"], 30)
+
+    def test_separate_staging_and_verification_deadlines(self):
+        for field, phase in (("staging", "input_staging_validation"),
+                             ("verification", "correctness_verification")):
+            with self.subTest(field=field):
+                trial = self.prepare(**{field + "_seconds": 1})
+                self.failed(trial, "timeout")
+                self.assertEqual(trial.state["phases"][-1]["name"], phase)
+
+    def test_full_prepare_validation_uses_owned_helper_without_large_generation(self):
+        # Model only the size boundary. Stop deliberately before generating any data.
+        def decline_generation(command, log, limit, deadline):
+            self.assertIn("generate_csv", command[3])
+            self.assertEqual(command[-2:], ["1048576", "20261010"])
+            Path(log).write_text("MOCKED generation declined\n")
+            raise runner.TrialError("MOCKED full-size generation deliberately not executed")
+        self.processes.run = decline_generation
+        with mock.patch.object(fixture, "generate_csv", side_effect=AssertionError("full allocation reached")):
+            trial = runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.canonical_parent,
+                backend="ext4", records=1048576, expected_device="259:7", host=self.host,
+                processes=self.processes, mounts=self.mounts, clock=self.clock)
+        self.assertEqual(trial.state["limits"]["records"], 1048576)
+        self.assertIn("deliberately not executed", trial.state["error"])
+        self.assertFalse((trial.canonical_directory / "input.csv").exists())
+
+    def test_io_budget_includes_canonical_checks(self):
+        trial = self.prepare(staging_seconds=1)
+        original = trial.check_canonical
+        def slow_reference_check():
+            original()
+            self.clock.value += 1.1
+        trial.check_canonical = slow_reference_check
+        # No staged data if reference validation already consumed the I/O budget.
+        trial.phase("test_staging", lambda: None)
+        with self.assertRaises(runner.TrialError):
+            trial.io("stage")
+        self.assertFalse((trial.root / "input.csv").exists())
+
+    def test_tampered_large_count_refused_at_load(self):
+        trial = self.prepare()
+        trial.state["limits"]["records"] = 2**200
+        trial.save()
+        with self.assertRaises(runner.TrialError):
+            runner.Trial.load(trial.artifacts, processes=self.processes,
+                mounts=self.mounts, clock=self.clock, host=self.host)
+
+    def test_invalid_persisted_budget_cannot_disable_overall_deadline(self):
+        for consumed in (-1, float("nan"), float("inf")):
+            with self.subTest(consumed=consumed):
+                trial = self.prepare()
+                trial.state["budget"]["consumed_seconds"] = consumed
+                trial.save()
+                with self.assertRaises(runner.TrialError):
+                    runner.Trial.load(trial.artifacts, processes=self.processes,
+                        mounts=self.mounts, clock=self.clock, host=self.host)
+
+    def test_preparation_time_includes_source_capture_in_overall_budget(self):
+        original = runner.measurement_source
+        def slow_source():
+            self.clock.value += 2
+            return original()
+        with mock.patch.object(runner, "measurement_source", side_effect=slow_source):
+            trial = self.prepare(overall_seconds=1)
+        self.assertEqual(trial.state["outcome"], "failed")
+        self.assertIn("overall", trial.state["error"])
+        self.assertFalse((trial.canonical_directory / "input.csv").exists())
+
+    def test_exhausted_preparation_budget_survives_cli_reload(self):
+        trial = self.prepare(overall_seconds=1)
+        # Simulate a confirmed completed preparation consuming the entire budget.
+        trial.state["budget"]["consumed_seconds"] = 1
+        trial.save()
+        loaded = runner.Trial.load(trial.artifacts, processes=self.processes,
+            mounts=self.mounts, clock=self.clock, host=self.host)
+        self.failed(loaded, "overall")
+        self.assertFalse((loaded.root / "input.csv").exists())
+
+    def test_final_bookkeeping_cannot_report_pass_after_overall_deadline(self):
+        trial = self.prepare(overall_seconds=30)
+        original = trial.save
+        def late_final_save():
+            original()
+            if trial.state["outcome"] == "passed":
+                self.clock.value += 30
+        trial.save = late_final_save
+        self.failed(trial, "overall")
+
+    def test_deadline_maxima_are_inclusive_and_next_value_is_rejected(self):
+        runner.measurement_limits(1048576, readiness_seconds=300, application_seconds=300,
+            staging_seconds=300, verification_seconds=300, shutdown_seconds=300,
+            io_seconds=300, overall_seconds=900)
+        for field in ("readiness", "application", "staging", "verification", "shutdown", "io"):
+            with self.subTest(field=field), self.assertRaises(runner.TrialError):
+                runner.measurement_limits(1048576, **{field + "_seconds": 301})
+
+    def test_evidence_scan_failure_remains_unavailable_and_preserves_artifacts(self):
+        trial = self.prepare()
+        with mock.patch.object(runner, "account_owned_tree", side_effect=runner.TrialError("MOCKED scan unavailable")):
+            self.failed(trial, "scan unavailable")
+        self.assertIsNone(trial.state["evidence_usage"]["value"])
+        self.assertIn("unavailable", trial.state["evidence_usage"]["reason"])
+        self.assertTrue(trial.artifacts.exists())
+
+    def test_32768_records_still_prepare_and_verify_offline(self):
+        trial = runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.canonical_parent,
+            backend="ext4", records=32768, expected_device="259:7", host=self.host,
+            processes=self.processes, mounts=self.mounts, clock=self.clock)
+        self.assertEqual(trial.state["outcome"], "prepared", trial.state.get("error"))
+        self.assertEqual(trial.state["logical"]["input_bytes"], 4194373)
+        self.assertTrue(trial.execute(), trial.state.get("error"))
+        self.assertEqual(trial.state["validations"][-1]["output"]["actual"]["row_count"], 10773)
+        self.assertEqual(trial.state["validations"][-1]["output"]["actual"]["sha256"],
+            "c804dfef2dd1c1d5ed64a9f4768bfd816e843372c8ec3801b044249c7a038734")
+
+    def test_full_size_memory_guard_before_generation(self):
+        self.host.memory = 2 * 1024**3
+        with mock.patch.object(fixture, "generate_csv", side_effect=AssertionError("full allocation reached")):
+            trial = runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.canonical_parent,
+                backend="ext4", records=1048576, expected_device="259:7", host=self.host,
+                processes=self.processes, mounts=self.mounts, clock=self.clock)
+        self.assertEqual(trial.state["outcome"], "failed")
+        self.assertIn("memory", trial.state["error"])
+
+    def test_full_size_disk_guard_before_generation(self):
+        self.host.free = 2214593063  # full backing reservation minus one byte
+        with mock.patch.object(fixture, "generate_csv", side_effect=AssertionError("full allocation reached")):
+            trial = runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.canonical_parent,
+                backend="ext4", records=1048576, expected_device="259:7", host=self.host,
+                processes=self.processes, mounts=self.mounts, clock=self.clock)
+        self.assertEqual(trial.state["outcome"], "failed")
+        self.assertIn("backing", trial.state["error"])
+
+    def test_separate_device_canonical_reservation_and_same_device_offline_combination(self):
+        # Unlike backing, canonical storage need not reserve eight copies.
+        original = self.host.resources
+        def resources(path):
+            values = original(path)
+            if self.canonical_parent in path.parents:
+                values["available_disk_bytes"] = 1140859018  # 1 GiB + 64 MiB + 2*(69+32*128)
+            return values
+        self.host.resources = resources
+        trial = self.prepare()
+        self.assertEqual(trial.state["outcome"], "prepared", trial.state.get("error"))
+        plan = runner.measurement_capacity(134217797, canonical_tmpfs=False, same_device=True)
+        self.assertEqual(plan["backing_required_bytes"], 2483028658)
+
+    def test_readiness_and_application_defaults_unchanged(self):
+        trial = self.prepare()
+        self.assertEqual(trial.state["limits"]["deadlines_seconds"]["application"], 30)
+        self.assertEqual(trial.state["limits"]["deadlines_seconds"]["readiness"], 10)
+        self.assertEqual(runner.measurement_limits(32768)["input_bytes"], 4194373)
+
+    def test_preparation_helper_deadline_retains_partial_canonical(self):
+        original = self.processes.run
+        def late_generation(command, log, limit, deadline):
+            value = original(command, log, limit, deadline)
+            self.clock.value = deadline
+            return value
+        self.processes.run = late_generation
+        trial = self.prepare(io_seconds=1)
+        self.assertEqual(trial.state["outcome"], "failed")
+        self.assertIn("timeout", trial.state["error"])
+        self.assertTrue((trial.canonical_directory / "input.csv").exists())
+        self.assertEqual(trial.state["canonical"], {})
+
+    def test_deadline_cli_options_only_on_measurement(self):
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            runner.main(["self-test", "--parent", str(self.parent), "--staging-seconds", "120"])
+        self.assertEqual(error.exception.code, 2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = runner.main(["measure-self-test", "--parent", str(self.parent),
+                "--canonical-parent", str(self.canonical_parent), "--records", "2",
+                "--staging-seconds", "120", "--verification-seconds", "120", "--overall-seconds", "900"])
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
