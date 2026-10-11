@@ -1042,6 +1042,354 @@ class MeasurementTests(unittest.TestCase):
         launch.assert_not_called()
 
 
+class SharedCanonicalTests(unittest.TestCase):
+    """Real tiny canonical/oracle files; mount and trial measurements are fake."""
+    setUp = MeasurementTests.setUp
+    tearDown = MeasurementTests.tearDown
+
+    def bundle(self, campaign_id="1" * 32, **kwargs):
+        return runner.CanonicalBundle.prepare(self.canonical_parent,
+            evidence_parent=self.parent, campaign_id=campaign_id, records=32,
+            host=self.host, **kwargs)
+
+    def trial(self, bundle, backend="ext4", **kwargs):
+        return runner.MeasurementTrial.prepare(self.parent,
+            canonical_bundle=bundle.root, campaign_id=bundle.state["campaign_id"],
+            records=32, backend=backend, expected_device="259:7",
+            daemon=Path(sys.executable).resolve(), build_provenance={"mocked": True},
+            processes=MeasurementProcesses(self.clock), mounts=MeasurementMounts(),
+            host=self.host, clock=self.clock, **kwargs)
+
+    def test_two_independent_trials_reuse_one_bundle_without_generation(self):
+        bundle = self.bundle()
+        self.assertEqual(bundle.state["outcome"], "ready", bundle.state.get("error"))
+        before = {p.name: p.read_bytes() for p in bundle.root.iterdir()}
+        with mock.patch.object(fixture, "generate_csv", side_effect=AssertionError("reuse generated a fixture")):
+            for backend in ("ext4", "myfs"):
+                trial = self.trial(bundle, backend)
+                self.assertEqual(trial.state["outcome"], "prepared", trial.state.get("error"))
+                self.assertTrue(trial.execute(), trial.state.get("error"))
+                self.assertEqual(trial.state["canonical"], bundle.state["canonical"])
+                self.assertEqual(trial.state["validations"][-1]["output"]["actual"],
+                                 trial.state["validations"][-1]["output"]["expected"])
+                self.assertEqual(trial.state["canonical_reference"]["ownership"], "campaign")
+                self.assertEqual(trial.state["evidence"], "mocked")
+                self.assertTrue(trial.state["canonical_checks"])
+                trial.cleanup()
+                self.assertFalse(trial.workspace.exists())
+                self.assertEqual(before, {p.name: p.read_bytes() for p in bundle.root.iterdir()})
+
+    def test_seed_record_and_generator_mismatch_refused(self):
+        bundle = self.bundle()
+        for options in ({"seed": 1}, {"records": 33}):
+            with self.subTest(options=options), self.assertRaises(runner.TrialError):
+                runner.CanonicalBundle.load(bundle.root, campaign_id="1" * 32,
+                    **dict({"seed": 20261010, "records": 32}, **options))
+        with mock.patch.object(fixture, "CSV_GENERATOR", "foreign-generator"), self.assertRaises(runner.TrialError):
+            runner.CanonicalBundle.load(bundle.root, campaign_id="1" * 32, records=32, seed=20261010)
+
+    def test_corrupt_truncated_and_invalid_references_refused_without_repair(self):
+        for index, name in enumerate(("input.csv", "expected.csv", "input.manifest.json")):
+            with self.subTest(name=name):
+                bundle = self.bundle(f"{index + 2:032x}")
+                path = bundle.root / name
+                path.write_bytes(b"corrupt\n")
+                with self.assertRaises(runner.TrialError):
+                    runner.CanonicalBundle.load(bundle.root, campaign_id=bundle.state["campaign_id"],
+                                                records=32, seed=20261010)
+                self.assertEqual(path.read_bytes(), b"corrupt\n")
+
+    def test_symlink_substitution_refused(self):
+        bundle = self.bundle()
+        original = bundle.root / "expected.csv"
+        target = self.parent / "unrelated.csv"
+        target.write_bytes(original.read_bytes())
+        original.unlink()
+        original.symlink_to(target)
+        with self.assertRaises(runner.TrialError):
+            self.trial(bundle)
+        self.assertTrue(target.exists())
+
+    def test_file_identity_replacement_with_identical_bytes_refused(self):
+        bundle = self.bundle()
+        path = bundle.root / "input.csv"
+        replacement = bundle.root / "replacement"
+        replacement.write_bytes(path.read_bytes())
+        replacement.replace(path)
+        with self.assertRaises(runner.TrialError):
+            self.trial(bundle)
+
+    def test_directory_substitution_refused(self):
+        bundle = self.bundle()
+        trial = self.trial(bundle)
+        moved = bundle.root.with_name("retained-original")
+        bundle.root.rename(moved)
+        bundle.root.mkdir(mode=0o700)
+        self.assertFalse(trial.execute())
+        self.assertTrue(trial.workspace.exists())
+        self.assertTrue(moved.exists())
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_missing_tmpfs_bundle_requires_explicit_reconstruction(self):
+        bundle = self.bundle()
+        trial = self.trial(bundle)
+        (bundle.root / "input.csv").unlink()
+        self.assertFalse(trial.execute())
+        self.assertFalse((bundle.root / "input.csv").exists())
+        self.assertTrue(trial.artifacts.exists())
+
+    def test_foreign_campaign_and_path_escape_refused(self):
+        bundle = self.bundle()
+        for root, campaign in ((bundle.root, "2" * 32),
+                               (bundle.root, "../escape")):
+            with self.subTest(campaign=campaign), self.assertRaises(runner.TrialError):
+                runner.CanonicalBundle.load(root, campaign_id=campaign, records=32, seed=20261010)
+        alias = self.parent / "bundle-alias"
+        alias.symlink_to(bundle.root, target_is_directory=True)
+        with self.assertRaises(runner.TrialError):
+            runner.CanonicalBundle.load(alias, campaign_id="1" * 32, records=32, seed=20261010)
+
+    def test_duplicate_and_in_progress_campaign_creation_preserves_existing_data(self):
+        bundle = self.bundle()
+        before = {p.name: p.read_bytes() for p in bundle.root.iterdir()}
+        with self.assertRaises((runner.TrialError, FileExistsError)):
+            self.bundle()
+        self.assertEqual(before, {p.name: p.read_bytes() for p in bundle.root.iterdir()})
+        pending = self.canonical_parent / ("m0-shared-canonical-" + "3" * 32)
+        pending.mkdir(mode=0o700)
+        sentinel = pending / "pending"
+        sentinel.write_bytes(b"another preparer owns this")
+        with self.assertRaises((runner.TrialError, FileExistsError)):
+            self.bundle("3" * 32)
+        self.assertEqual(sentinel.read_bytes(), b"another preparer owns this")
+
+    def test_stale_receipt_or_foreign_state_refused(self):
+        bundle = self.bundle()
+        trial = self.trial(bundle)
+        path = bundle.artifacts / "state.json"
+        record = json.loads(path.read_text())
+        record["campaign_id"] = "2" * 32
+        path.write_text(json.dumps(record))
+        self.assertFalse(trial.execute())
+        self.assertTrue(trial.workspace.exists())
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_canonical_corruption_after_staging_invalidates_trial(self):
+        bundle = self.bundle()
+        trial = self.trial(bundle)
+        original = trial.io
+        def stage_then_corrupt(kind):
+            value = original(kind)
+            if kind == "stage":
+                (bundle.root / "expected.csv").write_bytes(b"incorrect\n")
+            return value
+        trial.io = stage_then_corrupt
+        self.assertFalse(trial.execute())
+        self.assertTrue(trial.workspace.exists())
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_failed_application_keeps_shared_bundle_and_trial_evidence(self):
+        bundle = self.bundle()
+        trial = self.trial(bundle)
+        trial.processes.application_error = True
+        self.assertFalse(trial.execute())
+        self.assertTrue(trial.artifacts.exists())
+        self.assertTrue(bundle.root.exists())
+        self.assertTrue(bundle.artifacts.exists())
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_reuse_reserves_no_new_canonical_copy_and_preserves_backing_headroom(self):
+        bundle = self.bundle()
+        self.host.free = 1024**3 + 64 * 1024**2 + 8 * (69 + 32 * 128)
+        trial = self.trial(bundle)
+        self.assertEqual(trial.state["outcome"], "prepared", trial.state.get("error"))
+        plan = trial.state["capacity_plan"]
+        self.assertEqual(plan["retained_headroom_bytes"], 1073741824)
+        self.assertEqual(plan["canonical_required_bytes"], 1140850688)
+        self.assertEqual(plan["canonical_new_allocation_estimate_bytes"], 0)
+        self.assertGreater(plan["shared_canonical_allocated_bytes"], 0)
+        self.assertEqual(plan["memory_required_bytes"], 2147483648)
+        self.host.free = 1
+        self.assertFalse(trial.execute())
+        self.assertTrue(bundle.root.exists())
+
+    def test_shared_reference_cannot_be_inside_trial_parent(self):
+        bundle = self.bundle()
+        with self.assertRaises(runner.TrialError):
+            runner.MeasurementTrial.prepare(bundle.root, canonical_bundle=bundle.root,
+                campaign_id="1" * 32, records=32, backend="ext4", expected_device="259:7")
+
+    def test_bundle_receipt_retains_metadata_not_large_csv_copies(self):
+        bundle = self.bundle()
+        record = json.loads((bundle.artifacts / "state.json").read_text())
+        self.assertEqual(record["outcome"], "ready")
+        self.assertTrue(record["oracle_validation"]["passed"])
+        self.assertEqual(record["fixture_manifest"]["generator_version"], "myfs-m0-csv-v1")
+        self.assertFalse(list(bundle.artifacts.glob("*.csv")))
+        self.assertIn("reboot", record["persistence"]["limitation"])
+
+    def test_canonical_cli_and_shared_offline_cli_are_explicit(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        output = StringIO()
+        with mock.patch.object(runner, "MeasurementHost", return_value=self.host), redirect_stdout(output):
+            code = runner.main(["canonical-prepare", "--canonical-parent", str(self.canonical_parent),
+                "--evidence-parent", str(self.parent), "--campaign-id", "1" * 32,
+                "--records", "32", "--seed", "20261010"])
+            self.assertEqual(code, 0)
+            prepared = json.loads(output.getvalue())
+            self.assertTrue(prepared["passed"])
+            for _ in range(2):
+                output.seek(0); output.truncate()
+                self.assertEqual(runner.main(["measure-self-test", "--parent", str(self.parent),
+                    "--canonical-bundle", prepared["bundle"], "--campaign-id", "1" * 32,
+                    "--records", "32", "--seed", "20261010"]), 0)
+                trial_record = json.loads(output.getvalue())
+                self.assertIn("OFFLINE", trial_record["label"])
+                state = json.loads((Path(trial_record["artifacts"]) / "state.json").read_text())
+                self.assertIsNone(state["measurements"]["application"]["wall_seconds"]["value"])
+                self.assertEqual(state["canonical_reference"]["ownership"], "campaign")
+                self.assertEqual(runner.main(["cleanup", trial_record["artifacts"]]), 0)
+            self.assertTrue(Path(prepared["bundle"], "expected.csv").exists())
+
+    def test_corrupt_staged_input_with_consistent_output_cannot_redefine_reference(self):
+        bundle = self.bundle()
+        trial = self.trial(bundle)
+        original = trial.processes.wait
+        def corrupt_then_wait(identity, deadline):
+            entry = next(c for c in trial.processes.entries if c["identity"] == identity)
+            if str(application.__file__) in entry["command"]:
+                path = trial.root / "input.csv"
+                path.write_bytes(path.read_bytes().replace(b",ok,", b",er,"))
+            return original(identity, deadline)
+        trial.processes.wait = corrupt_then_wait
+        self.assertFalse(trial.execute())
+        self.assertFalse(trial.state["validations"][-1]["input"]["passed"])
+        self.assertTrue(fixture.validate_output(trial.root / "input.csv", trial.root / "output.csv")["passed"])
+        self.assertTrue(bundle.root.exists())
+
+    def test_canonical_creation_capacity_failure_retains_unvalidated_evidence(self):
+        self.host.memory = 1
+        bundle = self.bundle()
+        self.assertEqual(bundle.state["outcome"], "failed")
+        self.assertFalse((bundle.root / "input.csv").exists())
+        self.assertTrue((bundle.artifacts / "state.json").exists())
+        with self.assertRaises(runner.TrialError):
+            self.trial(bundle)
+
+    def test_missing_capacity_remains_unavailable(self):
+        self.host.resources = lambda path: {"available_disk_bytes": None,
+            "available_memory_bytes": None, "evidence": "mocked", "reason": "test unavailable"}
+        bundle = self.bundle()
+        self.assertEqual(bundle.state["outcome"], "failed")
+        self.assertIsNone(bundle.state["resource_observations"][0]["available_disk_bytes"])
+
+    def test_full_size_capacity_model_reuse_does_not_allocate_in_test(self):
+        with mock.patch.object(fixture, "generate_csv", side_effect=AssertionError("full generation forbidden")):
+            plan = runner.measurement_capacity(134217797, canonical_tmpfs=True, same_device=False, shared=True)
+            self.assertEqual(plan["backing_required_bytes"], 2214593064)
+            self.assertEqual(plan["canonical_required_bytes"], 1140850688)
+            self.assertEqual(plan["memory_required_bytes"], 2147483648)
+            for count in (-1, 1048577, 2**200, True):
+                with self.subTest(count=count), self.assertRaises(runner.TrialError):
+                    runner.CanonicalBundle.prepare(self.canonical_parent, evidence_parent=self.parent, records=count)
+
+    def test_stale_trial_cannot_adopt_explicit_reconstructed_campaign(self):
+        bundle = self.bundle()
+        trial = self.trial(bundle)
+        bundle.root.rename(bundle.root.with_name("old-bundle"))
+        bundle.artifacts.rename(bundle.artifacts.with_name("old-evidence"))
+        replacement = self.bundle()
+        self.assertEqual(replacement.state["outcome"], "ready")
+        self.assertEqual(bundle.state["canonical"]["input.csv"]["sha256"],
+                         replacement.state["canonical"]["input.csv"]["sha256"])
+        self.assertFalse(trial.execute())
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_ancestor_and_receipt_symlinks_are_refused(self):
+        bundle = self.bundle()
+        trial = self.trial(bundle)
+        receipt = bundle.artifacts / "state.json"
+        original = self.parent / "retained-receipt.json"
+        receipt.rename(original)
+        receipt.symlink_to(original)
+        self.assertFalse(trial.execute())
+        self.assertTrue(original.exists())
+
+    def test_canonical_deadline_failure_retains_partial_files(self):
+        bundle = self.bundle(io_seconds=0.001)
+        self.assertEqual(bundle.state["outcome"], "failed")
+        self.assertTrue(bundle.root.exists())
+        self.assertTrue((bundle.artifacts / "state.json").exists())
+
+    def test_non_object_ownership_and_receipt_json_fail_closed(self):
+        for index, name in enumerate(("owner.json", "state.json")):
+            with self.subTest(name=name):
+                bundle = self.bundle(f"{index + 4:032x}")
+                path = (bundle.root if name == "owner.json" else bundle.artifacts) / name
+                path.write_text("[]")
+                with self.assertRaises(runner.TrialError):
+                    runner.CanonicalBundle.load(bundle.root, campaign_id=bundle.state["campaign_id"],
+                                                records=32, seed=20261010)
+
+    def test_pinned_owner_mismatch_refused_before_following_foreign_receipt_path(self):
+        bundle = self.bundle()
+        reference = bundle.reference()
+        owner = json.loads((bundle.root / "owner.json").read_text())
+        owner["evidence_parent"] = str(self.parent / "foreign")
+        (bundle.root / "owner.json").write_text(json.dumps(owner))
+        with mock.patch.object(runner, "strict_path", wraps=runner.strict_path) as inspected:
+            with self.assertRaises(runner.TrialError):
+                runner.CanonicalBundle.load(bundle.root, campaign_id="1" * 32,
+                    records=32, seed=20261010, expected=reference)
+        self.assertFalse(any("foreign" in str(c.args[0]) for c in inspected.call_args_list))
+
+    def test_unexpected_mount_over_shared_references_refused(self):
+        bundle = self.bundle()
+        mounts = mock.Mock()
+        mounts.snapshot.return_value = [{"target": str(bundle.root / "nested")}]
+        with self.assertRaises(runner.TrialError):
+            runner.CanonicalBundle.load(bundle.root, campaign_id="1" * 32,
+                                        records=32, seed=20261010, mounts=mounts)
+
+    def test_shared_hard_link_alias_refused(self):
+        import os
+        bundle = self.bundle()
+        os.link(bundle.root / "input.csv", self.parent / "alias.csv")
+        with self.assertRaises(runner.TrialError):
+            self.trial(bundle)
+
+    def test_resource_read_error_retains_null_observation_and_reason(self):
+        self.host.resources = mock.Mock(side_effect=OSError("test resource endpoint unavailable"))
+        bundle = self.bundle()
+        self.assertEqual(bundle.state["outcome"], "failed")
+        observation = bundle.state["resource_observations"][0]
+        self.assertIsNone(observation["available_disk_bytes"])
+        self.assertIsNone(observation["available_memory_bytes"])
+        self.assertIn("endpoint unavailable", observation["reason"])
+
+    def test_boolean_seed_cannot_alias_integer_seed(self):
+        bundle = self.bundle(seed=0)
+        with self.assertRaises((runner.TrialError, ValueError)):
+            runner.CanonicalBundle.load(bundle.root, campaign_id="1" * 32, records=32, seed=False)
+
+    def test_real_measurement_requires_nonvolatile_campaign_receipt(self):
+        bundle = self.bundle()
+        self.assertEqual(bundle.state["persistence"]["small_receipt_filesystem"], "ext4")
+        device = self.host.device
+        self.host.device = lambda path: dict(device(path), fstype="tmpfs") if path == bundle.artifacts else device(path)
+        trial = self.trial(bundle)
+        self.assertEqual(trial.state["outcome"], "failed")
+        self.assertIn("volatile", trial.state["error"])
+        self.assertTrue(bundle.root.exists())
+        self.assertTrue(trial.artifacts.exists())
+
+
 class FullMeasurementTests(unittest.TestCase):
     """Full-size boundaries are mocked; actual fixture generation stays tiny."""
     setUp = MeasurementTests.setUp
