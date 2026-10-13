@@ -1,8 +1,15 @@
 """Offline M0-B2 safety checks. All mounted evidence below is mocked."""
 
 import importlib.util
+import contextlib
+import cProfile
+import hashlib
+import io
 import json
+import marshal
+import os
 from pathlib import Path
+import pstats
 import sys
 import tempfile
 import unittest
@@ -1696,6 +1703,540 @@ class FullMeasurementTests(unittest.TestCase):
                 "--canonical-parent", str(self.canonical_parent), "--records", "2",
                 "--staging-seconds", "120", "--verification-seconds", "120", "--overall-seconds", "900"])
         self.assertEqual(code, 0)
+
+
+class PythonProfileTests(unittest.TestCase):
+    """Real tiny offline profiles; no mounts, large fixtures or timing comparisons."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="m0-d6b-tests-")
+        self.parent = Path(self.temp.name)
+        self.references = self.parent / "references"
+        self.references.mkdir()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def prepare(self, diagnostic="python-cpu", **kwargs):
+        return runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.references,
+            backend="offline-check", records=12, diagnostic=diagnostic, **kwargs)
+
+    def profile_paths(self, trial):
+        prefix = "python-cpu-" + trial.anchor["trial_id"]
+        return trial.artifacts / (prefix + ".prof"), trial.artifacts / (prefix + ".json")
+
+    def passed(self, trial):
+        self.assertTrue(trial.execute(), trial.state["error"])
+        value = trial.state["diagnostic"]["profile"]
+        self.assertTrue(value["valid"], value.get("reason"))
+        self.assertGreater(value["function_count"], 0)
+        self.assertGreater(value["total_calls"], 0)
+        return value
+
+    def test_default_application_command_and_offline_wall_unchanged(self):
+        trial = self.prepare(diagnostic=None)
+        self.assertTrue(trial.execute(), trial.state["error"])
+        child = next(c for c in trial.state["children"] if str(application.__file__) in c["command"])
+        self.assertEqual(child["command"], [sys.executable, "-B", str(application.__file__), str(trial.root)])
+        self.assertIsNone(trial.state["measurements"]["application"]["wall_seconds"]["value"])
+        self.assertEqual(list(trial.artifacts.glob("python-cpu-*")), [])
+
+    def test_real_profile_is_cpu_timed_readable_and_exact_output(self):
+        trial = self.prepare()
+        value = self.passed(trial)
+        raw, receipt = self.profile_paths(trial)
+        stats = pstats.Stats(str(raw))
+        self.assertEqual(value["total_calls"], stats.total_calls)
+        self.assertEqual(value["primitive_calls"], stats.prim_calls)
+        self.assertEqual(value["function_count"], len(stats.stats))
+        self.assertEqual(value["sha256"], hashlib.sha256(raw.read_bytes()).hexdigest())
+        self.assertEqual(value["byte_count"], raw.stat().st_size)
+        self.assertEqual(value["timer"], "time.process_time")
+        self.assertEqual(value["unit"], "CPU seconds (user + system)")
+        self.assertEqual(value["boundary_clock"], "time.monotonic")
+        self.assertEqual(value["boundary_unit"], "seconds")
+        self.assertTrue(any(k[0] == str(application.__file__) and k[2] == "transform" for k in stats.stats))
+        self.assertEqual((trial.root / "output.csv").read_bytes(),
+                         (trial.canonical_directory / "expected.csv").read_bytes())
+        self.assertEqual(value["evidence"], "actual offline execution")
+        self.assertIsNone(value["script_error"])
+        self.assertEqual(receipt.parent, trial.artifacts)
+        self.assertEqual(trial.state["measurement_population"], "instrumented_application_completion")
+        self.assertFalse(trial.state["baseline_eligible"])
+        self.assertIsNone(trial.state["measurements"]["application"]["wall_seconds"]["value"])
+
+    def test_boundaries_and_owned_child_accounting(self):
+        trial = self.prepare()
+        value = self.passed(trial)
+        child = next(c for c in trial.state["children"] if c["identity"] == trial.state["application_identity"])
+        boundaries = value["boundaries"]
+        ordered = [child["launch_monotonic"], *[boundaries[k] for k in
+                   ("launcher_start", "profiler_enable", "profiler_disable", "serialization_start", "serialization_end")],
+                   child["exit_monotonic"]]
+        self.assertEqual(ordered, sorted(ordered))
+        self.assertEqual(value["child_completion_monotonic"], child["exit_monotonic"])
+        self.assertEqual(child["reap_count"], 1)
+        self.assertEqual(child["exit_status"], 0)
+        self.assertEqual(value["process_identity"], child["identity"])
+        resources = trial.state["measurements"]["application"]
+        self.assertEqual(resources["user_seconds"], child["resources"]["user_seconds"])
+        self.assertEqual(resources["wall_seconds"]["population"]["completion"],
+                         "instrumented_application_completion")
+
+    def test_diagnostic_configuration_immutable_across_reload_and_runtime(self):
+        trial = self.prepare()
+        loaded = runner.Trial.load(trial.artifacts)
+        self.assertEqual(loaded.state["diagnostic"]["configuration"]["mode"], "python-cpu")
+        loaded.state["diagnostic"]["configuration"]["mode"] = None
+        self.assertFalse(loaded.execute())
+        self.assertIn("diagnostic", loaded.state["error"])
+        trial = self.prepare()
+        state = json.loads((trial.artifacts / "state.json").read_text())
+        state["diagnostic"]["configuration"]["profile_max_bytes"] += 1
+        (trial.artifacts / "state.json").write_text(json.dumps(state))
+        with self.assertRaises(runner.TrialError):
+            runner.Trial.load(trial.artifacts)
+
+    def test_invalid_modes_rejected_before_workspace_allocation(self):
+        before = set(self.parent.iterdir())
+        for mode in ("wall", "perf", "", True, {}, 1):
+            with self.subTest(mode=mode), self.assertRaises(runner.TrialError):
+                self.prepare(diagnostic=mode)
+        self.assertEqual(set(self.parent.iterdir()), before)
+
+    def test_cli_opt_in_only_on_measurement_preparation(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            for command in ("prepare", "self-test", "measure-self-test"):
+                with self.subTest(command=command), self.assertRaises(SystemExit) as e:
+                    runner.main([command, "--parent", str(self.parent), "--diagnostic", "python-cpu"])
+                self.assertEqual(e.exception.code, 2)
+        clock = FakeClock()
+        processes, mounts, host = MeasurementProcesses(clock), MeasurementMounts(), MeasurementHost(self.references)
+        with mock.patch.object(runner, "AccountingProcesses", return_value=processes), \
+                mock.patch.object(runner, "MeasurementMounts", return_value=mounts), \
+                mock.patch.object(runner, "MeasurementHost", return_value=host), \
+                mock.patch.object(runner, "Clock", return_value=clock), contextlib.redirect_stdout(io.StringIO()) as out:
+            result = runner.main(["measure-prepare", "--parent", str(self.parent),
+                "--canonical-parent", str(self.references), "--backend", "ext4", "--expected-device", "259:7",
+                "--records", "2", "--diagnostic", "python-cpu"])
+        self.assertEqual(result, 0)
+        state = json.loads((Path(json.loads(out.getvalue())["artifacts"]) / "state.json").read_text())
+        self.assertEqual(state["diagnostic"]["configuration"]["mode"], "python-cpu")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as e:
+            runner.main(["measure-prepare", "--parent", str(self.parent), "--canonical-parent", str(self.references),
+                         "--backend", "ext4", "--expected-device", "259:7", "--diagnostic", "wall"])
+        self.assertEqual(e.exception.code, 2)
+
+    def test_profile_overwrite_and_symlink_refused_without_touching_target(self):
+        for which in (0, 1):
+            for symlink in (False, True):
+                with self.subTest(which=which, symlink=symlink):
+                    trial = self.prepare()
+                    target = trial.artifacts / "unrelated-preserve"
+                    target.write_bytes(b"preserve")
+                    path = self.profile_paths(trial)[which]
+                    if symlink:
+                        path.symlink_to(target)
+                    else:
+                        path.write_bytes(b"preserve")
+                    self.assertFalse(trial.execute())
+                    self.assertEqual(target.read_bytes(), b"preserve")
+                    self.assertEqual(path.read_bytes(), b"preserve")
+                    self.assertFalse((trial.root / "output.csv").exists())
+                    self.assertTrue(trial.workspace.exists())
+                    self.assertFalse(trial.state["diagnostic"]["profile"]["valid"])
+
+    def test_missing_corrupt_partial_oversized_and_identity_substitution_refused(self):
+        mutations = ("missing", "corrupt", "partial", "oversized", "same_bytes_new_inode", "hardlink")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                trial = self.prepare()
+                self.passed(trial)
+                raw, _ = self.profile_paths(trial)
+                if mutation == "missing":
+                    raw.unlink()
+                elif mutation == "corrupt":
+                    raw.write_bytes(b"not a marshal profile")
+                elif mutation == "partial":
+                    raw.write_bytes(raw.read_bytes()[:12])
+                elif mutation == "oversized":
+                    with raw.open("ab") as f:
+                        f.truncate(16 * 1024**2 + 1)  # Sparse file; no large allocation.
+                elif mutation == "same_bytes_new_inode":
+                    old = raw.with_suffix(".saved")
+                    raw.rename(old)
+                    raw.write_bytes(old.read_bytes())
+                else:
+                    raw.with_suffix(".alias").hardlink_to(raw)
+                self.assertFalse(trial.verify())
+                self.assertFalse(trial.state["diagnostic"]["profile"]["valid"])
+                with self.assertRaises(runner.TrialError):
+                    trial.cleanup()
+                self.assertTrue(trial.workspace.exists())
+
+    def test_invalid_receipt_timer_identity_and_boundaries_refused(self):
+        for field in ("timer", "process_identity", "boundaries", "argv", "sys_path_0", "cwd"):
+            with self.subTest(field=field):
+                trial = self.prepare()
+                original = trial.complete_application
+                def tamper():
+                    _, receipt = self.profile_paths(trial)
+                    value = json.loads(receipt.read_text())
+                    if field == "timer":
+                        value[field] = "time.perf_counter"
+                    elif field == "process_identity":
+                        value[field]["start_ticks"] = "stale"
+                    elif field == "boundaries":
+                        value[field]["profiler_disable"] = value[field]["profiler_enable"] - 1
+                    elif field == "argv":
+                        value[field][-1] = "/unrelated-root"
+                    else:
+                        value[field] = "/unrelated-modules"
+                    receipt.write_text(json.dumps(value))
+                    return original()
+                trial.complete_application = tamper
+                self.assertFalse(trial.execute())
+                self.assertFalse(trial.state["diagnostic"]["profile"]["valid"])
+
+    def test_successful_cleanup_retains_profile_and_canonical(self):
+        trial = self.prepare()
+        value = self.passed(trial)
+        before = trial.canonical_snapshot()
+        raw, receipt = self.profile_paths(trial)
+        runner.Trial.load(trial.artifacts).cleanup()
+        self.assertFalse(trial.workspace.exists())
+        self.assertTrue(raw.is_file() and receipt.is_file())
+        self.assertEqual(hashlib.sha256(raw.read_bytes()).hexdigest(), value["sha256"])
+        self.assertEqual(trial.canonical_snapshot(), before)
+
+    def test_existing_output_failure_and_nonzero_exit_retain_profile(self):
+        trial = self.prepare()
+        original = trial.io
+        def existing(kind):
+            value = original(kind)
+            if kind == "stage":
+                (trial.root / "output.csv").write_bytes(b"preserve existing output")
+            return value
+        trial.io = existing
+        self.assertFalse(trial.execute())
+        self.assertIn("application exit", trial.state["error"])
+        self.assertEqual((trial.root / "output.csv").read_bytes(), b"preserve existing output")
+        self.assertTrue(self.profile_paths(trial)[0].is_file())
+        self.assertEqual(trial.state["measurements"]["application"]["exit_status"]["value"], 1)
+        self.assertEqual(trial.state["diagnostic"]["profile"]["script_exit_status"], 1)
+
+    def launcher(self, text):
+        """Owned tiny __main__ fixture for launcher contracts, never an app replacement in a trial."""
+        trial = self.prepare()
+        script = self.parent / ("launcher-case-" + trial.anchor["trial_id"] + ".py")
+        script.write_text(text, encoding="ascii")
+        anchor = json.loads(json.dumps(trial.anchor))
+        anchor["diagnostic_application"] = {"path": str(script), "file": runner.profile_application_file(script)}
+        (trial.artifacts / "owner.json").write_text(json.dumps(anchor))
+        return trial, anchor, script
+
+    def invoke_launcher(self, trial, anchor, script):
+        return runner.python_cpu_profile(trial.artifacts, anchor, "actual offline execution", script, trial.root)
+
+    def test_launcher_preserves_main_argv_file_cwd_and_sibling_import(self):
+        (self.parent / "sibling.py").write_text("VALUE = 17\n")
+        trial, anchor, script = self.launcher(
+            "import json,sys,os,sibling\n"
+            "print(json.dumps([__name__,__file__,sys.argv,os.getcwd(),sys.path[0],sibling.VALUE]))\n")
+        argv, path, cwd = sys.argv, sys.path[:], os.getcwd()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.invoke_launcher(trial, anchor, script)
+        self.assertEqual(json.loads(out.getvalue()), ["__main__", str(script), [str(script), str(trial.root)],
+                                                    cwd, str(script.parent), 17])
+        self.assertIs(sys.argv, argv)
+        self.assertEqual(sys.path, path)
+        self.assertEqual(os.getcwd(), cwd)
+
+    def test_cpu_timer_and_disabled_serialization_are_real(self):
+        trial, anchor, script = self.launcher("sum(range(500))\n")
+        constructor, dump = runner.cProfile.Profile, runner.marshal.dump
+        timers, enabled_at_write = [], []
+        def construct(*args, **kwargs):
+            timers.append(kwargs.get("timer"))
+            return constructor(*args, **kwargs)
+        def serialize(*args):
+            enabled_at_write.append(sys.getprofile())
+            return dump(*args)
+        with mock.patch.object(runner.cProfile, "Profile", side_effect=construct), \
+                mock.patch.object(runner.marshal, "dump", side_effect=serialize):
+            self.invoke_launcher(trial, anchor, script)
+        self.assertEqual(timers, [runner.time.process_time])
+        self.assertEqual(enabled_at_write, [None])
+        self.assertGreater(pstats.Stats(str(self.profile_paths(trial)[0])).total_calls, 0)
+
+    def test_exception_and_systemexit_preserve_profile_and_exit(self):
+        for text, exception, code in (("raise RuntimeError('literal failure')\n", RuntimeError, 1),
+                                      ("raise SystemExit(7)\n", SystemExit, 7),
+                                      ("raise SystemExit(0)\n", SystemExit, 0)):
+            with self.subTest(code=code):
+                trial, anchor, script = self.launcher(text)
+                with self.assertRaises(exception) as e:
+                    self.invoke_launcher(trial, anchor, script)
+                if exception is SystemExit:
+                    self.assertEqual(e.exception.code, code)
+                raw, receipt = self.profile_paths(trial)
+                value = json.loads(receipt.read_text())
+                self.assertTrue(value["valid"])
+                self.assertEqual(value["script_exit_status"], code)
+                self.assertGreater(pstats.Stats(str(raw)).total_calls, 0)
+                self.assertLessEqual(value["boundaries"]["profiler_disable"], value["boundaries"]["serialization_start"])
+
+    def test_serialization_error_invalidates_trial_with_correct_output(self):
+        trial = self.prepare()
+        code = runner.PYTHON_PROFILE_CODE.replace("m.python_cpu_profile(",
+            "m.marshal.dump=lambda *a: (_ for _ in ()).throw(OSError('injected serialization failure')); m.python_cpu_profile(")
+        with mock.patch.object(runner, "PYTHON_PROFILE_CODE", code):
+            self.assertFalse(trial.execute())
+        self.assertEqual((trial.root / "output.csv").read_bytes(), (trial.canonical_directory / "expected.csv").read_bytes())
+        raw, receipt = self.profile_paths(trial)
+        value = json.loads(receipt.read_text())
+        self.assertFalse(value["valid"])
+        self.assertIn("injected serialization", value["serialization_error"])
+        self.assertEqual(value["byte_count"], raw.stat().st_size)
+        self.assertEqual(value["sha256"], hashlib.sha256(raw.read_bytes()).hexdigest())
+        self.assertTrue(raw.exists())
+        self.assertFalse(trial.state["diagnostic"]["profile"]["valid"])
+        self.assertEqual(trial.state["measurements"]["application"]["exit_status"]["value"], 1)
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+
+    def test_write_time_bound_retains_partial_and_does_not_exceed_limit(self):
+        path = self.parent / "bounded.prof"
+        parent = os.open(self.parent, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            writer = runner.BoundedProfileWriter(fd, parent, path.name, 8)
+            writer.write(b"12345")
+            with self.assertRaises(runner.TrialError):
+                writer.write(b"6789")
+            self.assertEqual(path.read_bytes(), b"12345")
+            self.assertLessEqual(path.stat().st_size, 8)
+        finally:
+            os.close(fd)
+            os.close(parent)
+
+    def test_missing_profile_cannot_pass_even_with_exact_output(self):
+        for which in (0, 1):
+            with self.subTest(which=which):
+                trial = self.prepare()
+                original = trial.complete_application
+                def missing():
+                    self.profile_paths(trial)[which].unlink()
+                    return original()
+                trial.complete_application = missing
+                self.assertFalse(trial.execute())
+                self.assertFalse(trial.state["diagnostic"]["profile"]["valid"])
+                self.assertEqual((trial.root / "output.csv").read_bytes(), (trial.canonical_directory / "expected.csv").read_bytes())
+
+    def test_nonobject_boundary_receipts_fail_closed_and_retain_evidence(self):
+        for malformed in (None, [], "invalid"):
+            for after_pass in (False, True):
+                with self.subTest(malformed=malformed, after_pass=after_pass):
+                    trial = self.prepare()
+                    def corrupt():
+                        _, receipt = self.profile_paths(trial)
+                        value = json.loads(receipt.read_text())
+                        value["boundaries"] = malformed
+                        receipt.write_text(json.dumps(value))
+                    if after_pass:
+                        self.passed(trial)
+                        corrupt()
+                        result = trial.verify()
+                    else:
+                        original = trial.complete_application
+                        def corrupted_completion():
+                            corrupt()
+                            return original()
+                        trial.complete_application = corrupted_completion
+                        result = trial.execute()
+                    self.assertFalse(result)
+                    self.assertEqual(trial.state["outcome"], "failed")
+                    self.assertFalse(trial.state["diagnostic"]["profile"]["valid"])
+                    self.assertIn("diagnostic", trial.state["error"])
+                    self.assertTrue(trial.artifacts.exists() and trial.workspace.exists())
+                    with self.assertRaises(runner.TrialError):
+                        trial.cleanup()
+
+    def test_recursive_json_receipt_failure_invalidates_trial(self):
+        trial = self.prepare()
+        original = trial.complete_application
+        def recursive_receipt():
+            raw_loads = runner.json.loads
+            def loads(value, *args, **kwargs):
+                # Leave owner/state/canonical decoding real; inject only the receipt failure.
+                if isinstance(value, bytes) and b'"profiler_enable"' in value:
+                    raise RecursionError("injected recursive diagnostic JSON")
+                return raw_loads(value, *args, **kwargs)
+            with mock.patch.object(runner.json, "loads", side_effect=loads):
+                return original()
+        trial.complete_application = recursive_receipt
+        self.assertFalse(trial.execute())
+        self.assertEqual(trial.state["outcome"], "failed")
+        self.assertFalse(trial.state["diagnostic"]["profile"]["valid"])
+        self.assertIn("recursive diagnostic JSON", trial.state["error"])
+        self.assertTrue(trial.workspace.exists())
+
+    def test_timeout_uses_single_reaper_retains_evidence_and_blocks_cleanup(self):
+        trial = self.prepare(application_seconds=.3)
+        code = runner.PYTHON_PROFILE_CODE.replace("m.python_cpu_profile(",
+                                                "import time; time.sleep(10); m.python_cpu_profile(")
+        with mock.patch.object(runner, "PYTHON_PROFILE_CODE", code):
+            self.assertFalse(trial.execute())
+        self.assertIn("timeout", trial.state["error"])
+        child = next(c for c in trial.state["children"] if c["identity"] == trial.state["application_identity"])
+        self.assertEqual(child["reap_count"], 1)
+        self.assertTrue(child["signals"])
+        self.assertEqual(child["resources"]["user_seconds"]["population"]["owned_child"], child["identity"])
+        with self.assertRaises(runner.TrialError):
+            trial.cleanup()
+        self.assertTrue(trial.workspace.exists() and trial.artifacts.exists())
+
+    def test_artifact_directory_substitution_and_source_identity_refused(self):
+        trial = self.prepare()
+        anchor = json.loads(json.dumps(trial.anchor))
+        anchor["identities"]["artifacts"]["inode"] += 1
+        with self.assertRaises(runner.TrialError):
+            self.invoke_launcher(trial, anchor, Path(application.__file__))
+        anchor = json.loads(json.dumps(trial.anchor))
+        anchor["diagnostic_application"]["file"]["sha256"] = "0" * 64
+        with self.assertRaises(runner.TrialError):
+            self.invoke_launcher(trial, anchor, Path(application.__file__))
+        self.assertEqual(list(trial.artifacts.glob("python-cpu-*")), [])
+
+    def test_legacy_unprofiled_state_loads_without_diagnostic_migration(self):
+        trial = self.prepare(diagnostic=None)
+        trial.anchor.pop("diagnostic")
+        trial.state.pop("diagnostic")
+        trial.state.pop("measurement_population")
+        trial.state.pop("baseline_eligible")
+        for p in (trial.artifacts, trial.workspace, trial.canonical_directory):
+            (p / "owner.json").write_text(json.dumps(trial.anchor))
+        trial.save()
+        loaded = runner.Trial.load(trial.artifacts)
+        self.assertTrue(loaded.execute(), loaded.state["error"])
+        self.assertNotIn("diagnostic", loaded.state)
+
+    def test_population_and_profile_state_corruption_refused_on_reload(self):
+        for field in ("population", "profile"):
+            with self.subTest(field=field):
+                trial = self.prepare(diagnostic=None)
+                state = json.loads((trial.artifacts / "state.json").read_text())
+                if field == "population":
+                    state["measurement_population"] = "arbitrary population"
+                else:
+                    state["diagnostic"]["profile"] = None
+                (trial.artifacts / "state.json").write_text(json.dumps(state))
+                with self.assertRaises(runner.TrialError):
+                    runner.Trial.load(trial.artifacts)
+
+    def test_explicit_null_diagnostic_anchor_is_not_legacy_absence(self):
+        trial = self.prepare(diagnostic=None)
+        trial.anchor["diagnostic"] = None
+        trial.state.pop("diagnostic")
+        for root in (trial.artifacts, trial.workspace, trial.canonical_directory):
+            (root / "owner.json").write_text(json.dumps(trial.anchor))
+        trial.save()
+        with self.assertRaises(runner.TrialError):
+            runner.Trial.load(trial.artifacts)
+
+    def test_post_serialization_inode_substitution_invalidates_profile(self):
+        trial, anchor, script = self.launcher("sum(range(100))\n")
+        dump = runner.marshal.dump
+        raw, receipt = self.profile_paths(trial)
+        def substitute(*args):
+            dump(*args)
+            saved = raw.with_suffix(".saved")
+            raw.rename(saved)
+            fd = os.open(raw, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, saved.read_bytes())
+            finally:
+                os.close(fd)
+        with mock.patch.object(runner.marshal, "dump", side_effect=substitute):
+            with self.assertRaises(runner.TrialError):
+                self.invoke_launcher(trial, anchor, script)
+        self.assertFalse(json.loads(receipt.read_text())["valid"])
+        self.assertTrue(raw.exists() and raw.with_suffix(".saved").exists())
+
+    def test_profiled_shared_trial_cleanup_preserves_campaign_references(self):
+        bundle = runner.CanonicalBundle.prepare(self.references, evidence_parent=self.parent,
+                                                records=12, seed=20261010)
+        self.assertEqual(bundle.state["outcome"], "ready", bundle.state["error"])
+        before = bundle.snapshot()
+        trial = runner.MeasurementTrial.prepare(self.parent, canonical_bundle=bundle.root,
+            campaign_id=bundle.owner["campaign_id"], backend="offline-check", records=12, diagnostic="python-cpu")
+        self.passed(trial)
+        runner.Trial.load(trial.artifacts).cleanup()
+        self.assertEqual(bundle.snapshot(), before)
+        self.assertTrue(bundle.artifacts.exists())
+        self.assertTrue(self.profile_paths(trial)[0].exists())
+        self.assertEqual(len(list(self.references.glob("m0-shared-canonical-*"))), 1)
+
+    def test_profiled_malformed_input_propagates_nonzero_application_exit(self):
+        trial = self.prepare()
+        original = trial.io
+        def corrupt(kind):
+            result = original(kind)
+            if kind == "stage":
+                (trial.root / "input.csv").write_bytes(b"incorrect header\n")
+            return result
+        trial.io = corrupt
+        self.assertFalse(trial.execute())
+        self.assertEqual(trial.state["measurements"]["application"]["exit_status"]["value"], 1)
+        self.assertEqual(trial.state["diagnostic"]["profile"]["script_exit_status"], 1)
+        self.assertEqual((trial.root / "output.csv").read_bytes(), b"")
+        self.assertTrue(trial.workspace.exists())
+
+    def test_mocked_ext4_and_myfs_profiles_keep_lifecycle_and_evidence_populations(self):
+        class ProfileProcesses(MeasurementProcesses):
+            def wait(self, identity, deadline):
+                entry = next(e for e in self.entries if e["identity"] == identity)
+                if runner.PYTHON_PROFILE_CODE not in entry["command"]:
+                    return super().wait(identity, deadline)
+                artifacts, anchor_json, evidence, script, root = entry["command"][-5:]
+                anchor = json.loads(anchor_json)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        runner.python_cpu_profile(Path(artifacts), anchor, evidence, Path(script), Path(root))
+                    except SystemExit as e:
+                        if e.code != 0:
+                            raise
+                receipt = Path(artifacts) / runner.profile_names(anchor["trial_id"])[1]
+                value = json.loads(receipt.read_text())
+                start = entry["launch_monotonic"]
+                value.update(process_identity=identity, boundaries=dict(zip(
+                    ("launcher_start", "profiler_enable", "profiler_disable", "serialization_start", "serialization_end"),
+                    (start+.1, start+.2, start+4, start+4.1, start+4.5))))
+                receipt.write_text(json.dumps(value))
+                self.clock.value += 5
+                entry.update(exit_status=0, exit_monotonic=self.clock.now(),
+                    resources=runner.resource_metrics(None, "mocked", identity, start, self.clock.now()))
+                self.reaps[identity["pid"]] = 1
+                self.on_change()
+                return 0
+        for backend in ("ext4", "myfs"):
+            with self.subTest(backend=backend):
+                clock = FakeClock()
+                processes, mounts = ProfileProcesses(clock), MeasurementMounts()
+                trial = runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.references,
+                    backend=backend, records=8, diagnostic="python-cpu", expected_device="259:7",
+                    daemon=Path(sys.executable).resolve(), build_provenance={"mocked": True},
+                    processes=processes, mounts=mounts, host=MeasurementHost(self.references), clock=clock)
+                self.passed(trial)
+                self.assertEqual(trial.state["diagnostic"]["profile"]["evidence"], "mocked")
+                wall = trial.state["measurements"]["application"]["wall_seconds"]
+                self.assertEqual(wall["value"], 5)
+                self.assertEqual(wall["evidence"], "mocked")
+                self.assertFalse(trial.state["baseline_eligible"])
+                self.assertEqual(mounts.events, ["mount", "stat-probe", "unmount"] * 3 if backend == "myfs" else [])
+                self.assertEqual(len(trial.state["measurements"]["daemon_lifecycles"]), 3 if backend == "myfs" else 0)
+                trial.cleanup()
+                self.assertTrue(self.profile_paths(trial)[0].exists())
 
 
 if __name__ == "__main__":

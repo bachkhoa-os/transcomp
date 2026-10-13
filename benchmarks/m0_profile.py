@@ -106,15 +106,41 @@ headroom remains 1 GiB + 64 MiB, and memory free headroom remains 2 GiB.
 Existing shared allocation is recorded separately and is already reflected
 in observed free space/MemAvailable. Backing headroom/model is unchanged.
 No automatic archive, reconstruction, repetitions or statistical reporting.
+
+Application CPU diagnostics (measurement preparation only):
+  measure-prepare ... --diagnostic python-cpu
+  measure-run ARTIFACT_DIRECTORY
+
+Default commands and smoke/OFFLINE self-test CLIs remain unprofiled. An explicit
+diagnostic is pinned in ownership metadata and excluded from baseline populations.
+The same owned Python child uses cProfile(timer=time.process_time) around
+runpy.run_path of the unchanged application, with its original argv, script
+directory at sys.path[0], __main__ behavior and unchanged cwd. Launcher imports
+are already loaded and runpy has its own loader frames: this is an instrumented
+invocation, not identical interpreter startup. CPU seconds combine user/system
+execution, not blocking time; C extensions expose call boundaries, not native
+internal stacks. Whole-child wait4 also includes launcher/startup/finalization.
+Serialization follows profiler disable, outside the profile but inside complete
+child wall time. Instrumented wall samples are labeled
+instrumented_application_completion. OFFLINE wall values remain unavailable.
+Raw pstats-compatible marshal data and a JSON receipt use exclusive, no-follow,
+private trial-specific files in persistent artifacts. Writes are strictly bounded
+to 16 MiB for raw data and 2 MiB for the receipt, within the 64 MiB trial budget.
+Serialization errors retain partial files and invalidate the trial. Identity/hash
+checks detect accidental changes, not malicious rewriting of all same-user state.
 """
 
 import argparse
+import cProfile
 import hashlib
+import io
 import json
 import math
+import marshal
 import os
 from pathlib import Path
 import re
+import runpy
 import selectors
 import shutil
 import signal
@@ -894,6 +920,305 @@ class Trial:
 MEASUREMENT_SCHEMA = "myfs-m0-measurement-v1"
 MEASUREMENT_MAX_RECORDS = 1048576
 EVIDENCE_BUDGET_BYTES = 64 * 1024**2
+PYTHON_PROFILE_SCHEMA = "myfs-m0-python-cpu-v1"
+PROFILE_MAX_BYTES = 16 * 1024**2
+
+
+def diagnostic_configuration(mode):
+    if mode is not None and (not isinstance(mode, str) or mode != "python-cpu"):
+        raise TrialError("invalid diagnostic; select python-cpu explicitly or leave unprofiled")
+    return {"schema": PYTHON_PROFILE_SCHEMA, "mode": mode,
+            "timer": "time.process_time" if mode else None,
+            "profile_max_bytes": PROFILE_MAX_BYTES if mode else None}
+
+
+def profile_names(trial_id):
+    if not re.fullmatch(r"[0-9a-f]{32}", trial_id):
+        raise TrialError("invalid diagnostic trial identity")
+    prefix = "python-cpu-" + trial_id
+    return prefix + ".prof", prefix + ".json"
+
+
+def profile_directory(artifacts, anchor):
+    artifacts = strict_path(artifacts)
+    if (artifacts != Path(anchor["parent"]) / ("m0-artifacts-" + anchor["trial_id"])
+            or directory_identity(artifacts.parent) != anchor["parent_identity"]
+            or read_json(artifacts / "owner.json") != anchor
+            or stat.S_IMODE(artifacts.stat().st_mode) != 0o700):
+        raise TrialError("diagnostic artifact ownership/path mismatch")
+    fd = os.open(artifacts, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        profile_directory_check(artifacts, fd, anchor)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def profile_directory_check(artifacts, fd, anchor):
+    info = os.fstat(fd)
+    identity = {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid}
+    if identity != anchor["identities"]["artifacts"] or directory_identity(strict_path(artifacts)) != identity:
+        raise TrialError("diagnostic artifact directory substituted")
+
+
+def profile_file_read(fd, name, maximum, guard, *, private=True):
+    """Pinned no-follow read; strict size, private owner and no hard-link aliases."""
+    child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    try:
+        before = os.fstat(child)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or (private and stat.S_IMODE(before.st_mode) != 0o600) or before.st_nlink != 1
+                or before.st_size > maximum):
+            raise TrialError("unsafe/oversized diagnostic artifact")
+        chunks, size = [], 0
+        while True:
+            guard()
+            chunk = os.read(child, min(65536, maximum + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > maximum:
+                raise TrialError("diagnostic artifact grew beyond limit")
+        after, named = os.fstat(child), os.stat(name, dir_fd=fd, follow_symlinks=False)
+        def stable(info):
+            return (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_nlink,
+                    info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if stable(before) != stable(after) or stable(after) != stable(named) or size != after.st_size:
+            raise TrialError("diagnostic artifact identity/content changed during read")
+        data = b"".join(chunks)
+        return data, {"identity": {"device": after.st_dev, "inode": after.st_ino, "uid": after.st_uid},
+                      "sha256": hashlib.sha256(data).hexdigest(), "byte_count": size,
+                      "mtime_ns": after.st_mtime_ns, "ctime_ns": after.st_ctime_ns}
+    finally:
+        os.close(child)
+
+
+def profile_application_file(script):
+    # Repository source can be group-writable (the current checkout is 0664).
+    # Pin its identity/content; do not apply campaign-private permission rules.
+    script = strict_path(script)
+    fd = os.open(script.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        _, record = profile_file_read(fd, script.name, 2 * 1024**2, lambda: None, private=False)
+        return record
+    finally:
+        os.close(fd)
+
+
+class BoundedProfileWriter:
+    """Write-time byte ceiling; retain partial data on overflow or I/O failure."""
+
+    def __init__(self, fd, parent, name, maximum):
+        self.fd, self.parent, self.name, self.maximum = fd, parent, name, maximum
+        self.written = 0
+        self.identity = os.fstat(fd)
+
+    def write(self, data):
+        if len(data) > self.maximum - self.written:
+            raise TrialError("diagnostic serialization exceeds write-time size limit")
+        current = os.stat(self.name, dir_fd=self.parent, follow_symlinks=False)
+        if ((current.st_dev, current.st_ino) != (self.identity.st_dev, self.identity.st_ino)
+                or current.st_uid != os.getuid() or current.st_nlink != 1
+                or not stat.S_ISREG(current.st_mode) or stat.S_IMODE(current.st_mode) != 0o600):
+            raise TrialError("diagnostic output identity substituted")
+        offset = 0
+        while offset < len(data):
+            n = os.write(self.fd, data[offset:])
+            if n <= 0:
+                raise OSError("diagnostic short write")
+            offset += n
+            self.written += n
+        return offset
+
+
+def profile_statistics(stats, guard=lambda: None):
+    """Validate the raw pstats format before accepting any call/CPU summary."""
+    if not isinstance(stats, dict) or not stats or len(stats) > 65536:
+        raise TrialError("invalid/empty diagnostic function statistics")
+    def function(key):
+        return (isinstance(key, tuple) and len(key) == 3 and isinstance(key[0], str)
+                and type(key[1]) is int and key[1] >= 0 and isinstance(key[2], str))
+    def numbers(values):
+        return (len(values) == 4 and all(type(n) is int and n >= 0 for n in values[:2])
+                and all(type(n) in (int, float) and math.isfinite(n) and n >= 0 for n in values[2:]))
+    for key, value in stats.items():
+        guard()
+        if (not function(key) or not isinstance(value, tuple) or len(value) != 5
+                or not numbers(value[:4]) or value[0] > value[1] or not isinstance(value[4], dict)):
+            raise TrialError("corrupt diagnostic function statistics")
+        for caller, counters in value[4].items():
+            guard()
+            if not function(caller) or not isinstance(counters, tuple) or not numbers(counters):
+                raise TrialError("corrupt diagnostic caller statistics")
+    calls = sum(value[1] for value in stats.values())
+    if calls <= 0:
+        raise TrialError("diagnostic profile has no calls")
+    return {"function_count": len(stats), "total_calls": calls,
+            "primitive_calls": sum(value[0] for value in stats.values()),
+            "self_cpu_seconds": sum(value[2] for value in stats.values()),
+            "self_cpu_reason": "sum of non-cumulative profiler self CPU; not complete wait4 CPU or blocked time"}
+
+
+def python_cpu_profile(artifacts, anchor, evidence, script, root):
+    """Child-only launcher: one process, CPU clock, original script via runpy.
+
+    No waiter or backend logic. Exceptions/SystemExit propagate after disabling
+    and publishing diagnostics; serialization failure makes successful scripts
+    exit nonzero. No output path is accepted from persisted profile receipts.
+    """
+    launcher_start = time.monotonic()
+    config = diagnostic_configuration("python-cpu")
+    if anchor.get("diagnostic") != config:
+        raise TrialError("diagnostic launcher configuration mismatch")
+    artifacts, script, root = Path(artifacts), strict_path(script), Path(root)
+    application_record = {"path": str(script), "file": profile_application_file(script)}
+    if (application_record != anchor.get("diagnostic_application")
+            or root != Path(anchor["parent"]) / ("m0-work-" + anchor["trial_id"]) / "application"):
+        raise TrialError("diagnostic application script/root mismatch")
+    directory = profile_directory(artifacts, anchor)
+    raw_name, receipt_name = profile_names(anchor["trial_id"])
+    raw_fd = receipt_fd = None
+    error = serialization_error = None
+    report = {"schema": PYTHON_PROFILE_SCHEMA, "trial_id": anchor["trial_id"],
+              "mode": "python-cpu", "timer": "time.process_time", "unit": "CPU seconds (user + system)",
+              "boundary_clock": "time.monotonic", "boundary_unit": "seconds",
+              "evidence": evidence, "process_identity": process_identity(os.getpid()),
+              "application": application_record, "argv": [str(script), str(root)], "cwd": os.getcwd(),
+              "sys_path_0": str(script.parent), "valid": False, "reason": "profile not serialized",
+              "sha256": None, "byte_count": None,
+              "script_exit_status": None, "script_error": None, "serialization_error": None,
+              "serialization_scope": "profiler finalization, raw marshal write and hash; JSON receipt publication follows",
+              "boundaries": {"launcher_start": launcher_start, "profiler_enable": None,
+                  "profiler_disable": None, "serialization_start": None, "serialization_end": None}}
+    try:
+        for name in (raw_name, receipt_name):
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise TrialError("existing diagnostic artifact; refusing overwrite")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        raw_fd = os.open(raw_name, flags, 0o600, dir_fd=directory)
+        created_raw = os.fstat(raw_fd)
+        receipt_fd = os.open(receipt_name, flags, 0o600, dir_fd=directory)
+        old_argv, old_path = sys.argv, sys.path[:]
+        profiler = cProfile.Profile(timer=time.process_time)
+        try:
+            sys.argv = [str(script), str(root)]
+            sys.path[0] = str(script.parent)
+            report["boundaries"]["profiler_enable"] = time.monotonic()
+            profiler.enable()
+            try:
+                runpy.run_path(str(script), run_name="__main__")
+            except BaseException as caught:
+                error = caught
+            finally:
+                profiler.disable()
+                report["boundaries"]["profiler_disable"] = time.monotonic()
+        finally:
+            sys.argv, sys.path[:] = old_argv, old_path
+        if isinstance(error, SystemExit):
+            code = error.code
+            report["script_exit_status"] = 0 if code is None else code % 256 if isinstance(code, int) else 1
+        else:
+            report["script_exit_status"] = 1 if error else 0
+        report["script_error"] = repr(error)[:4096] if error and report["script_exit_status"] != 0 else None
+        report["boundaries"]["serialization_start"] = time.monotonic()
+        try:
+            profiler.create_stats()  # Already disabled; cProfile preserves pstats caller data.
+            report.update(profile_statistics(profiler.stats))
+            marshal.dump(profiler.stats, BoundedProfileWriter(raw_fd, directory, raw_name, config["profile_max_bytes"]))
+            _, raw_record = profile_file_read(directory, raw_name, config["profile_max_bytes"], lambda: None)
+            current_raw = os.fstat(raw_fd)
+            if (raw_record["identity"] != {"device": created_raw.st_dev, "inode": created_raw.st_ino, "uid": created_raw.st_uid}
+                    or current_raw.st_nlink != 1 or raw_record["byte_count"] != current_raw.st_size
+                    or raw_record["mtime_ns"] != current_raw.st_mtime_ns
+                    or raw_record["ctime_ns"] != current_raw.st_ctime_ns):
+                raise TrialError("diagnostic raw output substituted after serialization")
+            report.update(raw_record, valid=True, reason=None)
+        except Exception as caught:
+            serialization_error = caught
+            report.update(valid=False, reason="profile serialization failed", serialization_error=str(caught)[:4096])
+            try:
+                _, raw_record = profile_file_read(directory, raw_name, config["profile_max_bytes"], lambda: None)
+                report.update(raw_record)  # Actual partial bytes/hash, never an empty valid fallback.
+            except Exception as observation_error:
+                report["raw_observation_error"] = str(observation_error)[:4096]
+        finally:
+            report["boundaries"]["serialization_end"] = time.monotonic()
+        profile_directory_check(artifacts, directory, anchor)
+        info = os.fstat(receipt_fd)
+        report["receipt_identity"] = {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid}
+        payload = (json.dumps(report, sort_keys=True, indent=2) + "\n").encode("ascii")
+        BoundedProfileWriter(receipt_fd, directory, receipt_name, 2 * 1024**2).write(payload)
+        if serialization_error is not None and report["script_exit_status"] == 0:
+            raise TrialError("diagnostic serialization failed") from serialization_error
+        if error is not None:
+            raise error
+    finally:
+        for fd in (raw_fd, receipt_fd, directory):
+            if fd is not None:
+                os.close(fd)
+
+
+PYTHON_PROFILE_CODE = (
+    "import json,sys; from pathlib import Path; sys.path[0]=sys.argv[1]; import m0_profile as m; "
+    "m.python_cpu_profile(Path(sys.argv[2]),json.loads(sys.argv[3]),sys.argv[4],Path(sys.argv[5]),Path(sys.argv[6]))"
+)
+
+
+def read_python_profile(artifacts, anchor, evidence, child, guard, previous=None):
+    """Require complete matching evidence from this owned child, never empty fallback."""
+    directory = profile_directory(artifacts, anchor)
+    raw_name, receipt_name = profile_names(anchor["trial_id"])
+    try:
+        data, receipt = profile_file_read(directory, receipt_name, 2 * 1024**2, guard)
+        report = json.loads(data)
+        if (not isinstance(report, dict) or report.get("schema") != PYTHON_PROFILE_SCHEMA
+                or report.get("trial_id") != anchor["trial_id"] or report.get("mode") != "python-cpu"
+                or report.get("timer") != "time.process_time" or report.get("unit") != "CPU seconds (user + system)"
+                or report.get("boundary_clock") != "time.monotonic" or report.get("boundary_unit") != "seconds"
+                or report.get("evidence") != evidence or report.get("process_identity") != child["identity"]
+                or report.get("application") != anchor["diagnostic_application"]
+                or report.get("argv") != [anchor["diagnostic_application"]["path"],
+                    str(Path(anchor["parent"]) / ("m0-work-" + anchor["trial_id"]) / "application")]
+                or report.get("sys_path_0") != str(Path(anchor["diagnostic_application"]["path"]).parent)
+                or report.get("cwd") != child.get("diagnostic_cwd")
+                or report.get("receipt_identity") != receipt["identity"]):
+            raise TrialError("diagnostic receipt configuration/identity mismatch")
+        if report.get("valid") is not True:
+            raise TrialError("diagnostic serialization invalid: " + str(report.get("serialization_error") or report.get("reason")))
+        bounds = report.get("boundaries", {})
+        if not isinstance(bounds, dict):
+            raise TrialError("diagnostic boundaries must be an object")
+        times = [child["launch_monotonic"], *[bounds.get(n) for n in
+                 ("launcher_start", "profiler_enable", "profiler_disable", "serialization_start", "serialization_end")],
+                 child["exit_monotonic"]]
+        if (any(type(t) not in (int, float) or not math.isfinite(t) for t in times)
+                or times != sorted(times) or report.get("script_exit_status") != child["exit_status"]):
+            raise TrialError("diagnostic timing/exit evidence mismatch")
+        blob, raw = profile_file_read(directory, raw_name, anchor["diagnostic"]["profile_max_bytes"], guard)
+        if any(report.get(k) != v for k, v in raw.items()):
+            raise TrialError("diagnostic profile identity/hash mismatch")
+        source = io.BytesIO(blob)
+        statistics = profile_statistics(marshal.load(source), guard)
+        if source.read(1) or any(report.get(k) != v for k, v in statistics.items()):
+            raise TrialError("diagnostic statistics mismatch/trailing bytes")
+        value = dict(report, artifact=str(artifacts / raw_name), receipt=str(artifacts / receipt_name),
+                     receipt_record=receipt, child_completion_monotonic=child["exit_monotonic"],
+                     population="instrumented script invocation including runpy loader; serialization excluded",
+                     limitation="CPU clock combines user/system; C-call boundaries are not native stacks; not blocked time or complete wait4 CPU")
+        if previous is not None and value != previous:
+            raise TrialError("diagnostic evidence changed after publication")
+        profile_directory_check(artifacts, directory, anchor)
+        guard()
+        return value
+    except (OSError, ValueError, TypeError, KeyError, EOFError, OverflowError, RecursionError) as error:
+        raise TrialError("missing/corrupt diagnostic evidence: " + str(error)) from error
+    finally:
+        os.close(directory)
 
 
 def measurement_limits(records, *, readiness_seconds=10, application_seconds=30,
@@ -1581,6 +1906,7 @@ class MeasurementTrial(Trial):
     schema = MEASUREMENT_SCHEMA
 
     def __init__(self, artifacts, anchor, state, processes=None, mounts=None, clock=None, host=None):
+        self.validate_diagnostic_configuration(anchor, state)
         limits = state["limits"]
         measurement_limits(limits["records"], overall_seconds=limits.get("overall_seconds", 900),
                            **{k + "_seconds": v for k, v in limits["deadlines_seconds"].items()})
@@ -1601,6 +1927,51 @@ class MeasurementTrial(Trial):
         self._io_kind = None
         self._io_end = None
 
+    @staticmethod
+    def validate_diagnostic_configuration(anchor, state):
+        # Legacy states without either field remain unprofiled; no migration writes.
+        if "diagnostic" not in anchor:
+            if "diagnostic" in state:
+                raise TrialError("diagnostic configuration missing from ownership anchor")
+            return
+        config = anchor["diagnostic"]
+        if (not isinstance(config, dict) or config != diagnostic_configuration(config.get("mode"))
+                or not isinstance(state.get("diagnostic"), dict)
+                or state["diagnostic"].get("configuration") != config
+                or not isinstance(state["diagnostic"].get("profile"), dict)
+                or state.get("measurement_population") != ("instrumented_application_completion" if config["mode"] else "buffered_application_completion")
+                or state.get("baseline_eligible") is not (not config["mode"] and state["backend"] != "offline-check")):
+            raise TrialError("inconsistent/changed diagnostic configuration or population")
+
+    @property
+    def python_diagnostic(self):
+        return self.anchor.get("diagnostic", {}).get("mode") == "python-cpu"
+
+    def collect_python_profile(self, child):
+        if not self.python_diagnostic:
+            return
+        previous = self.state["diagnostic"]["profile"]
+        deadline = self.deadline("io")
+        def guard():
+            self.check_budget()
+            if self.clock.now() >= deadline:
+                raise TrialError("diagnostic evidence validation timeout")
+        try:
+            value = read_python_profile(self.artifacts, self.anchor, self.state["evidence"], child, guard,
+                                        previous if previous.get("valid") is True else None)
+            self.state["diagnostic"]["profile"] = value
+        except TrialError as error:
+            self.state["diagnostic"]["profile"] = dict(previous, valid=False, reason=str(error))
+            self.save()
+            raise
+
+    def check_python_profile(self):
+        if self.python_diagnostic:
+            child = next((c for c in self.state["children"] if c.get("identity") == self.state.get("application_identity")), None)
+            if child is None or child.get("exit_status") != 0:
+                raise TrialError("diagnostic application normal exit unconfirmed")
+            self.collect_python_profile(child)
+
     @property
     def canonical_directory(self):
         shared = self.anchor.get("shared_canonical")
@@ -1617,7 +1988,8 @@ class MeasurementTrial(Trial):
                 processes=None, mounts=None, host=None, clock=None,
                 readiness_seconds=10, application_seconds=30, shutdown_seconds=30,
                 io_seconds=30, staging_seconds=None, verification_seconds=None,
-                overall_seconds=900, log_bytes=1024**2):
+                overall_seconds=900, log_bytes=1024**2, diagnostic=None):
+        diagnostic_config = diagnostic_configuration(diagnostic)
         config = measurement_limits(records, readiness_seconds=readiness_seconds,
             application_seconds=application_seconds, shutdown_seconds=shutdown_seconds,
             io_seconds=io_seconds, staging_seconds=staging_seconds,
@@ -1667,6 +2039,9 @@ class MeasurementTrial(Trial):
                       ("application", workspace / "application"), ("backing", workspace / "backing"))}}
         if shared:
             anchor["shared_canonical"] = shared.reference()
+        anchor["diagnostic"] = diagnostic_config
+        if diagnostic:
+            anchor["diagnostic_application"] = {"path": str(APPLICATION), "file": profile_application_file(APPLICATION)}
         for path in (artifacts, workspace, *((canonical,) if shared is None else ())):
             exclusive_json(path / "owner.json", anchor)
         state = {"schema": cls.schema, "trial_id": trial_id, "anchor": anchor, "backend": backend,
@@ -1699,6 +2074,15 @@ class MeasurementTrial(Trial):
                      ("native_hotspots", "no native profiling; counters cannot locate hotspots"),
                      ("compression_savings", "not calculated; filtering/schema changes are not compression"),
                      ("storage_peak", "no continuous accounting"), ("crash_durability", "not tested"))}}
+        state["diagnostic"] = {"configuration": dict(diagnostic_config),
+            "profile": {"valid": None, "reason": "application not executed" if diagnostic else "diagnostic not selected",
+                        "artifact": str(artifacts / profile_names(trial_id)[0]) if diagnostic else None,
+                        "sha256": None, "byte_count": None, "function_count": None, "total_calls": None}}
+        state["measurement_population"] = "instrumented_application_completion" if diagnostic else "buffered_application_completion"
+        state["baseline_eligible"] = not diagnostic and backend != "offline-check"
+        if diagnostic:
+            state["label"] = ("OFFLINE CPU diagnostic and correctness check" if backend == "offline-check"
+                              else "instrumented Python CPU diagnostic; excluded from baseline populations")
         state["canonical_reference"] = {"ownership": "campaign" if shared else "trial-retained",
             "campaign_id": campaign_id if shared else None,
             "receipt": str(shared.artifacts / "state.json") if shared else None,
@@ -1780,6 +2164,7 @@ class MeasurementTrial(Trial):
         return trial
 
     def check_paths(self, mounted=False):
+        self.validate_diagnostic_configuration(self.anchor, self.state)
         super().check_paths(mounted)
         parent = strict_path(self.anchor["canonical_parent"])
         if (directory_identity(parent) != self.anchor["canonical_parent_identity"]
@@ -2056,18 +2441,24 @@ class MeasurementTrial(Trial):
         self.check_canonical()
         self.check_device()
         self.resource_guard()
-        command = placed_command([sys.executable, "-B", str(APPLICATION), str(self.root)],
-                                 self.state["affinities"]["application"])
+        command = [sys.executable, "-B", str(APPLICATION), str(self.root)]
+        if self.python_diagnostic:
+            command = [sys.executable, "-B", "-c", PYTHON_PROFILE_CODE, str(Path(__file__).parent),
+                       str(self.artifacts), json.dumps(self.anchor), self.state["evidence"],
+                       str(APPLICATION), str(self.root)]
+        command = placed_command(command, self.state["affinities"]["application"])
         self.state["commands"].append(command)
         deadline = self.deadline("application")
         identity = self.processes.launch(command, self.artifacts / "application.log",
                                          self.state["limits"]["log_bytes_per_child"])
         self.state["application_identity"] = identity
+        if self.python_diagnostic:
+            next(e for e in self.processes.entries if e["identity"] == identity)["diagnostic_cwd"] = os.getcwd()
         try:
             self.state["application_affinity_observation"] = self.check_affinity(identity, "application", deadline)
             self.state["application_start_counters"] = self.processes.counters(identity)
             code = self.processes.wait(identity, deadline)
-        except TrialError:
+        except TrialError as failure:
             # A timed-out application may be terminated only through its owned
             # handle, never a persisted PID; the failed trial retains evidence.
             if self.processes.owned(identity) and self.processes.poll(identity) is None:
@@ -2078,14 +2469,20 @@ class MeasurementTrial(Trial):
                     pass  # No broad kill/recovery; unconfirmed child blocks cleanup.
             entry = next(e for e in self.processes.entries if e.get("identity") == identity)
             if entry.get("exit_monotonic") is not None:
-                self.complete_application()
+                try:
+                    self.complete_application()
+                except TrialError as profile_error:
+                    raise TrialError(f"{failure}; diagnostic invalid: {profile_error}") from profile_error
             raise
         self.state["application_result"] = {"exit_status": code, "identity": identity, "evidence": self.state["evidence"]}
         entry = next(e for e in self.processes.entries if e.get("identity") == identity)
         if entry["exit_monotonic"] >= deadline:
             raise TrialError("application timeout")
         if code != 0:
-            self.complete_application()
+            try:
+                self.complete_application()
+            except TrialError as error:
+                raise TrialError(f"application exit: {code}; diagnostic invalid: {error}") from error
             raise TrialError(f"application exit: {code}; partial output unvalidated")
         if self.daemon_identity is not None and (self.processes.poll(self.daemon_identity) is not None
                                                 or self.expected_mount() != self.mount_identity):
@@ -2104,6 +2501,10 @@ class MeasurementTrial(Trial):
         self.state["measurements"]["application"] = values
         self.state["application_end_counters"] = entry.get("endpoint_counters", {
             "value": None, "reason": "adapter did not capture pre-reap endpoint", "evidence": self.state["evidence"]})
+        if self.python_diagnostic:
+            values["wall_seconds"]["population"]["completion"] = "instrumented_application_completion"
+            values["wall_seconds"]["limitation"] = "whole child includes startup, launcher and profile serialization; excluded from baseline"
+            self.collect_python_profile(entry)
 
     def storage_accounting(self):
         self.no_mounts()
@@ -2219,6 +2620,12 @@ class MeasurementTrial(Trial):
         return self.state["outcome"] == "passed"
 
     def verify(self):
+        if self.python_diagnostic:
+            try:
+                self.check_python_profile()
+            except TrialError as error:
+                self.fail(error)
+                return False
         if self.state["backend"] not in ("ext4", "offline-check"):
             return super().verify()
         try:
@@ -2251,6 +2658,7 @@ class MeasurementTrial(Trial):
     def cleanup(self):
         self.check_device()
         self.confirm_exits()
+        self.check_python_profile()
         super().cleanup()
         self.state["retention"]["workspace"] = "guardedly removed"
         self.save()
@@ -2306,6 +2714,8 @@ def main(argv=None):
             command.add_argument("--build-provenance", type=Path)
             command.add_argument("--application-cpus", type=cpu_list)
             command.add_argument("--daemon-cpus", type=cpu_list)
+            command.add_argument("--diagnostic", choices=("python-cpu",), default=None,
+                                 help="opt-in application CPU profile; instrumented completion is excluded from baseline")
         for limit, default in (("readiness", 10), ("application", 30), ("shutdown", 30), ("io", 30)):
             command.add_argument(f"--{limit}-seconds", type=float, default=default)
         for name in ("staging", "verification"):
@@ -2333,7 +2743,8 @@ def main(argv=None):
                 records=args.records, seed=args.seed, expected_device=getattr(args, "expected_device", None),
                 daemon=getattr(args, "daemon", None), build_provenance=getattr(args, "build_provenance", None),
                 application_affinity=getattr(args, "application_cpus", None), daemon_affinity=getattr(args, "daemon_cpus", None),
-                materialize=args.materialize, **{name + "_seconds": getattr(args, name + "_seconds")
+                materialize=args.materialize, diagnostic=getattr(args, "diagnostic", None),
+                **{name + "_seconds": getattr(args, name + "_seconds")
                                                for name in ("readiness", "application", "shutdown", "io",
                                                             "staging", "verification", "overall")})
             passed = trial.state["outcome"] == "prepared"
