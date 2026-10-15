@@ -2239,5 +2239,622 @@ class PythonProfileTests(unittest.TestCase):
                 self.assertTrue(self.profile_paths(trial)[0].exists())
 
 
+class DaemonSyncTests(unittest.TestCase):
+    """No real mount: lifecycle adapters are mocked; artifact validation is real."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="m0-sync-runner-")
+        self.parent = Path(self.temp.name)
+        self.refs = self.parent / "refs"
+        self.refs.mkdir()
+        self.clock = FakeClock()
+        self.host = MeasurementHost(self.refs)
+        self.processes = MeasurementProcesses(self.clock)
+        self.mounts = MeasurementMounts()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def prepare(self, backend="myfs", **kwargs):
+        return runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.refs,
+            backend=backend, records=8, expected_device="259:7", processes=self.processes,
+            mounts=self.mounts, host=self.host, clock=self.clock,
+            daemon=Path(sys.executable).resolve(), build_provenance={"mocked": True}, **kwargs)
+
+    def test_bad_or_combined_modes_refused_before_allocation(self):
+        before = list(self.parent.iterdir())
+        for backend, mode, python in (("ext4", "sync-calls", None),
+                ("offline-check", "sync-calls", None), ("myfs", "invalid", None),
+                ("myfs", "sync-calls", "python-cpu")):
+            with self.subTest(backend=backend, mode=mode, python=python):
+                with self.assertRaises(runner.TrialError):
+                    self.prepare(backend, daemon_diagnostic=mode, diagnostic=python)
+        self.assertEqual(list(self.parent.iterdir()), before)
+
+    def test_unverified_diagnostic_binary_refused(self):
+        with self.assertRaisesRegex(runner.TrialError, "provenance"):
+            self.prepare(daemon_diagnostic="sync-calls")
+
+    def test_default_keeps_baseline_and_old_child_command(self):
+        trial = self.prepare("ext4")
+        self.assertTrue(trial.execute(), trial.state["error"])
+        self.assertTrue(trial.state["baseline_eligible"])
+        self.assertEqual(trial.state["measurement_population"], "buffered_application_completion")
+        self.assertIn([sys.executable, "-B", str(application.__file__), str(trial.root)], trial.state["commands"])
+
+    def test_fd_handoff_retains_direct_child_and_one_reaper(self):
+        import subprocess
+        clock = runner.Clock()
+        processes = runner.AccountingProcesses(clock)
+        path = self.parent / "child-artifact"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            code = "import os; os.write(int(os.environ['M0_TEST_FD']), str(os.getpid()).encode())"
+            env = dict(os.environ, M0_TEST_FD=str(fd))
+            identity = processes.launch([sys.executable, "-B", "-c", code],
+                self.parent / "child.log", 1024, pass_fds=(fd,), env=env)
+        finally:
+            os.close(fd)
+        with mock.patch.object(subprocess.Popen, "poll", side_effect=AssertionError("alternate reaper")), \
+                mock.patch.object(subprocess.Popen, "wait", side_effect=AssertionError("alternate reaper")):
+            self.assertEqual(processes.wait(identity, clock.now() + 5), 0)
+            self.assertEqual(processes.poll(identity), 0)
+        self.assertEqual(path.read_text(), str(identity["pid"]))
+        self.assertEqual(processes.entries[0]["reap_count"], 1)
+
+    @staticmethod
+    def trace(events=None):
+        header = {"kind": "header", "schema": "m0-daemon-sync-v1", "trial_id": "a"*32,
+            "token": "b"*32, "pid": 123, "clock": "CLOCK_MONOTONIC", "unit": "nanoseconds",
+            "module_base": 4096, "caller_source": "__builtin_return_address",
+            "max_bytes": 4194304, "max_events": 8192, "enabled_monotonic_ns": 1000000000}
+        if events is None:
+            events = [dict(kind="event", sequence=1, pid=123, tid=123, operation="fsync", fd=5,
+                caller=8192, entry_ns=2000000000, exit_ns=4000000000, return_value=0,
+                errno=0, clock_error=False),
+                dict(kind="event", sequence=2, pid=123, tid=124, operation="fdatasync", fd=6,
+                caller=8200, entry_ns=3000000000, exit_ns=5000000000, return_value=-1,
+                errno=9, clock_error=False)]
+        footer = {"kind": "footer", "observed": len(events), "written": len(events), "dropped": 0,
+            "inflight": 0, "clock_errors": 0, "recording_errors": 0, "overflow": False,
+            "complete": True, "finalized_monotonic_ns": 6000000000, "live_threads": 1,
+            "trial_id": "a"*32, "token": "b"*32, "pid": 123}
+        return [header, *events, footer]
+
+    def decode(self, rows):
+        raw = ("\n".join(json.dumps(r) for r in rows)+"\n").encode("ascii")
+        return runner.decode_sync_trace(raw, trial_id="a"*32, token="b"*32,
+            child={"identity": {"pid":123}, "launch_monotonic": .5, "exit_monotonic":7.,
+                "exit_status":0, "reap_count":1}, application_interval=[2.5,4.5],
+            shutdown_start=5.5, evidence="mocked")
+
+    def test_independent_elapsed_union_and_straddling_populations(self):
+        report = self.decode(self.trace())
+        self.assertEqual(report["summary"]["event_count"], 2)
+        self.assertEqual(report["summary"]["failed_count"], 1)
+        self.assertEqual(report["summary"]["summed_seconds"], 4.)
+        self.assertEqual(report["summary"]["union_seconds"], 3.)
+        self.assertEqual(report["application_overlap"]["union_seconds"], 2.)
+        self.assertEqual(report["boundary_straddling_count"], 2)
+        self.assertEqual(report["evidence"], "mocked")
+
+    def test_corrupt_partial_foreign_and_incomplete_events_rejected(self):
+        import copy
+        changes = [lambda r: r.pop(), lambda r: r[-1].update(complete=False),
+            lambda r: r[-1].update(dropped=1), lambda r: r[-1].update(written=1),
+            lambda r: r[-1].update(overflow=True), lambda r: r[-1].update(inflight=1),
+            lambda r: r[0].update(pid=999), lambda r: r[0].update(token="c"*32),
+            lambda r: r[1].update(exit_ns=100), lambda r: r[1].update(tid=0),
+            lambda r: r[2].update(sequence=1), lambda r: r[1].update(clock_error=True),
+            lambda r: r[1].update(operation="write"), lambda r: r[-1].update(pid=999),
+            lambda r: r[-1].pop("live_threads"), lambda r: r[0].update(module_base=0),
+            lambda r: r[1].update(sequence=True), lambda r: r[1].update(caller=1)]
+        for change in changes:
+            rows = copy.deepcopy(self.trace())
+            change(rows)
+            with self.subTest(rows=rows), self.assertRaises(runner.TrialError):
+                self.decode(rows)
+
+
+class SyncWrapperOfflineTests(unittest.TestCase):
+    """Actual tiny C helpers; never execute or mount myfs."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        import subprocess
+        cls.compiler = shutil.which("gcc")
+        if not cls.compiler:
+            raise unittest.SkipTest("gcc unavailable: offline wrapper build not verified")
+        cls.temp = tempfile.TemporaryDirectory(prefix="m0-sync-wrapper-tests-")
+        cls.directory = Path(cls.temp.name)
+        cls.component = BENCHMARKS / "m0_daemon_sync_diagnostic.c"
+        if not cls.component.exists():
+            raise AssertionError("sync diagnostic component has not been implemented")
+        cls.helper_source = cls.directory / "helper.c"
+        cls.helper_source.write_text(r'''
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+static void *worker(void *value) {
+    long count = (long)value;
+    for (long i=0; i<count; ++i) {
+        errno=0; if (fsync(-1)!=-1 || errno!=EBADF) abort();
+        errno=0; if (fdatasync(-1)!=-1 || errno!=EBADF) abort();
+    }
+    return NULL;
+}
+static void *unfinished_worker(void *value) { (void)value; pause(); return NULL; }
+int main(int argc, char **argv) {
+    const char *mode=argc>1 ? argv[1] : "regular";
+    if (!strcmp(mode,"threads") || !strcmp(mode,"overflow")) {
+        pthread_t threads[8]; long count=!strcmp(mode,"overflow") ? 1024 : 64;
+        for (int i=0;i<8;++i) if(pthread_create(&threads[i],NULL,worker,(void*)count)) abort();
+        for (int i=0;i<8;++i) if(pthread_join(threads[i],NULL)) abort();
+    } else {
+        FILE *data=tmpfile(); if(!data) return 2;
+        errno=EAGAIN; int a=fsync(fileno(data)); int ae=errno;
+        errno=EINTR; int b=fdatasync(fileno(data)); int be=errno;
+        errno=0; int c=fsync(-1); int ce=errno;
+        errno=0; int d=fdatasync(-1); int de=errno;
+        printf("%d %d %d %d %d %d %d %d\n",a,ae,b,be,c,ce,d,de);
+        fclose(data);
+        if (!strcmp(mode,"fork")) {
+            pid_t child=fork(); if(child<0)return 5;
+            if(!child) {
+                errno=0;
+                if(fcntl(atoi(argv[2]),F_GETFD)!=-1 || errno!=EBADF) _exit(6);
+                if(fsync(-1)!=-1 || errno!=EBADF) _exit(7);
+                _exit(0);
+            }
+            int status=0; if(waitpid(child,&status,0)!=child || status) return 8;
+            if(fsync(-1)!=-1 || errno!=EBADF) return 9;
+        }
+        if (!strcmp(mode,"handoff")) {
+            if(getenv("M0_SYNC_FD") || getenv("M0_SYNC_TRIAL") || getenv("M0_SYNC_TOKEN"))return 10;
+            if(!(fcntl(atoi(argv[2]),F_GETFD)&FD_CLOEXEC))return 11;
+        }
+        if (!strcmp(mode,"live-thread")) {
+            pthread_t thread;
+            if(pthread_create(&thread,NULL,unfinished_worker,NULL))return 12;
+        }
+        if (!strcmp(mode,"incomplete")) _exit(0);
+        if (!strcmp(mode,"write-failure")) {
+            int replacement=open(argv[3],O_RDONLY); if(replacement<0)return 3;
+            if(dup2(replacement,atoi(argv[2]))<0)return 4;
+            close(replacement);
+        }
+    }
+    return 0;
+}
+''')
+        cls.helper = cls.directory / "helper"
+        flags = [cls.compiler, "-O2", "-g", "-fno-omit-frame-pointer", "-Wall", "-Wextra", "-Werror", "-pthread"]
+        result = subprocess.run(flags + [str(cls.helper_source), str(cls.component), "-Wl,--wrap=fsync,--wrap=fdatasync", "-o", str(cls.helper)], capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise AssertionError(f"offline helper compile exit {result.returncode}: {result.stderr}")
+        cls.stub_source = cls.directory / "stub.c"
+        cls.stub_source.write_text(r'''
+#include <errno.h>
+int fsync_count, fdatasync_count;
+int fsync(int fd) { ++fsync_count; errno=EAGAIN; return fd; }
+int fdatasync(int fd) { ++fdatasync_count; errno=EBADF; return -fd; }
+''')
+        cls.count_source = cls.directory / "count.c"
+        cls.count_source.write_text(r'''
+#include <errno.h>
+#include <stdio.h>
+#include <unistd.h>
+extern int fsync_count,fdatasync_count;
+int main(void) {
+ errno=EINTR; int a=fsync(17), ae=errno;
+ errno=EINTR; int b=fdatasync(23), be=errno;
+ printf("%d %d %d %d %d %d\n",a,ae,b,be,fsync_count,fdatasync_count);
+ return 0;
+}
+''')
+        cls.count_helper = cls.directory / "count"
+        result = subprocess.run(flags + [str(cls.count_source), str(cls.stub_source), str(cls.component), "-Wl,--wrap=fsync,--wrap=fdatasync", "-o", str(cls.count_helper)], capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise AssertionError(f"stub helper compile exit {result.returncode}: {result.stderr}")
+        cls.readdir_source = cls.directory / "readdir_failure.c"
+        cls.readdir_source.write_text(r'''
+#include <dirent.h>
+#include <errno.h>
+#include <string.h>
+struct dirent *readdir(DIR *directory) {
+    (void)directory;
+    static struct dirent entry;
+    static int calls;
+    if(calls++) { errno=EIO; return 0; }
+    strcpy(entry.d_name,"123"); return &entry;
+}
+''')
+        cls.readdir_helper = cls.directory / "readdir-failure"
+        result = subprocess.run(flags + [str(cls.helper_source), str(cls.readdir_source), str(cls.component),
+            "-Wl,--wrap=fsync,--wrap=fdatasync", "-o", str(cls.readdir_helper)],
+            capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise AssertionError(f"readdir failure helper compile exit {result.returncode}: {result.stderr}")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def invoke(self, mode="regular", *, enabled=True, count=False, changes=None,
+               file_mode=None, prefix=b"", hardlink=False, binary=None):
+        import subprocess
+        import uuid
+        root = self.directory / uuid.uuid4().hex
+        root.mkdir(mode=0o700)
+        path = root / "events.jsonl"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if file_mode is not None:
+            os.fchmod(fd, file_mode)
+        if prefix:
+            os.write(fd, prefix)
+            os.lseek(fd, 0, os.SEEK_SET)
+        if hardlink:
+            os.link(path, root / "alias.jsonl")
+        env = dict(os.environ)
+        for key in ("M0_SYNC_FD", "M0_SYNC_TRIAL", "M0_SYNC_TOKEN"):
+            env.pop(key, None)
+        if enabled:
+            env.update(M0_SYNC_FD=str(fd), M0_SYNC_TRIAL="1"*32, M0_SYNC_TOKEN="2"*32)
+        if changes:
+            env.update(changes)
+        try:
+            result = subprocess.run([str(self.count_helper)] if count else [str(binary or self.helper), mode, str(fd), str(path)],
+                env=env, pass_fds=(fd,), capture_output=True, text=True, timeout=10)
+        finally:
+            os.close(fd)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = path.read_bytes()
+        rows = [json.loads(row) for row in data.splitlines()]
+        return result, path, rows
+
+    def test_wrapper_calls_real_operations_once_and_preserves_return_and_errno(self):
+        import errno
+        result, _, rows = self.invoke(count=True)
+        self.assertEqual(result.stdout.strip(), f"17 {errno.EAGAIN} -23 {errno.EBADF} 1 1")
+        self.assertEqual([r["return_value"] for r in rows[1:-1]], [17, -23])
+        self.assertEqual([r["errno"] for r in rows[1:-1]], [errno.EAGAIN, errno.EBADF])
+
+    def test_real_linker_wrapped_success_failure_and_monotonic_caller_evidence(self):
+        import errno
+        result, path, rows = self.invoke()
+        self.assertEqual(result.stdout.strip(), f"0 {errno.EAGAIN} 0 {errno.EINTR} -1 {errno.EBADF} -1 {errno.EBADF}")
+        header, footer = rows[0], rows[-1]
+        self.assertEqual(header["schema"], "m0-daemon-sync-v1")
+        self.assertEqual(header["trial_id"], "1"*32)
+        self.assertEqual(header["token"], "2"*32)
+        self.assertEqual(header["clock"], "CLOCK_MONOTONIC")
+        self.assertGreater(header["module_base"], 0)
+        self.assertTrue(footer["complete"])
+        self.assertEqual(footer["observed"], 4)
+        self.assertEqual(footer["written"], 4)
+        self.assertEqual(footer["dropped"], 0)
+        self.assertEqual(footer["inflight"], 0)
+        self.assertLessEqual(path.stat().st_size, 4*1024*1024)
+        for event in rows[1:-1]:
+            self.assertEqual(event["pid"], header["pid"])
+            self.assertGreater(event["tid"], 0)
+            self.assertGreaterEqual(event["entry_ns"], header["enabled_monotonic_ns"])
+            self.assertGreaterEqual(event["exit_ns"], event["entry_ns"])
+            self.assertLessEqual(event["exit_ns"], footer["finalized_monotonic_ns"])
+            self.assertGreater(event["caller"], header["module_base"])
+
+    def test_disabled_instrumentation_emits_nothing_and_preserves_real_result(self):
+        import errno
+        result, _, rows = self.invoke(enabled=False, count=True)
+        self.assertEqual(result.stdout.strip(), f"17 {errno.EAGAIN} -23 {errno.EBADF} 1 1")
+        self.assertEqual(rows, [])
+
+    def test_threaded_recorder_has_no_lost_or_duplicate_events(self):
+        _, _, rows = self.invoke("threads")
+        events = rows[1:-1]
+        self.assertEqual(len(events), 1024)
+        self.assertEqual(sorted(event["sequence"] for event in events), list(range(1, 1025)))
+        self.assertEqual(len(set(event["tid"] for event in events)), 8)
+        self.assertTrue(rows[-1]["complete"])
+        self.assertEqual(rows[-1]["observed"], 1024)
+        self.assertEqual(rows[-1]["clock_errors"], 0)
+        self.assertEqual(rows[-1]["recording_errors"], 0)
+
+    def test_overflow_is_bounded_and_explicitly_incomplete(self):
+        _, path, rows = self.invoke("overflow")
+        self.assertLessEqual(path.stat().st_size, 4*1024*1024)
+        self.assertEqual(rows[-1]["observed"], 16384)
+        self.assertEqual(rows[-1]["written"], 8192)
+        self.assertEqual(rows[-1]["dropped"], 8192)
+        self.assertTrue(rows[-1]["overflow"])
+        self.assertFalse(rows[-1]["complete"])
+
+    def test_abrupt_exit_has_no_complete_footer(self):
+        _, _, rows = self.invoke("incomplete")
+        self.assertEqual(rows, [])
+
+    def test_failed_serialization_cannot_be_presented_as_complete(self):
+        _, _, rows = self.invoke("write-failure")
+        self.assertFalse(rows and rows[-1].get("complete"))
+
+    def test_invalid_enabled_configuration_does_not_change_sync_results(self):
+        import errno
+        result, _, rows = self.invoke(count=True, changes={"M0_SYNC_TRIAL": "invalid"})
+        self.assertEqual(result.stdout.strip(), f"17 {errno.EAGAIN} -23 {errno.EBADF} 1 1")
+        self.assertEqual(rows, [])
+
+    def test_forked_helper_cannot_inherit_the_diagnostic_writer(self):
+        _, _, rows = self.invoke("fork")
+        self.assertTrue(rows[-1]["complete"])
+        self.assertEqual(rows[-1]["written"], 5)
+        self.assertEqual(len(set(row["pid"] for row in rows)), 1)
+
+    def test_constructor_clears_handoff_environment_and_sets_close_on_exec(self):
+        _, _, rows = self.invoke("handoff")
+        self.assertTrue(rows[-1]["complete"])
+
+    def test_nonprivate_or_aliased_artifact_descriptor_is_refused(self):
+        for options in ({"file_mode": 0o644}, {"hardlink": True}):
+            with self.subTest(options=options):
+                _, _, rows = self.invoke(**options)
+                self.assertEqual(rows, [])
+
+    def test_nonempty_artifact_is_not_overwritten(self):
+        before = b'{"existing":"preserve"}\n'
+        _, path, rows = self.invoke(prefix=before)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(rows, [{"existing": "preserve"}])
+
+    def test_surviving_threads_invalidate_normal_exit_completeness(self):
+        _, _, rows = self.invoke("live-thread")
+        self.assertGreater(rows[-1]["live_threads"], 1)
+        self.assertGreater(rows[-1]["recording_errors"], 0)
+        self.assertFalse(rows[-1]["complete"])
+
+    def test_incomplete_thread_enumeration_cannot_publish_complete_evidence(self):
+        _, _, rows = self.invoke(binary=self.readdir_helper)
+        self.assertEqual(rows[-1]["live_threads"], -1)
+        self.assertGreater(rows[-1]["recording_errors"], 0)
+        self.assertFalse(rows[-1]["complete"])
+
+    def test_invalid_token_still_contains_a_verified_private_handoff_descriptor(self):
+        for mode in ("handoff", "fork"):
+            with self.subTest(mode=mode):
+                _, _, rows = self.invoke(mode, changes={"M0_SYNC_TOKEN": "invalid"})
+                self.assertEqual(rows, [])
+
+
+    def test_real_taskset_fd_handoff_single_reaper_and_independent_parser(self):
+        import shutil
+        import subprocess
+        taskset = shutil.which("taskset")
+        self.assertIsNotNone(taskset, "taskset required to verify actual launch chain")
+        with tempfile.TemporaryDirectory(prefix="m0-sync-owned-helper-") as directory:
+            root = Path(directory)
+            raw = root / "events.jsonl"
+            fd = os.open(raw, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            clock = runner.Clock()
+            processes = runner.AccountingProcesses(clock)
+            try:
+                env = dict(os.environ, M0_SYNC_FD=str(fd), M0_SYNC_TRIAL="a"*32, M0_SYNC_TOKEN="b"*32)
+                command = [taskset, "-c", str(min(os.sched_getaffinity(0))), str(self.helper), "handoff", str(fd)]
+                identity = processes.launch(command, root/"helper.log", 4096, pass_fds=(fd,), env=env)
+            finally:
+                os.close(fd)
+            with mock.patch.object(subprocess.Popen, "poll", side_effect=AssertionError("second reaper")), \
+                    mock.patch.object(subprocess.Popen, "wait", side_effect=AssertionError("second reaper")):
+                self.assertEqual(processes.wait(identity,clock.now()+5),0)
+                self.assertEqual(processes.poll(identity),0)
+            child = processes.entries[0]
+            records = [json.loads(line) for line in raw.read_bytes().splitlines()]
+            self.assertEqual(records[0]["pid"],identity["pid"])
+            self.assertEqual(child["reap_count"],1)
+            interval=[records[0]["enabled_monotonic_ns"]/1e9,records[-1]["finalized_monotonic_ns"]/1e9]
+            decoded=runner.decode_sync_trace(raw.read_bytes(),trial_id="a"*32,token="b"*32,
+                child=child,application_interval=interval,shutdown_start=interval[-1],evidence="actual offline helper")
+            self.assertTrue(decoded["valid"])
+            self.assertEqual(decoded["summary"]["event_count"],4)
+            self.assertEqual(decoded["summary"]["failed_count"],2)
+            self.assertEqual(decoded["failed_errno_counts"],{"9":2})
+
+
+class SyncMeasurementProcesses(MeasurementProcesses):
+    """Explicitly mocked mount daemon; real descriptor handoff and trace bytes."""
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.launch_options = []
+        self.trace_fd = None
+        self.trace_environment = None
+        self.trace_identity = None
+        self.trace_error = None
+
+    def launch(self, command, log, limit, *, pass_fds=(), env=None):
+        identity = super().launch(command, log, limit)
+        if "-f" in command and any(str(arg).startswith("fsname=m0-") for arg in command):
+            self.launch_options.append({"pass_fds": pass_fds, "env": dict(env or {}), "identity": identity})
+        if pass_fds:
+            self.trace_fd = os.dup(pass_fds[0])
+            self.trace_environment = dict(env)
+            self.trace_identity = identity
+        return identity
+
+    def wait(self, identity, deadline):
+        code = super().wait(identity, deadline)
+        entry = next(e for e in self.entries if e["identity"] == identity)
+        entry["reap_count"] = self.reaps[identity["pid"]]
+        if identity == self.trace_identity and self.trace_fd is not None:
+            try:
+                app = next(e for e in self.entries if str(application.__file__) in e["command"])
+                rows = DaemonSyncTests.trace()
+                rows[0].update(trial_id=self.trace_environment["M0_SYNC_TRIAL"], token=self.trace_environment["M0_SYNC_TOKEN"],
+                    pid=identity["pid"], enabled_monotonic_ns=round((entry["launch_monotonic"]+.01)*1e9))
+                for index,event in enumerate(rows[1:-1]):
+                    event.update(pid=identity["pid"], tid=identity["pid"]+index,
+                        entry_ns=round((app["launch_monotonic"]+1+index)*1e9),
+                        exit_ns=round((app["launch_monotonic"]+2+index)*1e9))
+                rows[-1].update(finalized_monotonic_ns=round((entry["exit_monotonic"]-.01)*1e9),
+                    live_threads=1, trial_id=rows[0]["trial_id"], token=rows[0]["token"], pid=identity["pid"])
+                if self.trace_error == "incomplete":
+                    rows.pop()
+                elif self.trace_error == "foreign":
+                    rows[0]["pid"] = 99999
+                if self.trace_error != "missing":
+                    os.write(self.trace_fd, ("\n".join(json.dumps(r) for r in rows)+"\n").encode("ascii"))
+            finally:
+                os.close(self.trace_fd)
+                self.trace_fd = None
+        return code
+
+
+class DaemonSyncLifecycleTests(unittest.TestCase):
+    setUp = DaemonSyncTests.setUp
+    tearDown = DaemonSyncTests.tearDown
+
+    def provenance(self):
+        # Intentionally mocked linked-image evidence; no real daemon is executed.
+        exe = runner.executable_identity(Path(sys.executable).resolve())
+        production = runner.measurement_source()["production_files"]
+        return {"schema":"m0-smoke-build-provenance-v1", "exit_status":0,
+            "source_fingerprints_before":production, "source_fingerprints_after":production,
+            "daemon":exe, "evidence":"mocked", "daemon_sync":{
+                "schema":"myfs-m0-sync-build-v1", "wrapper_sha256":runner.summary(runner.SYNC_WRAPPER)["sha256"],
+                "wrap_symbols":["fsync","fdatasync"], "coverage_verified":True,
+                "build_flags":["-O2","-DNDEBUG","-g","-fno-omit-frame-pointer"], "module_build_id":"d"*40,
+                "coverage":[dict(source=s,function=f,operation=o,source_line=n,
+                    linked_call_address="abc",target="__wrap_"+o) for s,f,o,n in runner.SYNC_SITES]}}
+
+    def prepare(self, **kwargs):
+        self.processes = SyncMeasurementProcesses(self.clock)
+        return runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.refs,
+            backend="myfs", records=8, expected_device="259:7", processes=self.processes,
+            mounts=self.mounts, host=self.host, clock=self.clock,
+            daemon=Path(sys.executable).resolve(), build_provenance=self.provenance(),
+            daemon_diagnostic="sync-calls", **kwargs)
+
+    def test_full_fake_lifecycle_excludes_other_mounts_and_preserves_timing(self):
+        trial = self.prepare()
+        self.assertEqual(trial.state["outcome"], "prepared", trial.state["error"])
+        before = trial.canonical_snapshot()
+        self.assertTrue(trial.execute(), trial.state["error"])
+        self.assertFalse(trial.state["baseline_eligible"])
+        self.assertEqual(trial.state["measurement_population"], "daemon_sync_instrumented_application_completion")
+        self.assertEqual(trial.state["measurements"]["application"]["wall_seconds"]["value"],5.)
+        options = self.processes.launch_options
+        self.assertEqual([len(v["pass_fds"]) for v in options], [0,1,0])
+        self.assertFalse(any(k in options[0]["env"] or k in options[2]["env"] for k in runner.SYNC_ENV))
+        self.assertEqual(options[1]["env"]["M0_SYNC_TRIAL"], trial.anchor["trial_id"])
+        trace = trial.state["daemon_diagnostic"]["trace"]
+        self.assertTrue(trace["valid"])
+        self.assertEqual(trace["report"]["evidence"], "mocked")
+        self.assertEqual(trace["report"]["summary"]["event_count"],2)
+        self.assertEqual(trace["daemon"], options[1]["identity"])
+        self.assertEqual(self.mounts.events, ["mount","stat-probe","unmount"]*3)
+        self.assertEqual(before, trial.canonical_snapshot())
+        self.assertTrue(all(n == 1 for n in self.processes.reaps.values()))
+        self.assertIn("NOT COLLECTED",trial.state["daemon_diagnostic"]["preparation"]["reason"])
+        artifact = Path(trace["artifact"])
+        trial.cleanup()
+        self.assertTrue(artifact.exists())
+        self.assertTrue(trial.canonical_directory.exists())
+        self.assertFalse(trial.workspace.exists())
+
+    def test_changed_diagnostic_state_cannot_become_baseline(self):
+        trial = self.prepare()
+        trial.state["baseline_eligible"] = True
+        with self.assertRaises(runner.TrialError):
+            trial.check_paths()
+        trial.state["baseline_eligible"] = False
+        trial.state["daemon_diagnostic"]["configuration"]["mode"] = None
+        with self.assertRaises(runner.TrialError):
+            trial.check_paths()
+
+    def test_missing_incomplete_foreign_trace_fails_and_retains_workspace(self):
+        for mode in ("missing", "incomplete", "foreign"):
+            with self.subTest(mode=mode):
+                trial = self.prepare()
+                self.processes.trace_error = mode
+                self.assertFalse(trial.execute())
+                self.assertIn("sync diagnostic",trial.state["error"])
+                self.assertFalse(trial.state["daemon_diagnostic"]["trace"]["valid"])
+                self.assertTrue(trial.workspace.exists())
+                self.assertTrue(trial.artifacts.exists())
+                with self.assertRaises(runner.TrialError):
+                    trial.cleanup()
+
+    def test_existing_artifact_and_symlink_refused(self):
+        for symlink in (False,True):
+            with self.subTest(symlink=symlink):
+                trial=self.prepare()
+                raw=trial.artifacts/runner.sync_names(trial.anchor["trial_id"])[0]
+                foreign=self.parent/("foreign-"+trial.anchor["trial_id"])
+                foreign.write_text("untouched")
+                if symlink:
+                    raw.symlink_to(foreign)
+                else:
+                    raw.write_text("existing")
+                self.assertFalse(trial.execute())
+                self.assertIn("overwrite",trial.state["error"])
+                self.assertEqual(foreign.read_text(),"untouched")
+                self.assertTrue(trial.workspace.exists())
+
+    def test_trace_or_receipt_change_prevents_cleanup(self):
+        for kind in ("raw", "receipt", "identity", "oversized"):
+            with self.subTest(kind=kind):
+                trial=self.prepare()
+                self.assertTrue(trial.execute(),trial.state["error"])
+                raw,receipt=(trial.artifacts/n for n in runner.sync_names(trial.anchor["trial_id"]))
+                if kind == "raw":
+                    raw.write_bytes(raw.read_bytes()[:-2])
+                elif kind == "receipt":
+                    receipt.write_text("{}")
+                elif kind == "oversized":
+                    with raw.open("ab") as stream: stream.truncate(runner.SYNC_MAX_BYTES+1)
+                else:
+                    blob=raw.read_bytes()
+                    raw.rename(raw.with_suffix(".saved"))
+                    raw.write_bytes(blob)
+                    raw.chmod(0o600)
+                with self.assertRaises(runner.TrialError): trial.cleanup()
+                self.assertTrue(trial.workspace.exists())
+                self.assertFalse(trial.state["daemon_diagnostic"]["trace"]["valid"])
+
+    def test_timeout_abnormal_exit_and_warning_cannot_validate_trace(self):
+        for mode in ("shutdown", "application", "abnormal"):
+            trial=self.prepare()
+            if mode == "shutdown": self.processes.shutdown_timeout=True
+            elif mode == "application": self.processes.application_timeout=True
+            else: self.processes.abnormal_exit=True
+            self.assertFalse(trial.execute(),mode)
+            self.assertTrue(trial.workspace.exists())
+            with self.assertRaises(runner.TrialError): trial.cleanup()
+            if self.processes.trace_fd is not None:
+                os.close(self.processes.trace_fd)
+                self.processes.trace_fd=None
+
+    def test_provenance_coverage_and_source_mismatch_refused(self):
+        for key,value in (("wrapper_sha256","0"*64),("coverage",[]),("wrap_symbols",["fsync"]),
+                ("module_build_id",""),("coverage_verified",False)):
+            receipt=self.provenance()
+            receipt["daemon_sync"][key]=value
+            with self.subTest(key=key),self.assertRaises(runner.TrialError):
+                runner.sync_build(receipt["daemon"]["path"],receipt)
+
+    def test_cli_is_measurement_only_and_combination_rejected(self):
+        import subprocess
+        base=[sys.executable,"-B",str(BENCHMARKS/"m0_profile.py")]
+        for command in ("prepare","self-test","measure-self-test"):
+            result=subprocess.run(base+[command,"--help"],capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0)
+            self.assertNotIn("--daemon-diagnostic",result.stdout)
+        result=subprocess.run(base+["measure-prepare","--help"],capture_output=True,text=True,timeout=5)
+        self.assertIn("--daemon-diagnostic {sync-calls}",result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

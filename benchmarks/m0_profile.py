@@ -128,6 +128,47 @@ private trial-specific files in persistent artifacts. Writes are strictly bounde
 to 16 MiB for raw data and 2 MiB for the receipt, within the 64 MiB trial budget.
 Serialization errors retain partial files and invalidate the trial. Identity/hash
 checks detect accidental changes, not malicious rewriting of all same-user state.
+
+Isolated daemon sync diagnostics (measurement-only, myfs-only):
+  measure-prepare ... --backend myfs --daemon-diagnostic sync-calls
+                  --daemon DIAGNOSTIC_ELF --build-provenance REVIEWED_JSON
+Only an independently built/reviewed executable is accepted: unchanged production
+objects plus m0_daemon_sync_diagnostic.c and --wrap=fsync,--wrap=fdatasync. No automatic
+build. Its provenance extends m0-smoke-build-provenance-v1 with daemon_sync schema
+myfs-m0-sync-build-v1, wrapper hash, exact nine-source-site relocation/disassembly
+coverage, release/debug flags, linked addresses and ELF Build ID. The receipt pins
+that evidence; it is not cryptographic attestation against a malicious same user.
+Python CPU profiling cannot be combined with daemon sync profiling. Ordinary
+measurements and smoke defaults remain unchanged. Instrumented child timing uses
+the same launch-to-wait4 boundary but is baseline-ineligible and labeled
+ daemon_sync_instrumented_application_completion.
+
+The same daemon executable is a directly owned child in all three mount cycles.
+Only application-mount launch inherits the exclusive private JSONL artifact FD,
+using pass_fds through taskset's exec; the constructor sets CLOEXEC, clears the
+handoff environment and closes/disables the writer in fork descendants. Preparation
+and verification are NOT COLLECTED. No tracer, extra waiter, or process adoption.
+Actual direct-daemon executable identity is checked after mount readiness.
+
+The recorder uses 512 KiB static event memory, at most 8192 calls and a strict
+4 MiB emitted-byte limit. Mutex bookkeeping is outside the real sync operation.
+It records CLOCK_MONOTONIC nanoseconds, TID, raw return PC, FD, rc and saved errno.
+No per-call artifact I/O: normal-exit finalization writes header/events/footer.
+Missing footer, overflow, write/clock errors, live threads, inconsistent identities,
+loss or partial output invalidate the trial and retain all evidence. A separately
+bounded 1 MiB controller receipt is independently derived after normal exit and
+rechecked on verify/cleanup. More than 256 distinct thread or caller groups refuses
+analysis while retaining the raw trace. Caller attribution requires later checked
+symbolization using the recorded image base and pinned binary/Build ID; FD numbers
+alone do not identify files. No production atexit/destructor sync is currently
+present; later wrapped destructor calls would require re-review of finalization.
+
+Counts, elapsed min/median/max, sums, and interval unions are diagnostic populations.
+The application-window union clips call intervals; straddlers are reported. Summed
+thread durations overlap, and neither sums nor unions measure disk service, off-CPU
+waiting, scheduling delay, FUSE latency or causal application delay. Serialization
+is after sync timing but inside daemon shutdown. Raw events survive cleanup; no
+real mounted instrumentation is implied by offline helpers/fake lifecycle tests.
 """
 
 import argparse
@@ -145,6 +186,7 @@ import selectors
 import shutil
 import signal
 import stat
+import statistics
 import subprocess
 import sys
 import time
@@ -278,7 +320,7 @@ class Processes:
         self.clock, self.entries, self.handles = clock, [], {}
         self.on_change = lambda: None
 
-    def launch(self, command, log, limit):
+    def launch(self, command, log, limit, *, pass_fds=(), env=None):
         if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
             raise TrialError("pidfd supervision unavailable; refusing launch")
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -286,7 +328,7 @@ class Processes:
         launch_time = self.clock.now()
         try:
             child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     stdin=subprocess.DEVNULL, close_fds=True)
+                                     stdin=subprocess.DEVNULL, close_fds=True, pass_fds=pass_fds, env=env)
         except BaseException:
             stream.close()
             raise
@@ -747,6 +789,9 @@ class Trial:
             raise TrialError("mount identity changed")
         return found
 
+    def launch_daemon(self, command, log, limit, index):
+        return self.processes.launch(command, log, limit)
+
     def mount(self, readiness_deadline=None):
         self.no_mounts()
         self.check_paths()
@@ -758,8 +803,8 @@ class Trial:
         command = self.mounts.command(executable, self.root, self.backing, "m0-" + self.anchor["trial_id"])
         index = len(self.state["mounts"])
         self.state["commands"].append(command)
-        self.daemon_identity = self.processes.launch(command, self.artifacts / f"daemon-{index}.log",
-                                                     self.state["limits"]["log_bytes_per_child"])
+        self.daemon_identity = self.launch_daemon(command, self.artifacts / f"daemon-{index}.log",
+                                                  self.state["limits"]["log_bytes_per_child"], index)
         entry = {"daemon": self.daemon_identity, "mount": None, "unmounted": False,
                  "daemon_exit_status": None, "daemon_exit_reason": "exit not yet observed",
                  "evidence": self.state["evidence"]}
@@ -1304,10 +1349,10 @@ class AccountingProcesses(Processes):
     are best effort, not instantaneous limits or native hotspot evidence.
     """
 
-    def launch(self, *args):
+    def launch(self, *args, **kwargs):
         if any(not hasattr(os, name) for name in ("wait4", "waitid", "P_PIDFD", "WNOWAIT")):
             raise TrialError("pidfd waitid/wait4 accounting unavailable; refusing launch")
-        return super().launch(*args)
+        return super().launch(*args, **kwargs)
 
     def counters(self, identity):
         at = self.clock.now()
@@ -1895,6 +1940,194 @@ class CanonicalBundle:
         return bundle
 
 
+# Isolated daemon diagnostic. No build, ptrace, extra waiter or mounted helper.
+SYNC_SCHEMA = "m0-daemon-sync-v1"
+SYNC_MAX_BYTES = 4 * 1024**2
+SYNC_MAX_EVENTS = 8192
+SYNC_WRAPPER = Path(__file__).with_name("m0_daemon_sync_diagnostic.c")
+SYNC_ENV = ("M0_SYNC_FD", "M0_SYNC_TRIAL", "M0_SYNC_TOKEN")
+SYNC_SITES = {
+    ("src/core/path.c", "create_generation_storage", "fsync", 325),
+    ("src/core/path.c", "fsync_parent_path", "fsync", 389),
+    ("src/core/metadata.c", "save_chunk_map_to_path", "fsync", 456),
+    ("src/core/metadata.c", "append_chunk_map_delta_to_fd", "fdatasync", 531),
+    ("src/core/compact.c", "compact_data_file_locked", "fsync", 2172),
+    ("src/fuse_ops/file.c", "rewrite_truncated_chunk_fd", "fdatasync", 291),
+    ("src/fuse_ops/file.c", "truncate_open_handle_locked", "fdatasync", 428),
+    ("src/fuse_ops/file.c", "myfs_write_locked", "fdatasync", 1052),
+    ("src/fuse_ops/file.c", "myfs_release", "fsync", 1162),
+}
+
+
+def sync_configuration(mode):
+    if mode not in (None, "sync-calls"):
+        raise TrialError("invalid daemon diagnostic")
+    return {"schema": SYNC_SCHEMA, "mode": mode, "clock": "CLOCK_MONOTONIC" if mode else None,
+            "max_bytes": SYNC_MAX_BYTES if mode else None,
+            "collection": "application-mount lifecycle only" if mode else None}
+
+
+def sync_build(daemon, provenance):
+    """Cross-check an independently produced build/coverage receipt; never build.
+
+    This pins supplied evidence and current source, not a security attestation
+    against malicious same-user rewrites. Coverage is deliberately source-specific;
+    changes require a new disassembly review and explicit coverage update.
+    """
+    try:
+        binary = executable_identity(daemon)
+        receipt = provenance if isinstance(provenance, dict) else read_json(strict_path(provenance))
+        production = measurement_source()["production_files"]
+        detail = receipt["daemon_sync"]
+        sites = detail["coverage"]
+        if (receipt.get("schema") != "m0-smoke-build-provenance-v1" or receipt.get("exit_status") != 0
+                or receipt.get("source_fingerprints_before") != production
+                or receipt.get("source_fingerprints_after") != production or receipt.get("daemon") != binary
+                or detail.get("schema") != "myfs-m0-sync-build-v1"
+                or detail.get("wrapper_sha256") != summary(SYNC_WRAPPER)["sha256"]
+                or detail.get("wrap_symbols") != ["fsync", "fdatasync"]
+                or detail.get("coverage_verified") is not True
+                or len(sites) != len(SYNC_SITES)
+                or {(s["source"], s["function"], s["operation"], s["source_line"]) for s in sites} != SYNC_SITES
+                or any(s["target"] != "__wrap_" + s["operation"]
+                       or not re.fullmatch(r"(?:0x)?[0-9a-f]+", s["linked_call_address"]) for s in sites)
+                or not all(f in detail.get("build_flags", []) for f in ("-O2", "-DNDEBUG", "-g", "-fno-omit-frame-pointer"))
+                or not re.fullmatch(r"[0-9a-f]{40,64}", detail.get("module_build_id", ""))):
+            raise TrialError("diagnostic executable provenance/coverage mismatch")
+        return {"executable": binary, "provenance": receipt}
+    except (KeyError, TypeError, OSError, ValueError) as error:
+        raise TrialError("diagnostic executable provenance unavailable/invalid: " + str(error)) from error
+
+
+def sync_names(trial_id):
+    if not re.fullmatch(r"[0-9a-f]{32}", trial_id):
+        raise TrialError("invalid sync diagnostic trial identity")
+    return "daemon-sync-" + trial_id + ".jsonl", "daemon-sync-" + trial_id + ".receipt.json"
+
+
+def sync_intervals(events, clip=None):
+    intervals = []
+    for event in events:
+        start, end = event["entry_ns"], event["exit_ns"]
+        if clip is not None:
+            start, end = max(start, clip[0]), min(end, clip[1])
+        if start <= end:
+            intervals.append((start, end))
+    durations = [(b-a)/1e9 for a, b in intervals]
+    union, right = 0, None
+    for start, end in sorted(intervals):
+        union += max(0, end - max(start, right if right is not None else start))
+        right = max(end, right if right is not None else end)
+    return {"event_count": len(intervals), "failed_count": sum(e["return_value"] == -1 for e in events),
+            "minimum_seconds": min(durations) if durations else None,
+            "median_seconds": statistics.median(durations) if durations else None,
+            "maximum_seconds": max(durations) if durations else None,
+            "summed_seconds": sum(durations), "union_seconds": union/1e9,
+            "empty_reason": None if durations else "no observed calls in this population"}
+
+
+def decode_sync_trace(raw, *, trial_id, token, child, application_interval, shutdown_start, evidence, guard=lambda: None):
+    """Independent bounded JSONL validation and interval analysis after owned exit.
+
+    Sums can overlap across threads. Unions describe time inside observed calls,
+    not disk service, off-CPU, scheduling delay or application/FUSE waiting.
+    Caller PCs plus image base/build identity permit later verified symbolization;
+    a reused FD number never proves an underlying pathname or data/metadata role.
+    """
+    def require(condition, message):
+        if not condition:
+            raise TrialError("invalid sync diagnostic: " + message)
+    def number(value, minimum=0):
+        return type(value) is int and minimum <= value < 2**64
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, "duplicate JSON key")
+            result[key] = value
+        return result
+    try:
+        require(0 < len(raw) <= SYNC_MAX_BYTES and raw.endswith(b"\n"), "empty/oversized/truncated trace")
+        lines = raw.splitlines()
+        require(2 <= len(lines) <= SYNC_MAX_EVENTS + 2, "invalid record count")
+        records = []
+        for line in lines:
+            guard()
+            require(len(line) <= 2048, "oversized record")
+            records.append(json.loads(line, object_pairs_hook=unique))
+        require(all(isinstance(r, dict) for r in records), "non-object record")
+        header, footer = records[0], records[-1]
+        events = records[1:-1]
+        pid = child["identity"]["pid"]
+        require(child["exit_status"] == 0 and child["reap_count"] == 1, "normal exactly-once daemon exit unconfirmed")
+        require(header.get("kind") == "header" and header.get("schema") == SYNC_SCHEMA
+                and header.get("trial_id") == trial_id and header.get("token") == token
+                and header.get("pid") == pid and header.get("clock") == "CLOCK_MONOTONIC"
+                and header.get("unit") == "nanoseconds" and header.get("max_bytes") == SYNC_MAX_BYTES
+                and header.get("max_events") == SYNC_MAX_EVENTS, "header identity/clock mismatch")
+        require(number(header.get("module_base"), 1) and header.get("caller_source") == "__builtin_return_address",
+                "missing caller/module attribution")
+        require(footer.get("kind") == "footer" and footer.get("trial_id") == trial_id
+                and footer.get("token") == token and footer.get("pid") == pid and footer.get("complete") is True
+                and footer.get("overflow") is False, "incomplete/overflow finalization")
+        for name in ("observed", "written", "dropped", "inflight", "clock_errors", "recording_errors"):
+            require(number(footer.get(name)), "invalid completeness counter")
+        require(footer["observed"] == footer["written"] == len(events)
+                and all(footer[k] == 0 for k in ("dropped", "inflight", "clock_errors", "recording_errors")),
+                "lost/unfinished/error events")
+        require(type(footer.get("live_threads")) is int and footer["live_threads"] == 1, "daemon threads still live at finalization")
+        enabled, finalized = header.get("enabled_monotonic_ns"), footer.get("finalized_monotonic_ns")
+        require(number(enabled) and number(finalized) and enabled <= finalized
+                and child["launch_monotonic"] <= enabled/1e9 <= finalized/1e9 <= child["exit_monotonic"],
+                "recorder outside owned child interval")
+        for sequence, event in enumerate(events, 1):
+            guard()
+            require(event.get("kind") == "event" and type(event.get("sequence")) is int and event["sequence"] == sequence
+                    and event.get("pid") == pid and number(event.get("tid"), 1)
+                    and event.get("operation") in ("fsync", "fdatasync")
+                    and type(event.get("fd")) is int and -(2**31) <= event["fd"] < 2**31
+                    and number(event.get("caller"), header["module_base"])
+                    and number(event.get("entry_ns")) and number(event.get("exit_ns"))
+                    and enabled <= event["entry_ns"] <= event["exit_ns"] <= finalized
+                    and type(event.get("return_value")) is int and event["return_value"] in (0, -1)
+                    and number(event.get("errno")) and event.get("clock_error") is False,
+                    "malformed/unattributed/out-of-order event")
+        require(isinstance(application_interval, (list, tuple)) and len(application_interval) == 2
+                and all(type(v) in (int, float) and math.isfinite(v) for v in application_interval)
+                and child["launch_monotonic"] <= application_interval[0] <= application_interval[1] <= child["exit_monotonic"]
+                and type(shutdown_start) in (float, int) and math.isfinite(shutdown_start)
+                and application_interval[1] <= shutdown_start <= child["exit_monotonic"], "invalid application/shutdown boundaries")
+        lo, hi = (round(v*1e9) for v in application_interval)
+        shutdown = round(shutdown_start*1e9)
+        groups = {}
+        for name, key in (("by_operation", lambda e: e["operation"]),
+                          ("by_thread", lambda e: str(e["tid"])),
+                          ("by_caller", lambda e: hex(e["caller"] - header["module_base"]))):
+            grouped = {}
+            for event in events:
+                grouped.setdefault(key(event), []).append(event)
+            require(len(grouped) <= 256, "analysis group bound exceeded; retain raw trace")
+            groups[name] = {k: sync_intervals(v) for k, v in grouped.items()}
+        overlap = [e for e in events if e["entry_ns"] < hi and e["exit_ns"] > lo]
+        straddlers = [e for e in events if e["entry_ns"] < lo < e["exit_ns"] or e["entry_ns"] < hi < e["exit_ns"]]
+        return {"schema": SYNC_SCHEMA, "valid": True, "reason": None, "evidence": evidence,
+                "clock": "CLOCK_MONOTONIC", "unit": "seconds", "header": header, "completeness": footer,
+                "summary": sync_intervals(events), **groups,
+                "failed_errno_counts": {str(n): sum(e["return_value"] == -1 and e["errno"] == n for e in events)
+                                        for n in sorted({e["errno"] for e in events if e["return_value"] == -1})},
+                "application_interval": list(application_interval), "shutdown_start": shutdown_start,
+                "application_overlap": sync_intervals(overlap, (lo, hi)),
+                "boundary_straddling_count": len(straddlers),
+                "before_application": sync_intervals([e for e in events if e["exit_ns"] <= lo]),
+                "after_application": sync_intervals([e for e in events if e["entry_ns"] >= hi]),
+                "shutdown_overlap": sync_intervals([e for e in events if e["exit_ns"] > shutdown],
+                                                    (shutdown, round(child["exit_monotonic"]*1e9))),
+                "limitations": "Elapsed calls include CPU and waiting/scheduling. Sums overlap; unions are not application delay. "
+                               "FD numbers are not file identities; caller keys are image-relative return PCs, not verified symbols. "
+                               "Preparation/verification not collected. No native-library internal/direct-syscall coverage."}
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise TrialError("missing/corrupt sync diagnostic: " + str(error)) from error
+
+
 class MeasurementTrial(Trial):
     """Opt-in, one-use staged-directory trial; never a multi-run campaign.
 
@@ -1931,17 +2164,133 @@ class MeasurementTrial(Trial):
     def validate_diagnostic_configuration(anchor, state):
         # Legacy states without either field remain unprofiled; no migration writes.
         if "diagnostic" not in anchor:
-            if "diagnostic" in state:
+            if "diagnostic" in state or "daemon_diagnostic" in anchor or "daemon_diagnostic" in state:
                 raise TrialError("diagnostic configuration missing from ownership anchor")
             return
         config = anchor["diagnostic"]
+        if not isinstance(config, dict):
+            raise TrialError("invalid diagnostic configuration")
+        sync = anchor.get("daemon_diagnostic")
+        if ("daemon_diagnostic" in anchor or "daemon_diagnostic" in state):
+            if (not isinstance(sync, dict) or sync != sync_configuration("sync-calls")
+                    or state["backend"] != "myfs" or config.get("mode") is not None
+                    or not isinstance(state.get("daemon_diagnostic"), dict)
+                    or state["daemon_diagnostic"].get("configuration") != sync
+                    or not isinstance(state["daemon_diagnostic"].get("trace"), dict)
+                    or not re.fullmatch(r"[0-9a-f]{32}", anchor.get("daemon_sync_token", ""))
+                    or not isinstance(anchor.get("daemon_sync_build"), dict)):
+                raise TrialError("changed/invalid daemon diagnostic ownership configuration")
+        population = ("daemon_sync_instrumented_application_completion" if sync else
+                      "instrumented_application_completion" if config.get("mode") else "buffered_application_completion")
         if (not isinstance(config, dict) or config != diagnostic_configuration(config.get("mode"))
                 or not isinstance(state.get("diagnostic"), dict)
                 or state["diagnostic"].get("configuration") != config
                 or not isinstance(state["diagnostic"].get("profile"), dict)
-                or state.get("measurement_population") != ("instrumented_application_completion" if config["mode"] else "buffered_application_completion")
-                or state.get("baseline_eligible") is not (not config["mode"] and state["backend"] != "offline-check")):
+                or state.get("measurement_population") != population
+                or state.get("baseline_eligible") is not (not config["mode"] and not sync and state["backend"] != "offline-check")):
             raise TrialError("inconsistent/changed diagnostic configuration or population")
+
+    @property
+    def sync_diagnostic(self):
+        return self.anchor.get("daemon_diagnostic", {}).get("mode") == "sync-calls"
+
+    def launch_daemon(self, command, log, limit, index):
+        if not self.sync_diagnostic:
+            return super().launch_daemon(command, log, limit, index)
+        # taskset execs the daemon in place: only that direct child inherits this
+        # FD. No tracer or new waiter. Recorder marks it CLOEXEC in its constructor.
+        env = {key: value for key, value in os.environ.items() if key not in SYNC_ENV}
+        if index != 1:
+            if index not in (0, 2):
+                raise TrialError("unexpected diagnostic daemon lifecycle")
+            return self.processes.launch(command, log, limit, env=env)
+        if self.state["phases"][-1]["name"] != "application_readiness":
+            raise TrialError("sync recorder only allowed for application mount")
+        directory = profile_directory(self.artifacts, self.anchor)
+        raw_name, receipt_name = sync_names(self.anchor["trial_id"])
+        fd = None
+        try:
+            for name in (raw_name, receipt_name):
+                if os.path.lexists(self.artifacts / name):
+                    raise TrialError("existing sync diagnostic artifact; refusing overwrite")
+            fd = os.open(raw_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         0o600, dir_fd=directory)
+            info = os.fstat(fd)
+            profile_directory_check(self.artifacts, directory, self.anchor)
+            record = {"artifact": str(self.artifacts / raw_name),
+                      "identity": {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid},
+                      "valid": None, "reason": "owned daemon has not finalized trace", "daemon": None}
+            self.state["daemon_diagnostic"]["trace"] = record
+            self.save()
+            env.update(M0_SYNC_FD=str(fd), M0_SYNC_TRIAL=self.anchor["trial_id"],
+                       M0_SYNC_TOKEN=self.anchor["daemon_sync_token"])
+            identity = self.processes.launch(command, log, limit, pass_fds=(fd,), env=env)
+            record["daemon"] = identity
+            self.save()
+            return identity
+        finally:
+            if fd is not None:
+                os.close(fd)
+            os.close(directory)
+
+    def check_sync_trace(self, *, publish=False):
+        if not self.sync_diagnostic:
+            return
+        previous = self.state["daemon_diagnostic"]["trace"]
+        directory = None
+        try:
+            self.no_mounts()
+            child = next((c for c in self.state["children"] if c.get("identity") == previous.get("daemon")), None)
+            if child is None or child.get("exit_status") != 0 or child.get("reap_count") != 1:
+                raise TrialError("sync diagnostic normal exactly-once daemon exit unconfirmed")
+            if len(self.state["mounts"]) < 2 or self.state["mounts"][1]["daemon"] != child["identity"]:
+                raise TrialError("sync diagnostic daemon lifecycle identity mismatch")
+            if not self.state["mounts"][1]["unmounted"] or self.state["mounts"][1]["daemon_exit_status"] != 0:
+                raise TrialError("sync diagnostic unmount/exit unconfirmed")
+            self.confirm_exits()
+            directory = profile_directory(self.artifacts, self.anchor)
+            deadline = self.deadline("io")
+            def guard():
+                if self.clock.now() >= deadline:
+                    raise TrialError("sync diagnostic validation timeout")
+                self.check_budget()
+            raw_name, receipt_name = sync_names(self.anchor["trial_id"])
+            raw, file = profile_file_read(directory, raw_name, SYNC_MAX_BYTES, guard)
+            if file["identity"] != previous["identity"]:
+                raise TrialError("sync artifact identity substituted")
+            interval = self.state["measurements"]["application"]["wall_seconds"]["interval"]
+            shutdown = next(p["start_monotonic"] for p in self.state["phases"] if p["name"] == "daemon_shutdown")
+            report = decode_sync_trace(raw, trial_id=self.anchor["trial_id"], token=self.anchor["daemon_sync_token"],
+                child=child, application_interval=interval, shutdown_start=shutdown,
+                evidence=self.state["evidence"], guard=guard)
+            report.update(artifact=str(self.artifacts / raw_name), file=file, daemon=child["identity"],
+                          executable=self.anchor["daemon_sync_build"]["executable"],
+                          module_build_id=self.anchor["daemon_sync_build"]["provenance"]["daemon_sync"]["module_build_id"])
+            if publish:
+                fd = os.open(receipt_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+                try:
+                    BoundedProfileWriter(fd, directory, receipt_name, 1024**2).write(
+                        (json.dumps(report, sort_keys=True, allow_nan=False) + "\n").encode("ascii"))
+                finally:
+                    os.close(fd)
+            receipt_raw, receipt = profile_file_read(directory, receipt_name, 1024**2, guard)
+            if json.loads(receipt_raw) != report:
+                raise TrialError("sync diagnostic receipt does not match independently decoded events")
+            result = {"artifact": str(self.artifacts / raw_name), "identity": file["identity"],
+                      "valid": True, "reason": None, "daemon": child["identity"],
+                      "file": file, "receipt": receipt, "report": report}
+            if not publish and result != previous:
+                raise TrialError("sync diagnostic evidence changed after publication")
+            profile_directory_check(self.artifacts, directory, self.anchor)
+            self.state["daemon_diagnostic"]["trace"] = result
+            self.save()
+        except (OSError, ValueError, KeyError, TypeError, StopIteration, TrialError) as error:
+            self.state["daemon_diagnostic"]["trace"] = dict(previous, valid=False, reason=str(error))
+            self.save()
+            raise TrialError("sync diagnostic invalid: " + str(error)) from error
+        finally:
+            if directory is not None:
+                os.close(directory)
 
     @property
     def python_diagnostic(self):
@@ -1988,8 +2337,13 @@ class MeasurementTrial(Trial):
                 processes=None, mounts=None, host=None, clock=None,
                 readiness_seconds=10, application_seconds=30, shutdown_seconds=30,
                 io_seconds=30, staging_seconds=None, verification_seconds=None,
-                overall_seconds=900, log_bytes=1024**2, diagnostic=None):
+                overall_seconds=900, log_bytes=1024**2, diagnostic=None, daemon_diagnostic=None):
         diagnostic_config = diagnostic_configuration(diagnostic)
+        sync_config = sync_configuration(daemon_diagnostic)
+        if daemon_diagnostic and (backend != "myfs" or diagnostic is not None):
+            raise TrialError("daemon diagnostic requires myfs and cannot combine with Python profiling")
+        # Pin reviewed executable/provenance before any expensive allocation.
+        sync_binary = sync_build(daemon, build_provenance) if daemon_diagnostic else None
         config = measurement_limits(records, readiness_seconds=readiness_seconds,
             application_seconds=application_seconds, shutdown_seconds=shutdown_seconds,
             io_seconds=io_seconds, staging_seconds=staging_seconds,
@@ -2040,6 +2394,10 @@ class MeasurementTrial(Trial):
         if shared:
             anchor["shared_canonical"] = shared.reference()
         anchor["diagnostic"] = diagnostic_config
+        if daemon_diagnostic:
+            anchor["daemon_diagnostic"] = sync_config
+            anchor["daemon_sync_build"] = sync_binary
+            anchor["daemon_sync_token"] = uuid.uuid4().hex
         if diagnostic:
             anchor["diagnostic_application"] = {"path": str(APPLICATION), "file": profile_application_file(APPLICATION)}
         for path in (artifacts, workspace, *((canonical,) if shared is None else ())):
@@ -2083,6 +2441,14 @@ class MeasurementTrial(Trial):
         if diagnostic:
             state["label"] = ("OFFLINE CPU diagnostic and correctness check" if backend == "offline-check"
                               else "instrumented Python CPU diagnostic; excluded from baseline populations")
+        if daemon_diagnostic:
+            state["daemon_diagnostic"] = {"configuration": dict(sync_config),
+                "trace": {"valid": None, "reason": "application daemon not executed", "artifact": None},
+                "preparation": {"value": None, "reason": "NOT COLLECTED: recorder disabled for preparation mount"},
+                "verification": {"value": None, "reason": "NOT COLLECTED: recorder disabled for verification mount"}}
+            state["measurement_population"] = "daemon_sync_instrumented_application_completion"
+            state["baseline_eligible"] = False
+            state["label"] = "sync-call daemon diagnostic; excluded from baseline populations"
         state["canonical_reference"] = {"ownership": "campaign" if shared else "trial-retained",
             "campaign_id": campaign_id if shared else None,
             "receipt": str(shared.artifacts / "state.json") if shared else None,
@@ -2166,6 +2532,13 @@ class MeasurementTrial(Trial):
     def check_paths(self, mounted=False):
         self.validate_diagnostic_configuration(self.anchor, self.state)
         super().check_paths(mounted)
+        if self.sync_diagnostic:
+            pinned = self.anchor["daemon_sync_build"]
+            if sync_build(pinned["executable"]["path"], pinned["provenance"]) != pinned:
+                raise TrialError("diagnostic source/executable provenance changed")
+            if self.state.get("daemon") is not None and any(
+                    self.state["daemon"].get(k) != v for k, v in pinned["executable"].items()):
+                raise TrialError("diagnostic executable state differs from ownership anchor")
         parent = strict_path(self.anchor["canonical_parent"])
         if (directory_identity(parent) != self.anchor["canonical_parent_identity"]
                 or str(self.canonical_directory) != self.state["canonical_root"]
@@ -2408,6 +2781,12 @@ class MeasurementTrial(Trial):
         self.resource_guard()
         super().mount(readiness_deadline=deadline)
         self.state["mounts"][-1]["affinity"] = self.check_affinity(self.daemon_identity, "daemon", deadline)
+        if self.sync_diagnostic and self.processes.evidence != "mocked":
+            observed = os.stat(f"/proc/{self.daemon_identity['pid']}/exe")
+            pinned = self.anchor["daemon_sync_build"]["executable"]
+            if (not self.processes.owned(self.daemon_identity)
+                    or (observed.st_dev, observed.st_ino) != (pinned["device"], pinned["inode"])):
+                raise TrialError("diagnostic child is not the verified direct daemon executable")
         if self.clock.now() >= deadline:
             raise TrialError("readiness/daemon affinity timeout")
 
@@ -2418,6 +2797,8 @@ class MeasurementTrial(Trial):
         resources = entry.get("resources") or resource_metrics(None, self.state["evidence"], identity, None, None)
         self.state["measurements"]["daemon_lifecycles"].append(resources)
         self.record_daemon_warnings()
+        if self.sync_diagnostic and len(self.state["mounts"]) == 2:
+            self.check_sync_trace(publish=True)
         if self.state["warnings"]:
             raise TrialError("unexplained daemon warning/error; trial invalid")
 
@@ -2501,6 +2882,9 @@ class MeasurementTrial(Trial):
         self.state["measurements"]["application"] = values
         self.state["application_end_counters"] = entry.get("endpoint_counters", {
             "value": None, "reason": "adapter did not capture pre-reap endpoint", "evidence": self.state["evidence"]})
+        if self.sync_diagnostic:
+            values["wall_seconds"]["population"]["completion"] = "daemon_sync_instrumented_application_completion"
+            values["wall_seconds"]["limitation"] = "daemon instrumentation active; diagnostic only, excluded from baseline"
         if self.python_diagnostic:
             values["wall_seconds"]["population"]["completion"] = "instrumented_application_completion"
             values["wall_seconds"]["limitation"] = "whole child includes startup, launcher and profile serialization; excluded from baseline"
@@ -2614,12 +2998,20 @@ class MeasurementTrial(Trial):
             if self.state["phases"][-1]["name"] == "post_exit_storage_accounting":
                 self.state["storage"] = {"allocated_bytes": None, "regular_apparent_bytes": None,
                                          "reason": "accounting incomplete: " + str(error), "errors": [str(error)]}
+            if self.sync_diagnostic:
+                self.state["daemon_diagnostic"]["trace"].update(valid=False, reason=str(error))
             self.fail(error)
         finally:
             self.finish_budget()
         return self.state["outcome"] == "passed"
 
     def verify(self):
+        if self.sync_diagnostic:
+            try:
+                self.check_sync_trace()
+            except (OSError, TrialError) as error:
+                self.fail(error)
+                return False
         if self.python_diagnostic:
             try:
                 self.check_python_profile()
@@ -2659,6 +3051,7 @@ class MeasurementTrial(Trial):
         self.check_device()
         self.confirm_exits()
         self.check_python_profile()
+        self.check_sync_trace()
         super().cleanup()
         self.state["retention"]["workspace"] = "guardedly removed"
         self.save()
@@ -2714,6 +3107,8 @@ def main(argv=None):
             command.add_argument("--build-provenance", type=Path)
             command.add_argument("--application-cpus", type=cpu_list)
             command.add_argument("--daemon-cpus", type=cpu_list)
+            command.add_argument("--daemon-diagnostic", choices=("sync-calls",), default=None,
+                                 help="myfs only; isolated verified sync wrapper build; excludes baseline")
             command.add_argument("--diagnostic", choices=("python-cpu",), default=None,
                                  help="opt-in application CPU profile; instrumented completion is excluded from baseline")
         for limit, default in (("readiness", 10), ("application", 30), ("shutdown", 30), ("io", 30)):
@@ -2744,6 +3139,7 @@ def main(argv=None):
                 daemon=getattr(args, "daemon", None), build_provenance=getattr(args, "build_provenance", None),
                 application_affinity=getattr(args, "application_cpus", None), daemon_affinity=getattr(args, "daemon_cpus", None),
                 materialize=args.materialize, diagnostic=getattr(args, "diagnostic", None),
+                daemon_diagnostic=getattr(args, "daemon_diagnostic", None),
                 **{name + "_seconds": getattr(args, name + "_seconds")
                                                for name in ("readiness", "application", "shutdown", "io",
                                                             "staging", "verification", "overall")})
