@@ -2853,8 +2853,753 @@ class DaemonSyncLifecycleTests(unittest.TestCase):
             self.assertEqual(result.returncode,0)
             self.assertNotIn("--daemon-diagnostic",result.stdout)
         result=subprocess.run(base+["measure-prepare","--help"],capture_output=True,text=True,timeout=5)
-        self.assertIn("--daemon-diagnostic {sync-calls}",result.stdout)
+        self.assertIn("--daemon-diagnostic {sync-calls,backing-io}",result.stdout)
 
+
+class IOMeasurementProcesses(SyncMeasurementProcesses):
+    """Fake mount/process lifecycle with real bounded controller artifact checks."""
+    def wait(self, identity, deadline):
+        code = MeasurementProcesses.wait(self, identity, deadline)
+        entry = next(e for e in self.entries if e["identity"] == identity)
+        entry["reap_count"] = self.reaps[identity["pid"]]
+        if identity == self.trace_identity and self.trace_fd is not None:
+            try:
+                app = next(e for e in self.entries if str(application.__file__) in e["command"])
+                rows = BackingIORunnerTests.trace()
+                env = self.trace_environment
+                rows[0].update(trial_id=env["M0_IO_TRIAL"], token=env["M0_IO_TOKEN"],
+                    pid=identity["pid"], expected_affinity=env["M0_IO_AFFINITY"],
+                    enabled_monotonic_ns=round((entry["launch_monotonic"]+.01)*1e9))
+                for i, row in enumerate(rows[1:-1]):
+                    row["e"][1]=identity["pid"]+i
+                    row["e"][5]=round((app["launch_monotonic"]+1+i)*1e9)
+                    row["e"][6]=round((app["launch_monotonic"]+2+i)*1e9)
+                    row["e"][12]=row["e"][5]-1000
+                    row["e"][16]=env["M0_IO_AFFINITY"]
+                rows[-1].update(finalized_monotonic_ns=round((entry["exit_monotonic"]-.01)*1e9),
+                    trial_id=rows[0]["trial_id"], token=rows[0]["token"], pid=identity["pid"])
+                if self.trace_error == "incomplete": rows.pop()
+                elif self.trace_error == "foreign": rows[0]["pid"]=99999
+                elif self.trace_error == "affinity": rows[1]["e"][13]=1
+                elif self.trace_error == "sync": rows[0]["schema"]=runner.SYNC_SCHEMA
+                if self.trace_error != "missing":
+                    os.write(self.trace_fd,("\n".join(json.dumps(r,separators=(",",":")) for r in rows)+"\n").encode())
+            finally:
+                os.close(self.trace_fd); self.trace_fd=None
+        return code
+
+
+class BackingIORunnerTests(unittest.TestCase):
+    """Backing-I/O controller evidence is mocked unless explicitly stated."""
+    setUp = DaemonSyncTests.setUp
+    tearDown = DaemonSyncTests.tearDown
+
+    def provenance(self):
+        receipt = DaemonSyncLifecycleTests.provenance(self)
+        detail = receipt.pop("daemon_sync")
+        detail.update(schema="myfs-m0-backing-io-build-v1", wrap_symbols=runner.IO_SYMBOLS,
+            compile_definitions=["M0_DIAGNOSTIC_BACKING_IO"],
+            coverage=[dict(source=s,function=f,operation=o,source_line=n,
+                           linked_call_address="abc",target="__wrap_"+o) for s,f,o,n in runner.IO_SITES])
+        receipt["daemon_backing_io"]=detail
+        return receipt
+
+    def prepare(self, **kwargs):
+        self.processes=IOMeasurementProcesses(self.clock)
+        return runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.refs,
+            backend="myfs", records=8, expected_device="259:7", processes=self.processes,
+            mounts=self.mounts, host=self.host, clock=self.clock, daemon_affinity=[0],
+            daemon=Path(sys.executable).resolve(), build_provenance=self.provenance(),
+            daemon_diagnostic="backing-io", **kwargs)
+
+    def test_full_fake_io_lifecycle_fd_timing_ownership_and_cleanup(self):
+        with mock.patch.dict(os.environ, {key:"unrelated" for key in runner.SYNC_ENV+runner.IO_ENV}):
+            trial=self.prepare()
+            self.assertEqual(trial.state["outcome"],"prepared",trial.state["error"])
+            canonical=trial.canonical_snapshot()
+            self.assertTrue(trial.execute(),trial.state["error"])
+        self.assertEqual(trial.state["measurement_population"],"daemon_backing_io_instrumented_application_completion")
+        self.assertFalse(trial.state["baseline_eligible"])
+        self.assertEqual(trial.state["measurements"]["application"]["wall_seconds"]["value"],5.)
+        options=self.processes.launch_options
+        self.assertEqual([len(x["pass_fds"]) for x in options],[0,1,0])
+        for i in (0,2): self.assertFalse(set(runner.SYNC_ENV+runner.IO_ENV)&set(options[i]["env"]))
+        self.assertFalse(set(runner.SYNC_ENV)&set(options[1]["env"]))
+        self.assertEqual(options[1]["env"]["M0_IO_AFFINITY"],format(1,"0256x"))
+        trace=trial.state["daemon_diagnostic"]["trace"]
+        self.assertTrue(trace["valid"])
+        self.assertEqual(trace["daemon"],options[1]["identity"])
+        self.assertEqual(trace["report"]["evidence"],"mocked")
+        self.assertEqual(self.mounts.events,["mount","stat-probe","unmount"]*3)
+        self.assertTrue(all(v==1 for v in self.processes.reaps.values()))
+        self.assertEqual(canonical,trial.canonical_snapshot())
+        self.assertIn("NOT COLLECTED",trial.state["daemon_diagnostic"]["preparation"]["reason"])
+        trial.cleanup()
+        self.assertTrue(Path(trace["artifact"]).exists())
+        self.assertTrue(trial.canonical_directory.exists())
+        self.assertFalse(trial.workspace.exists())
+
+    def test_io_config_and_affinity_cannot_change_after_preparation(self):
+        trial=self.prepare()
+        trial.state["affinities"]["daemon"]=[1]
+        with self.assertRaisesRegex(runner.TrialError,"affinity"): trial.check_paths()
+        trial.state["affinities"]["daemon"]=[0]
+        trial.state["daemon_diagnostic"]["configuration"]["mode"]="sync-calls"
+        with self.assertRaises(runner.TrialError): trial.check_paths()
+
+    def test_io_evidence_failure_retains_workspace_and_refuses_cleanup(self):
+        for mode in ("missing","incomplete","foreign","affinity","sync"):
+            with self.subTest(mode=mode):
+                trial=self.prepare(); self.processes.trace_error=mode
+                self.assertFalse(trial.execute())
+                self.assertFalse(trial.state["daemon_diagnostic"]["trace"]["valid"])
+                self.assertTrue(trial.workspace.exists())
+                with self.assertRaises(runner.TrialError): trial.cleanup()
+
+    def test_io_trace_hash_identity_and_receipt_changes_block_cleanup(self):
+        for mode in ("corrupt","replace","receipt"):
+            trial=self.prepare(); self.assertTrue(trial.execute(),trial.state["error"])
+            raw,receipt=(trial.artifacts/n for n in runner.sync_names(trial.anchor["trial_id"],"backing-io"))
+            if mode=="corrupt": raw.write_bytes(raw.read_bytes()[:-1])
+            elif mode=="receipt": receipt.write_text("{}")
+            else:
+                blob=raw.read_bytes(); raw.rename(raw.with_suffix(".saved")); raw.write_bytes(blob); raw.chmod(0o600)
+            with self.assertRaises(runner.TrialError): trial.cleanup()
+            self.assertTrue(trial.workspace.exists())
+
+    def test_io_artifact_symlink_and_overwrite_refusal(self):
+        for link in (False,True):
+            trial=self.prepare()
+            raw=trial.artifacts/runner.sync_names(trial.anchor["trial_id"],"backing-io")[0]
+            target=self.parent/("untouched-"+trial.anchor["trial_id"]); target.write_text("untouched")
+            if link: raw.symlink_to(target)
+            else: raw.write_text("existing")
+            self.assertFalse(trial.execute())
+            self.assertEqual(target.read_text(),"untouched")
+
+    def test_io_timeout_abnormal_exit_retains_evidence(self):
+        for flag in ("application_timeout","shutdown_timeout","abnormal_exit"):
+            trial=self.prepare(); setattr(self.processes,flag,True)
+            try:
+                self.assertFalse(trial.execute())
+                with self.assertRaises(runner.TrialError): trial.cleanup()
+            finally:
+                if self.processes.trace_fd is not None: os.close(self.processes.trace_fd)
+
+    def test_io_provenance_fields_refuse_wrong_mode_or_coverage(self):
+        for key,value in (("compile_definitions",[]),("wrap_symbols",["pread"]),
+                ("schema","myfs-m0-sync-build-v1"),("coverage",[]),("wrapper_sha256","0"*64)):
+            receipt=self.provenance(); receipt["daemon_backing_io"][key]=value
+            with self.assertRaises(runner.TrialError): runner.sync_build(receipt["daemon"]["path"],receipt,"backing-io")
+
+    def test_unprofiled_daemon_refuses_ambient_diagnostic_handoff(self):
+        trial=DaemonSyncTests.prepare(self)
+        with mock.patch.dict(os.environ,{"M0_IO_FD":"17"}):
+            with self.assertRaisesRegex(runner.TrialError,"ambient"):
+                trial.launch_daemon(["unused"],self.parent/"unused.log",1024,0)
+
+    @staticmethod
+    def trace():
+        rows = DaemonSyncTests.trace()
+        mask = format(1, "0256x")
+        rows[0].update(schema="m0-daemon-backing-io-v1", mode="backing-io",
+            event_fields=["sequence", "tid", "symbol", "fd", "caller", "entry_ns", "exit_ns",
+                "return_value", "errno", "requested_bytes", "offset", "buffer_size",
+                "affinity_ns", "affinity_status", "affinity_errno", "clock_error", "affinity"],
+            symbols=["pread", "pwrite", "read", "write", "__pread_chk"],
+            affinity_bits=1024, expected_affinity=mask, event_size_bytes=256,
+            event_memory_bytes=256*8192, max_event_line_bytes=492, max_serialized_bytes=4035584)
+        rows[1] = {"e": [1, 123, 0, 5, 8192, 2000000000, 4000000000, 3, 11, 8, -1, None,
+                         1900000000, 0, 0, 0, mask]}
+        rows[2] = {"e": [2, 124, 3, 6, 8200, 3000000000, 5000000000, -1, 4, 8, None, None,
+                         2900000000, 0, 0, 0, mask]}
+        rows[-1].update(canceled=0, affinity_errors=0)
+        return rows
+
+    def decode(self, rows):
+        raw = ("\n".join(json.dumps(r, separators=(",", ":")) for r in rows)+"\n").encode("ascii")
+        return runner.decode_backing_io_trace(raw, trial_id="a"*32, token="b"*32,
+            child={"identity": {"pid":123}, "launch_monotonic":.5, "exit_monotonic":7.,
+                   "exit_status":0, "reap_count":1}, application_interval=[2.5,4.5],
+            shutdown_start=5.5, evidence="mocked", expected_affinity=format(1, "0256x"))
+
+    def test_independent_io_decoder_counts_bytes_and_overlap(self):
+        report = self.decode(self.trace())
+        self.assertEqual(report["schema"], "m0-daemon-backing-io-v1")
+        self.assertEqual(report["summary"]["requested_bytes"], 16)
+        self.assertEqual(report["summary"]["transferred_bytes"], 3)
+        self.assertEqual(report["summary"]["partial_count"], 1)
+        self.assertEqual(report["summary"]["failed_count"], 1)
+        self.assertEqual(report["summary"]["union_seconds"], 3.)
+        self.assertEqual(report["summary"]["summed_seconds"], 4.)
+        self.assertEqual(report["failed_errno_counts"], {"4":1})
+        self.assertEqual(report["evidence"], "mocked")
+        self.assertEqual(report["affinity"]["observed_tids"], [123,124])
+
+    def test_io_decoder_rejects_invalid_values_and_mode_swaps(self):
+        import copy
+        mutations = [lambda r: r[0].update(schema="m0-daemon-sync-v1"),
+            lambda r: r[0].update(mode="sync-calls"), lambda r: r[0].update(expected_affinity="0"*256),
+            lambda r: r[0].update(max_serialized_bytes=4194305),
+            lambda r: r[-1].update(complete=False), lambda r: r[-1].update(dropped=1),
+            lambda r: r[-1].update(canceled=1), lambda r: r[-1].update(affinity_errors=1),
+            lambda r: r[-1].update(overflow=True), lambda r: r[-1].update(inflight=1),
+            lambda r: r[-1].update(live_threads=2), lambda r: r[-1].update(written=1),
+            lambda r: r.pop(), lambda r: r[0].update(pid=999)]
+        for index, value in ((0,True),(1,0),(2,5),(3,2**31),(4,0),(5,5000000001),
+                             (7,-2),(7,9),(8,-2**31-1),(9,-1),(9,2**64),(10,2**63),(11,1),
+                             (12,5000000000),(13,1),(13,2),(14,1),(15,1),(16,"0"*256)):
+            mutations.append(lambda r, i=index, v=value: r[1]["e"].__setitem__(i,v))
+        for change in mutations:
+            rows=copy.deepcopy(self.trace()); change(rows)
+            with self.subTest(rows=rows), self.assertRaises(runner.TrialError): self.decode(rows)
+        rows=self.trace(); rows[2]["e"][10]=0
+        with self.assertRaises(runner.TrialError): self.decode(rows)
+        rows=self.trace(); rows[1]["e"][2]=4
+        with self.assertRaises(runner.TrialError): self.decode(rows)
+
+    def test_io_decoder_fortified_zero_and_thread_order(self):
+        rows=self.trace(); rows[1]["e"][2]=4; rows[1]["e"][11]=8
+        rows[1]["e"][7]=0
+        self.assertEqual(self.decode(rows)["summary"]["zero_count"],1)
+        rows[1]["e"][11]=7
+        with self.assertRaises(runner.TrialError): self.decode(rows)
+        rows=self.trace(); rows[2]["e"][1]=123
+        with self.assertRaises(runner.TrialError): self.decode(rows)
+
+    def test_sync_decoder_does_not_accept_io_schema(self):
+        with self.assertRaises(runner.TrialError): DaemonSyncTests.decode(self,self.trace())
+
+    def test_io_decoder_rejects_noninteger_and_excess_memory_bounds(self):
+        for key in ("max_event_line_bytes","max_serialized_bytes","event_memory_bytes",
+                    "max_bytes","max_events","affinity_bits"):
+            rows=self.trace(); rows[0][key]=float(rows[0][key])
+            with self.subTest(key=key),self.assertRaises(runner.TrialError): self.decode(rows)
+        rows=self.trace(); rows[0].update(event_size_bytes=512,event_memory_bytes=512*8192)
+        with self.assertRaises(runner.TrialError): self.decode(rows)
+
+    def test_invalid_io_affinity_fails_closed(self):
+        for mask in (None,[],[True],[1024],[-1],[0,0],[{}],["0"]):
+            with self.subTest(mask=mask),self.assertRaises(runner.TrialError): runner.io_affinity(mask)
+
+    def test_io_decoder_rejects_duplicate_keys_truncation_and_size_overflow(self):
+        rows=self.trace()
+        raw=("\n".join(json.dumps(r,separators=(",",":")) for r in rows)+"\n").encode()
+        args=dict(trial_id="a"*32,token="b"*32,child={"identity":{"pid":123},
+            "launch_monotonic":.5,"exit_monotonic":7.,"exit_status":0,"reap_count":1},
+            application_interval=[2.5,4.5],shutdown_start=5.5,evidence="mocked",
+            expected_affinity=format(1,"0256x"))
+        for damaged in (raw[:-1],raw.replace(b'"pid":123',b'"pid":123,"pid":123',1),
+                        b' '*(4*1024**2)+b'\n',raw.replace(b'{"e":[1,',b'{"e":[true,',1)):
+            with self.assertRaises(runner.TrialError): runner.decode_backing_io_trace(damaged,**args)
+
+    def test_io_nonmyfs_and_combined_python_refused_before_allocation(self):
+        before=list(self.parent.iterdir())
+        for backend,python in (("ext4",None),("offline-check",None),("myfs","python-cpu")):
+            with self.assertRaises(runner.TrialError):
+                runner.MeasurementTrial.prepare(self.parent,canonical_parent=self.refs,
+                    backend=backend,records=8,daemon_diagnostic="backing-io",diagnostic=python)
+        self.assertEqual(list(self.parent.iterdir()),before)
+
+    def test_mode_configuration_and_distinct_artifact_names(self):
+        config = runner.sync_configuration("backing-io")
+        self.assertEqual(config["schema"], "m0-daemon-backing-io-v1")
+        self.assertEqual(config["max_bytes"], 4 * 1024**2)
+        self.assertNotEqual(runner.sync_names("a"*32), runner.sync_names("a"*32, "backing-io"))
+        self.assertEqual(runner.sync_configuration("sync-calls")["schema"], "m0-daemon-sync-v1")
+
+    def test_cli_repeated_conflicting_modes_refused_before_allocation(self):
+        import subprocess
+        command = [sys.executable, "-B", str(BENCHMARKS/"m0_profile.py"), "measure-prepare",
+            "--parent", str(self.parent), "--canonical-parent", str(self.refs),
+            "--backend", "myfs", "--expected-device", "259:7",
+            "--daemon-diagnostic", "sync-calls", "--daemon-diagnostic", "backing-io"]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("only once", result.stderr)
+        self.assertEqual(list(self.parent.iterdir()), [self.refs])
+
+    def test_backing_io_requires_explicit_affinity_and_mode_matched_build(self):
+        receipt = DaemonSyncLifecycleTests.provenance(self)
+        with self.assertRaisesRegex(runner.TrialError, "provenance"):
+            runner.sync_build(receipt["daemon"]["path"], receipt, "backing-io")
+        with self.assertRaisesRegex(runner.TrialError, "affinity"):
+            runner.MeasurementTrial.prepare(self.parent, canonical_parent=self.refs,
+                backend="myfs", records=8, expected_device="259:7",
+                daemon=Path(sys.executable).resolve(), build_provenance=receipt,
+                daemon_diagnostic="backing-io")
+
+
+
+class BackingIOWrapperTests(unittest.TestCase):
+    """Actual isolated C libc/linker checks; ordinary files, never myfs."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        import subprocess
+        cls.compiler = shutil.which("gcc")
+        if cls.compiler is None:
+            raise unittest.SkipTest("gcc unavailable: backing I/O wrappers unverified")
+        cls.temp = tempfile.TemporaryDirectory(prefix="m0-backing-io-tests-")
+        cls.directory = Path(cls.temp.name)
+        cls.component = BENCHMARKS / "m0_daemon_sync_diagnostic.c"
+        cls.source = cls.directory / "helper.c"
+        cls.source.write_text(r'''
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+extern ssize_t __pread_chk(int,void*,size_t,off_t,size_t);
+static void require(int condition) { if(!condition) abort(); }
+static int destructor_io;
+__attribute__((destructor)) static void ordinary_destructor(void) {
+    if(destructor_io) { char byte; require(read(-1,&byte,1)==-1 && errno==EBADF); }
+}
+static void *worker(void *arg) {
+    long count=(long)arg;
+    for(long i=0;i<count;++i) { char b; errno=0; require(read(-1,&b,1)==-1 && errno==EBADF); }
+    return NULL;
+}
+static int pipefd[2];
+static atomic_int cancel_tid;
+static void *cancel_worker(void *arg) {
+    if(arg) pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS,NULL);
+    atomic_store(&cancel_tid,(int)syscall(SYS_gettid));
+    char byte; ssize_t result=read(pipefd[0],&byte,1); (void)result; return NULL;
+}
+int main(int argc,char **argv) {
+    const char *mode=argc>1?argv[1]:"regular";
+    struct rlimit no_core={0,0}; require(setrlimit(RLIMIT_CORE,&no_core)==0);
+    if(!strcmp(mode,"threads") || !strcmp(mode,"overflow")) {
+        pthread_t threads[8]; long count=!strcmp(mode,"overflow")?1100:64;
+        for(int i=0;i<8;++i) require(!pthread_create(&threads[i],NULL,worker,(void*)count));
+        for(int i=0;i<8;++i) require(!pthread_join(threads[i],NULL));
+    } else if(!strcmp(mode,"cancel") || !strcmp(mode,"cancel-async") || !strcmp(mode,"live-thread")) {
+        require(!pipe(pipefd)); pthread_t thread;
+        require(!pthread_create(&thread,NULL,cancel_worker,!strcmp(mode,"cancel-async")?(void*)1:NULL));
+        /* Helper-only bounded observation of this owned TID's syscall. Direct
+           SYS_read deliberately avoids adding parent observations to the trace. */
+        char path[128],status[256]; int ready=0;
+        struct timespec begin,now; require(!clock_gettime(CLOCK_MONOTONIC,&begin));
+        while(!ready) {
+            int tid=atomic_load(&cancel_tid);
+            if(tid) {
+                snprintf(path,sizeof(path),"/proc/self/task/%d/syscall",tid);
+                int probe=open(path,O_RDONLY); require(probe>=0);
+                ssize_t n=syscall(SYS_read,probe,status,sizeof(status)-1); close(probe);
+                if(n>0) {
+                    status[n]=0; long number=-1; unsigned long arg=0;
+                    if(sscanf(status,"%ld %lx",&number,&arg)==2 &&
+                       number==SYS_read && arg==(unsigned long)pipefd[0]) ready=1;
+                }
+            }
+            require(!clock_gettime(CLOCK_MONOTONIC,&now));
+            require(now.tv_sec-begin.tv_sec<3); sched_yield();
+        }
+        if(!strcmp(mode,"live-thread")) return 0;
+        require(!pthread_cancel(thread)); void *result=NULL;
+        require(!pthread_join(thread,&result)); require(result==PTHREAD_CANCELED);
+        close(pipefd[0]); close(pipefd[1]);
+    } else {
+        FILE *file=tmpfile(); require(file!=NULL); int fd=fileno(file); char buf[8]={0};
+        errno=EAGAIN; require(pwrite(fd,"abcdef",6,0)==6 && errno==EAGAIN);
+        errno=EINTR; require(pread(fd,buf,8,0)==6 && errno==EINTR && !memcmp(buf,"abcdef",6));
+        errno=EAGAIN; require(write(fd,"xy",2)==2 && errno==EAGAIN);
+        require(lseek(fd,0,SEEK_SET)==0);
+        errno=EINTR; require(read(fd,buf,8)==6 && errno==EINTR);
+        errno=EAGAIN; require(__pread_chk(fd,buf,6,0,sizeof(buf))==6 && errno==EAGAIN);
+        require(pread(fd,buf,0,-1)==-1 && errno==EINVAL);
+        require(pread(fd,buf,0,0)==0);
+        require(pwrite(fd,buf,0,0)==0);
+        require(read(fd,buf,0)==0);
+        require(write(fd,buf,0)==0);
+        require(__pread_chk(fd,buf,0,0,sizeof(buf))==0);
+        require(pread(-1,buf,1,0)==-1 && errno==EBADF);
+        require(pwrite(-1,buf,1,0)==-1 && errno==EBADF);
+        require(read(-1,buf,1)==-1 && errno==EBADF);
+        require(write(-1,buf,1)==-1 && errno==EBADF);
+        require(__pread_chk(-1,buf,1,0,sizeof(buf))==-1 && errno==EBADF);
+        if(!strcmp(mode,"fortify")) {
+            volatile size_t bad=9; ssize_t result=__pread_chk(fd,buf,bad,0,sizeof(buf)); (void)result; return 77;
+        }
+        if(!strcmp(mode,"incomplete")) _exit(0);
+        if(!strcmp(mode,"destructor")) destructor_io=1;
+        if(!strcmp(mode,"fork")) {
+            pid_t child=fork(); require(child>=0);
+            if(!child) {
+                errno=0; if(fcntl(atoi(argv[2]),F_GETFD)!=-1 || errno!=EBADF) _exit(9);
+                char byte; if(read(-1,&byte,1)!=-1 || errno!=EBADF) _exit(10);
+                _exit(0);
+            }
+            int status=0; require(waitpid(child,&status,0)==child && status==0);
+            require(read(-1,buf,1)==-1 && errno==EBADF);
+        }
+        if(!strcmp(mode,"write-failure")) {
+            int replacement=open(argv[3],O_RDONLY); require(replacement>=0);
+            require(dup2(replacement,atoi(argv[2]))>=0); close(replacement);
+        }
+        if(!strcmp(mode,"handoff")) {
+            require(!getenv("M0_IO_FD") && !getenv("M0_IO_TRIAL") &&
+                    !getenv("M0_IO_TOKEN") && !getenv("M0_IO_AFFINITY"));
+            require(fcntl(atoi(argv[2]),F_GETFD)&FD_CLOEXEC);
+        }
+        fclose(file);
+    }
+    return 0;
+}
+''')
+        cls.flags = [cls.compiler,"-O2","-g","-fno-omit-frame-pointer","-Wall","-Wextra","-Werror","-pthread",
+                     "-DM0_DIAGNOSTIC_BACKING_IO=1"]
+        cls.wraps = ["-Wl,--wrap=pread,--wrap=pwrite,--wrap=read,--wrap=write,--wrap=__pread_chk"]
+        cls.helper = cls.directory / "helper"
+        command=cls.flags+[str(cls.source),str(cls.component)]+cls.wraps+["-o",str(cls.helper)]
+        result=subprocess.run(command,capture_output=True,text=True,timeout=30)
+        if result.returncode:
+            raise AssertionError(f"offline backing helper compile exit {result.returncode}: {result.stderr}")
+        cls.commands=[command]
+
+        cls.stub_source=cls.directory/"stub.c"
+        cls.stub_source.write_text(r'''
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+extern void *expected_pointer;
+int counts[5];
+static ssize_t check(int operation,int fd,void *buffer,size_t count,off_t offset,size_t buffer_size) {
+ int index=counts[operation]++;
+ if(errno!=EDOM || fd!=17 || buffer!=expected_pointer || count!=(index==4?SIZE_MAX:9) ||
+    ((operation==0 || operation==1 || operation==4) && offset!=(index==4?INT64_MIN:-17)) ||
+    (operation==4 && buffer_size!=(index==4?SIZE_MAX:123))) abort();
+ if(index==4) { errno=INT_MIN; return SSIZE_MAX; }
+ if(index==0) { errno=EAGAIN; return 7; }
+ if(index==1) { errno=EINTR; return -1; }
+ if(index==2) { errno=EBADF; return 0; }
+ if(index==3) { errno=-17; return 9; }
+ abort();
+}
+ssize_t pread(int fd,void *b,size_t n,off_t o) { return check(0,fd,b,n,o,0); }
+ssize_t pwrite(int fd,const void *b,size_t n,off_t o) { return check(1,fd,(void*)b,n,o,0); }
+ssize_t read(int fd,void *b,size_t n) { return check(2,fd,b,n,0,0); }
+ssize_t write(int fd,const void *b,size_t n) {
+ if(fd!=17) return syscall(SYS_write,fd,b,n);
+ return check(3,fd,(void*)b,n,0,0);
+}
+ssize_t __pread_chk(int fd,void *b,size_t n,off_t o,size_t z) { return check(4,fd,b,n,o,z); }
+''')
+        cls.count_source=cls.directory/"count.c"
+        cls.count_source.write_text(r'''
+#include <errno.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <limits.h>
+#include <unistd.h>
+extern ssize_t __pread_chk(int,void*,size_t,off_t,size_t);
+extern int counts[5];
+char buffer[16]; void *expected_pointer=buffer;
+int main(void) {
+ const ssize_t values[]={7,-1,0,9,SSIZE_MAX}; const int errors[]={EAGAIN,EINTR,EBADF,-17,INT_MIN};
+ for(int operation=0;operation<5;++operation) {
+  for(int attempt=0;attempt<5;++attempt) {
+   volatile size_t count=attempt==4?SIZE_MAX:9;
+   off_t offset=attempt==4?INT64_MIN:-17; size_t size=attempt==4?SIZE_MAX:123;
+   errno=EDOM; ssize_t result;
+   switch(operation) {
+    case 0:result=pread(17,buffer,count,offset);break;
+    case 1:result=pwrite(17,buffer,count,offset);break;
+    case 2:result=read(17,buffer,count);break;
+    case 3:result=write(17,buffer,count);break;
+    default:result=__pread_chk(17,buffer,count,offset,size);break;
+   }
+   if(result!=values[attempt] || errno!=errors[attempt]) abort();
+  }
+  if(counts[operation]!=5) abort();
+ }
+ return 0;
+}
+''')
+        cls.count_helper=cls.directory/"count"
+        variants=[("count",[cls.count_source,cls.stub_source])]
+        for name,definition in (
+            ("affinity-failure", "#define _GNU_SOURCE\n#include <errno.h>\n#include <sched.h>\nint sched_getaffinity(pid_t p,size_t n,cpu_set_t*m){(void)p;(void)n;(void)m;errno=EPERM;return -1;}\n"),
+            ("clock-failure", "#include <errno.h>\n#include <time.h>\nint clock_gettime(clockid_t c,struct timespec*t){(void)c;(void)t;errno=EIO;return -1;}\n"),
+            ("partial-output", "#define _GNU_SOURCE\n#include <errno.h>\n#include <unistd.h>\n#include <sys/syscall.h>\nssize_t write(int f,const void*b,size_t n){static unsigned calls;if(++calls<=3){errno=EINTR;return -1;}return syscall(SYS_write,f,b,n>1?1:n);}\n"),
+            ("interrupted-output", "#define _GNU_SOURCE\n#include <errno.h>\n#include <unistd.h>\nssize_t write(int f,const void*b,size_t n){(void)f;(void)b;(void)n;errno=EINTR;return -1;}\n")):
+            source=cls.directory/(name+".c");source.write_text(definition)
+            # Output-failure fixtures call only read(-1), so the fake serialization
+            # writer cannot interfere with the workload operation under test.
+            if "output" in name:
+                main=cls.directory/(name+"-main.c")
+                main.write_text("#include <errno.h>\n#include <unistd.h>\nint main(void){char b;return read(-1,&b,1)==-1 && errno==EBADF?0:2;}\n")
+            else: main=cls.source
+            variants.append((name,[main,source]))
+        for name,sources in variants:
+            command=cls.flags+(["-U_FORTIFY_SOURCE","-D_FORTIFY_SOURCE=0"] if name=="count" else [])+[str(p) for p in sources]+[str(cls.component)]+cls.wraps+["-o",str(cls.directory/name)]
+            result=subprocess.run(command,capture_output=True,text=True,timeout=30)
+            if result.returncode:
+                raise AssertionError(f"offline {name} compile exit {result.returncode}: {result.stderr}")
+            cls.commands.append(command)
+        # Test-only same-translation-unit access verifies the actual C serializer
+        # at every numeric width. These are fabricated sizing records, not I/O.
+        maximum=cls.directory/"maximum.c"
+        maximum.write_text('#include "'+str(cls.component)+'"\n'+r'''
+int main(void) {
+ observed=recorded=M0_SYNC_MAX_EVENTS;
+ for(unsigned i=0;i<M0_SYNC_MAX_EVENTS;++i) {
+  struct sync_event *e=&events[i]; memset(e,0,sizeof(*e));
+  e->sequence=i+1;e->tid=INT32_MAX;e->operation=4;e->fd=INT32_MIN;
+  e->caller=e->entry_ns=e->exit_ns=e->requested=e->buffer_size=e->affinity_ns=UINT64_MAX;
+  e->result=e->offset=INT64_MIN;e->saved_errno=INT32_MIN;
+  e->affinity_status=1;e->affinity_errno=INT32_MAX;e->clock_error=1;
+  for(int cpu=0;cpu<CPU_SETSIZE;++cpu)CPU_SET(cpu,&e->affinity);
+ }
+ /* Deliberately invalid metadata prevents a complete claim for synthetic rows. */
+ affinity_errors=clock_errors=recording_errors=1;
+ return 0;
+}
+''')
+        command=cls.flags+[str(maximum)]+cls.wraps+["-o",str(cls.directory/"maximum")]
+        result=subprocess.run(command,capture_output=True,text=True,timeout=30)
+        if result.returncode:
+            raise AssertionError(f"maximum serialization compile exit {result.returncode}: {result.stderr}")
+        cls.commands.append(command)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def invoke(self, mode="regular", *, enabled=True, changes=None, binary=None, expected_status=0):
+        import subprocess
+        import uuid
+        import time
+        root=self.directory/uuid.uuid4().hex
+        root.mkdir(mode=0o700)
+        path=root/"events.jsonl"
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        env={k:v for k,v in os.environ.items() if not k.startswith(("M0_IO_","M0_SYNC_"))}
+        mask=sum(1<<cpu for cpu in os.sched_getaffinity(0))
+        if enabled:
+            env.update(M0_IO_FD=str(fd),M0_IO_TRIAL="1"*32,M0_IO_TOKEN="2"*32,M0_IO_AFFINITY=f"{mask:0256x}")
+        if changes: env.update(changes)
+        try:
+            launched=time.monotonic()
+            result=subprocess.run([str(binary or self.helper),mode,str(fd),str(path)],env=env,
+                pass_fds=(fd,),capture_output=True,text=True,timeout=10)
+            result.launch_monotonic=launched
+            result.exit_monotonic=time.monotonic()
+        finally: os.close(fd)
+        self.assertEqual(result.returncode,expected_status,result.stderr)
+        rows=[json.loads(line) for line in path.read_bytes().splitlines()]
+        return result,path,rows
+
+    def events(self, rows):
+        return [dict(zip(rows[0]["event_fields"],row["e"])) for row in rows[1:-1]]
+
+    def test_all_five_real_libc_families_signed_results_errno_and_partial_zero(self):
+        import errno
+        _,_,rows=self.invoke()
+        self.assertEqual(rows[0]["schema"],"m0-daemon-backing-io-v1")
+        self.assertTrue(rows[-1]["complete"])
+        events=self.events(rows)
+        self.assertEqual(len(events),16)
+        self.assertEqual([e["symbol"] for e in events[:5]],[1,0,3,2,4])
+        self.assertEqual([e["return_value"] for e in events[:5]],[6,6,2,6,6])
+        self.assertEqual([e["errno"] for e in events[:5]],[errno.EAGAIN,errno.EINTR,errno.EAGAIN,errno.EINTR,errno.EAGAIN])
+        self.assertEqual(events[1]["requested_bytes"],8)
+        self.assertEqual(events[5]["offset"],-1)
+        self.assertEqual(events[4]["buffer_size"],8)
+        self.assertEqual([e["return_value"] for e in events[6:11]],[0]*5)
+        self.assertEqual([e["errno"] for e in events[-5:]],[errno.EBADF]*5)
+        for event in events:
+            self.assertGreater(event["caller"],rows[0]["module_base"])
+            self.assertLessEqual(event["affinity_ns"],event["entry_ns"])
+            self.assertLessEqual(event["entry_ns"],event["exit_ns"])
+            self.assertEqual(event["affinity_status"],0)
+            self.assertEqual(event["affinity"],rows[0]["expected_affinity"])
+
+    def test_disabled_recording_does_not_change_libc_results(self):
+        _,_,rows=self.invoke(enabled=False)
+        self.assertEqual(rows,[])
+
+    def test_fortified_invalid_call_terminates_only_isolated_child(self):
+        import signal
+        result,_,rows=self.invoke("fortify",expected_status=-signal.SIGABRT)
+        self.assertIn("buffer overflow",result.stderr)
+        self.assertEqual(rows,[])
+
+    def test_late_threads_have_direct_event_time_affinity_and_unique_sequences(self):
+        _,_,rows=self.invoke("threads")
+        events=self.events(rows)
+        self.assertEqual(len(events),512)
+        self.assertEqual([e["sequence"] for e in events],list(range(1,513)))
+        self.assertEqual(len({e["tid"] for e in events}),8)
+        self.assertNotIn(rows[0]["pid"],{e["tid"] for e in events})
+        self.assertTrue(all(e["affinity_status"]==0 for e in events))
+        self.assertTrue(rows[-1]["complete"])
+
+    def test_mismatched_affinity_marks_complete_population_invalid(self):
+        mask=sum(1<<cpu for cpu in os.sched_getaffinity(0)) ^ (1<<1023)
+        _,_,rows=self.invoke(changes={"M0_IO_AFFINITY":f"{mask:0256x}"})
+        self.assertFalse(rows[-1]["complete"])
+        self.assertEqual(rows[-1]["affinity_errors"],16)
+        self.assertTrue(all(e["affinity_status"]==1 for e in self.events(rows)))
+
+    def test_overflow_is_explicit_bounded_and_does_not_replace_events(self):
+        _,path,rows=self.invoke("overflow")
+        self.assertEqual(rows[-1]["observed"],8800)
+        self.assertEqual(rows[-1]["written"],8192)
+        self.assertEqual(rows[-1]["dropped"],608)
+        self.assertTrue(rows[-1]["overflow"])
+        self.assertFalse(rows[-1]["complete"])
+        self.assertLessEqual(path.stat().st_size,4*1024*1024)
+
+    def test_worst_case_serialized_records_fit_strict_complete_artifact_limit(self):
+        _,_,rows=self.invoke()
+        worst=[8192,2147483647,4,-2147483648,*([2**64-1]*3),-2**63,-2147483648,
+               2**64-1,-2**63,2**64-1,2**64-1,2,2147483647,1,"f"*256]
+        line=json.dumps({"e":worst},separators=(",",":"))+"\n"
+        self.assertEqual(len(line),492)
+        self.assertEqual(rows[0]["max_event_line_bytes"],492)
+        self.assertEqual(rows[0]["max_serialized_bytes"],8192*492+4096+1024)
+        self.assertLessEqual(rows[0]["max_serialized_bytes"],4*1024*1024)
+        self.assertEqual(rows[0]["event_memory_bytes"],8192*rows[0]["event_size_bytes"])
+
+    def test_normal_finalization_with_write_wrapping_never_recurses(self):
+        _,_,rows=self.invoke("handoff")
+        self.assertEqual(rows[-1]["written"],16)
+        self.assertEqual(rows[-1]["recording_errors"],0)
+        self.assertTrue(rows[-1]["complete"])
+
+    def test_failed_output_and_abnormal_exit_have_no_valid_footer(self):
+        for mode in ("write-failure","incomplete"):
+            with self.subTest(mode=mode):
+                _,_,rows=self.invoke(mode)
+                self.assertFalse(rows and rows[-1].get("complete"))
+
+    def test_cancellation_cannot_deadlock_or_claim_unrecorded_call_is_complete(self):
+        for mode in ("cancel","cancel-async"):
+            with self.subTest(mode=mode):
+                _,_,rows=self.invoke(mode)
+                self.assertFalse(rows[-1]["complete"])
+                self.assertGreater(rows[-1]["canceled"],0)
+                self.assertEqual(rows[-1]["inflight"],0)
+                self.assertEqual(rows[-1]["observed"],rows[-1]["written"]+rows[-1]["dropped"])
+
+    def test_exactly_once_all_arguments_and_eintr_short_zero_result_preservation(self):
+        import errno
+        for enabled in (False,True):
+            _,_,rows=self.invoke(binary=self.count_helper,enabled=enabled)
+            if not enabled:
+                self.assertEqual(rows,[])
+                continue
+            events=self.events(rows)
+            self.assertEqual(len(events),25)
+            for operation in range(5):
+                group=events[operation*5:(operation+1)*5]
+                self.assertEqual([e["symbol"] for e in group],[operation]*5)
+                self.assertEqual([e["requested_bytes"] for e in group],[9]*4+[2**64-1])
+                self.assertEqual([e["return_value"] for e in group],[7,-1,0,9,2**63-1])
+                self.assertEqual([e["errno"] for e in group],[errno.EAGAIN,errno.EINTR,errno.EBADF,-17,-2**31])
+                self.assertEqual([e["offset"] for e in group],([-17]*4+[-2**63]) if operation in (0,1,4) else [None]*5)
+                self.assertEqual([e["buffer_size"] for e in group],([123]*4+[2**64-1]) if operation==4 else [None]*5)
+            self.assertTrue(rows[-1]["complete"])
+
+    def test_failed_affinity_observation_is_explicit_and_invalid(self):
+        import errno
+        _,_,rows=self.invoke(binary=self.directory/"affinity-failure")
+        self.assertFalse(rows[-1]["complete"])
+        self.assertEqual(rows[-1]["affinity_errors"],16)
+        for event in self.events(rows):
+            self.assertEqual(event["affinity_status"],2)
+            self.assertEqual(event["affinity_errno"],errno.EPERM)
+            self.assertIsNone(event["affinity"])
+
+    def test_clock_failure_preserves_libc_behavior_and_invalidates_trace(self):
+        _,_,rows=self.invoke(binary=self.directory/"clock-failure")
+        self.assertFalse(rows[-1]["complete"])
+        self.assertGreater(rows[-1]["clock_errors"],0)
+        self.assertTrue(all(e["clock_error"] for e in self.events(rows)))
+
+    def test_recorder_partial_writes_and_bounded_eintr_retry(self):
+        _,_,rows=self.invoke(binary=self.directory/"partial-output")
+        self.assertTrue(rows[-1]["complete"])
+        self.assertEqual(rows[-1]["written"],1)
+        _,path,rows=self.invoke(binary=self.directory/"interrupted-output")
+        self.assertEqual(rows,[])
+        self.assertEqual(path.stat().st_size,0)
+
+    def test_backing_binary_excludes_sync_wrappers_and_rejects_combined_build(self):
+        import subprocess
+        symbols=subprocess.run(["nm",str(self.helper)],capture_output=True,text=True,timeout=5)
+        self.assertEqual(symbols.returncode,0)
+        self.assertNotIn("__wrap_fsync",symbols.stdout)
+        self.assertNotIn("__wrap_fdatasync",symbols.stdout)
+        for symbol in ("pread","pwrite","read","write","__pread_chk"):
+            self.assertIn("__wrap_"+symbol,symbols.stdout)
+        result=subprocess.run(self.flags+["-DM0_DIAGNOSTIC_SYNC_CALLS=1","-c",str(self.component),
+            "-o",str(self.directory/"forbidden.o")],capture_output=True,text=True,timeout=10)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn("select exactly one",result.stderr)
+
+    def test_actual_compact_trace_is_accepted_by_independent_controller_decoder(self):
+        result,path,rows=self.invoke()
+        child={"identity":{"pid":rows[0]["pid"]},"exit_status":0,"reap_count":1,
+               "launch_monotonic":result.launch_monotonic,
+               "exit_monotonic":result.exit_monotonic}
+        interval=[rows[0]["enabled_monotonic_ns"]/1e9,rows[-1]["finalized_monotonic_ns"]/1e9]
+        decoded=runner.decode_backing_io_trace(path.read_bytes(),trial_id="1"*32,token="2"*32,
+            child=child,application_interval=interval,shutdown_start=interval[-1],
+            expected_affinity=rows[0]["expected_affinity"],evidence="actual offline C helper")
+        self.assertTrue(decoded["valid"])
+        self.assertEqual(decoded["summary"]["event_count"],16)
+
+    def test_actual_c_serializer_handles_all_maximum_width_records_below_four_mib(self):
+        _,path,rows=self.invoke(binary=self.directory/"maximum")
+        raw=path.read_bytes()
+        self.assertFalse(rows[-1]["complete"])
+        self.assertEqual(len(rows)-2,8192)
+        self.assertEqual(max(len(line)+1 for line in raw.splitlines()[1:-1]),492)
+        self.assertLessEqual(len(raw),rows[0]["max_serialized_bytes"])
+        self.assertLessEqual(len(raw),4*1024*1024)
+        self.assertEqual(rows[0]["event_size_bytes"],232)
+        self.assertEqual(rows[0]["event_memory_bytes"],1900544)
+
+    def test_live_recording_thread_and_inflight_call_prevent_complete_finalization(self):
+        _,_,rows=self.invoke("live-thread")
+        self.assertFalse(rows[-1]["complete"])
+        self.assertEqual(rows[-1]["observed"],1)
+        self.assertEqual(rows[-1]["inflight"],1)
+        self.assertGreater(rows[-1]["live_threads"],1)
+        self.assertGreater(rows[-1]["recording_errors"],0)
+
+    def test_fork_descendant_cannot_inherit_active_recorder_or_writer(self):
+        _,_,rows=self.invoke("fork")
+        self.assertTrue(rows[-1]["complete"])
+        self.assertEqual(rows[-1]["written"],17)
+        self.assertEqual({event["tid"] for event in self.events(rows)},{rows[0]["pid"]})
+
+    def test_normal_priority_destructor_io_precedes_backing_trace_finalization(self):
+        _,_,rows=self.invoke("destructor")
+        self.assertTrue(rows[-1]["complete"])
+        self.assertEqual(rows[-1]["written"],17)
+        self.assertEqual(self.events(rows)[-1]["symbol"],2)
+        self.assertLessEqual(self.events(rows)[-1]["exit_ns"],rows[-1]["finalized_monotonic_ns"])
 
 if __name__ == "__main__":
     unittest.main()

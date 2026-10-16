@@ -129,8 +129,8 @@ to 16 MiB for raw data and 2 MiB for the receipt, within the 64 MiB trial budget
 Serialization errors retain partial files and invalidate the trial. Identity/hash
 checks detect accidental changes, not malicious rewriting of all same-user state.
 
-Isolated daemon sync diagnostics (measurement-only, myfs-only):
-  measure-prepare ... --backend myfs --daemon-diagnostic sync-calls
+Isolated daemon diagnostics (measurement-only, myfs-only):
+  measure-prepare ... --backend myfs --daemon-diagnostic sync-calls|backing-io
                   --daemon DIAGNOSTIC_ELF --build-provenance REVIEWED_JSON
 Only an independently built/reviewed executable is accepted: unchanged production
 objects plus m0_daemon_sync_diagnostic.c and --wrap=fsync,--wrap=fdatasync. No automatic
@@ -142,6 +142,32 @@ Python CPU profiling cannot be combined with daemon sync profiling. Ordinary
 measurements and smoke defaults remain unchanged. Instrumented child timing uses
 the same launch-to-wait4 boundary but is baseline-ineligible and labeled
  daemon_sync_instrumented_application_completion.
+
+backing-io is a separate build of that source with -DM0_DIAGNOSTIC_BACKING_IO,
+wrapping only pread,pwrite,read,write,__pread_chk. It requires daemon_backing_io
+provenance with schema myfs-m0-backing-io-build-v1, exact eight-source-site coverage,
+the five-symbol list and compile_definitions=["M0_DIAGNOSTIC_BACKING_IO"]. It never
+uses the sync-only executable. --daemon-cpus is required (CPUs 0..1023); its
+1024-bit mask is pinned in ownership metadata. Each event queries the current
+thread before real-call timing: this is not full-lifetime/thread coverage.
+Whole-child timing is daemon_backing_io_instrumented_application_completion and
+baseline-ineligible. The unmodified application's timing boundaries remain intact.
+
+The backing-I/O schema m0-daemon-backing-io-v1 uses compact JSON event arrays with
+fixed header field names and symbols. It preserves signed ssize_t results, signed
+off_t offsets, requested counts, fortified buffer sizes, saved errno and complete
+affinity masks without file contents. Byte totals count individual attempts and
+retries, not unique data or physical-device bytes. Success is determined by result,
+not stale errno. __pread_chk forwards all five arguments to libc fortification.
+The 8192-event buffer uses at most 2 MiB static memory on the reviewed ABI. The
+worst-case 492-byte event plus 4096-byte header and 1024-byte footer reservations
+totals 4035584 bytes, below the unchanged 4 MiB emitted cap. The independent
+receipt is capped at 1 MiB; all artifacts share the existing 64 MiB evidence budget.
+Recorder serialization deliberately bypasses wrapped write; no per-call file I/O.
+Cancellation marks the population incomplete without disabling cancellation during
+the real libc operation. Missing/footer/errors/affinity failures invalidate trials.
+Neither summed durations nor interval unions measure application waiting, native
+CPU costs, physical disk service or causal filesystem overhead.
 
 The same daemon executable is a directly owned child in all three mount cycles.
 Only application-mount launch inherits the exclusive private JSONL artifact FD,
@@ -1946,6 +1972,24 @@ SYNC_MAX_BYTES = 4 * 1024**2
 SYNC_MAX_EVENTS = 8192
 SYNC_WRAPPER = Path(__file__).with_name("m0_daemon_sync_diagnostic.c")
 SYNC_ENV = ("M0_SYNC_FD", "M0_SYNC_TRIAL", "M0_SYNC_TOKEN")
+IO_SCHEMA = "m0-daemon-backing-io-v1"
+IO_ENV = ("M0_IO_FD", "M0_IO_TRIAL", "M0_IO_TOKEN", "M0_IO_AFFINITY")
+IO_SYMBOLS = ["pread", "pwrite", "read", "write", "__pread_chk"]
+IO_FIELDS = ["sequence", "tid", "symbol", "fd", "caller", "entry_ns", "exit_ns",
+             "return_value", "errno", "requested_bytes", "offset", "buffer_size",
+             "affinity_ns", "affinity_status", "affinity_errno", "clock_error", "affinity"]
+IO_MAX_EVENT_LINE = 492
+IO_MAX_SERIALIZED = 8192 * IO_MAX_EVENT_LINE + 4096 + 1024
+IO_SITES = {
+    ("src/core/path.c", "validate_generation_marker", "read", 140),
+    ("src/core/path.c", "create_generation_storage", "write", 309),
+    ("src/core/metadata.c", "pread_full", "pread", 58),
+    ("src/core/metadata.c", "write_full", "write", 78),
+    ("src/core/compact.c", "pread_full_at", "__pread_chk", 1475),
+    ("src/core/compact.c", "pwrite_full_at", "pwrite", 1495),
+    ("src/core/chunkio.c", "pread_all", "pread", 16),
+    ("src/core/chunkio.c", "pwrite_all", "pwrite", 36),
+}
 SYNC_SITES = {
     ("src/core/path.c", "create_generation_storage", "fsync", 325),
     ("src/core/path.c", "fsync_parent_path", "fsync", 389),
@@ -1960,14 +2004,15 @@ SYNC_SITES = {
 
 
 def sync_configuration(mode):
-    if mode not in (None, "sync-calls"):
+    if mode not in (None, "sync-calls", "backing-io"):
         raise TrialError("invalid daemon diagnostic")
-    return {"schema": SYNC_SCHEMA, "mode": mode, "clock": "CLOCK_MONOTONIC" if mode else None,
+    return {"schema": IO_SCHEMA if mode == "backing-io" else SYNC_SCHEMA,
+            "mode": mode, "clock": "CLOCK_MONOTONIC" if mode else None,
             "max_bytes": SYNC_MAX_BYTES if mode else None,
             "collection": "application-mount lifecycle only" if mode else None}
 
 
-def sync_build(daemon, provenance):
+def sync_build(daemon, provenance, mode="sync-calls"):
     """Cross-check an independently produced build/coverage receipt; never build.
 
     This pins supplied evidence and current source, not a security attestation
@@ -1978,17 +2023,22 @@ def sync_build(daemon, provenance):
         binary = executable_identity(daemon)
         receipt = provenance if isinstance(provenance, dict) else read_json(strict_path(provenance))
         production = measurement_source()["production_files"]
-        detail = receipt["daemon_sync"]
+        if mode not in ("sync-calls", "backing-io"):
+            raise TrialError("invalid diagnostic build mode")
+        io_mode = mode == "backing-io"
+        detail = receipt["daemon_backing_io" if io_mode else "daemon_sync"]
+        expected_sites = IO_SITES if io_mode else SYNC_SITES
         sites = detail["coverage"]
         if (receipt.get("schema") != "m0-smoke-build-provenance-v1" or receipt.get("exit_status") != 0
                 or receipt.get("source_fingerprints_before") != production
                 or receipt.get("source_fingerprints_after") != production or receipt.get("daemon") != binary
-                or detail.get("schema") != "myfs-m0-sync-build-v1"
+                or detail.get("schema") != ("myfs-m0-backing-io-build-v1" if io_mode else "myfs-m0-sync-build-v1")
                 or detail.get("wrapper_sha256") != summary(SYNC_WRAPPER)["sha256"]
-                or detail.get("wrap_symbols") != ["fsync", "fdatasync"]
+                or detail.get("wrap_symbols") != (IO_SYMBOLS if io_mode else ["fsync", "fdatasync"])
+                or (io_mode and detail.get("compile_definitions") != ["M0_DIAGNOSTIC_BACKING_IO"])
                 or detail.get("coverage_verified") is not True
-                or len(sites) != len(SYNC_SITES)
-                or {(s["source"], s["function"], s["operation"], s["source_line"]) for s in sites} != SYNC_SITES
+                or len(sites) != len(expected_sites)
+                or {(s["source"], s["function"], s["operation"], s["source_line"]) for s in sites} != expected_sites
                 or any(s["target"] != "__wrap_" + s["operation"]
                        or not re.fullmatch(r"(?:0x)?[0-9a-f]+", s["linked_call_address"]) for s in sites)
                 or not all(f in detail.get("build_flags", []) for f in ("-O2", "-DNDEBUG", "-g", "-fno-omit-frame-pointer"))
@@ -1999,10 +2049,22 @@ def sync_build(daemon, provenance):
         raise TrialError("diagnostic executable provenance unavailable/invalid: " + str(error)) from error
 
 
-def sync_names(trial_id):
+def sync_names(trial_id, mode="sync-calls"):
     if not re.fullmatch(r"[0-9a-f]{32}", trial_id):
         raise TrialError("invalid sync diagnostic trial identity")
-    return "daemon-sync-" + trial_id + ".jsonl", "daemon-sync-" + trial_id + ".receipt.json"
+    if mode not in ("sync-calls", "backing-io"):
+        raise TrialError("invalid diagnostic artifact mode")
+    stem = ("daemon-io-" if mode == "backing-io" else "daemon-sync-") + trial_id
+    return stem + ".jsonl", stem + ".receipt.json"
+
+
+def io_affinity(mask):
+    """Fixed 1024-bit cpuset, CPU zero is the low bit. Fail before allocation."""
+    if (not isinstance(mask, list) or not mask
+            or any(type(cpu) is not int or not 0 <= cpu < 1024 for cpu in mask)
+            or len(set(mask)) != len(mask)):
+        raise TrialError("backing-I/O diagnostic requires explicit valid daemon affinity (CPUs 0..1023)")
+    return format(sum(1 << cpu for cpu in mask), "0256x")
 
 
 def sync_intervals(events, clip=None):
@@ -2128,6 +2190,147 @@ def decode_sync_trace(raw, *, trial_id, token, child, application_interval, shut
         raise TrialError("missing/corrupt sync diagnostic: " + str(error)) from error
 
 
+def decode_backing_io_trace(raw, *, trial_id, token, child, application_interval,
+                            shutdown_start, evidence, expected_affinity, guard=lambda: None):
+    """Decode the compact I/O schema independently; never relax sync validation.
+
+    Array indices are declared in the header and fixed here, not trusted from it.
+    Requested/transferred bytes count individual attempts (including retries), not
+    unique logical data or physical-device traffic. Affinity is observed before
+    each call, not continuously or over a thread's lifetime.
+    """
+    def require(condition, message):
+        if not condition:
+            raise TrialError("invalid backing-I/O diagnostic: " + message)
+    def integer(value, lo=0, hi=2**64-1):
+        return type(value) is int and lo <= value <= hi
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, "duplicate JSON key")
+            result[key] = value
+        return result
+    def aggregate(events, clip=None):
+        result = sync_intervals(events, clip)
+        result.update(requested_bytes=sum(e["requested_bytes"] for e in events),
+                      transferred_bytes=sum(max(0, e["return_value"]) for e in events),
+                      partial_count=sum(0 < e["return_value"] < e["requested_bytes"] for e in events),
+                      zero_count=sum(e["return_value"] == 0 for e in events))
+        return result
+    try:
+        require(0 < len(raw) <= SYNC_MAX_BYTES and raw.endswith(b"\n"), "empty/oversized/truncated trace")
+        lines = raw.splitlines()
+        require(3 <= len(lines) <= SYNC_MAX_EVENTS + 2, "missing events/invalid record count")
+        records = []
+        for i, line in enumerate(lines):
+            guard()
+            limit = 4096 if i == 0 else 1024 if i == len(lines)-1 else IO_MAX_EVENT_LINE
+            require(len(line)+1 <= limit, "oversized serialized record")
+            records.append(json.loads(line, object_pairs_hook=unique))
+        require(all(type(r) is dict for r in records), "non-object record")
+        header, footer = records[0], records[-1]
+        pid = child["identity"]["pid"]
+        require(integer(pid, 1, 2**31-1) and child["exit_status"] == 0 and child["reap_count"] == 1,
+                "normal exactly-once daemon exit unconfirmed")
+        require(all(integer(header.get(k)) for k in ("max_event_line_bytes", "max_serialized_bytes",
+                "event_memory_bytes", "event_size_bytes", "max_bytes", "max_events", "affinity_bits")),
+                "noninteger header bound")
+        require(type(expected_affinity) is str and re.fullmatch(r"[0-9a-f]{256}", expected_affinity)
+                and int(expected_affinity, 16) != 0, "invalid pinned affinity")
+        require(header.get("kind") == "header" and header.get("schema") == IO_SCHEMA
+                and header.get("mode") == "backing-io" and header.get("trial_id") == trial_id
+                and header.get("token") == token and type(header.get("pid")) is int and header["pid"] == pid
+                and header.get("clock") == "CLOCK_MONOTONIC" and header.get("unit") == "nanoseconds"
+                and header.get("max_bytes") == SYNC_MAX_BYTES and header.get("max_events") == SYNC_MAX_EVENTS
+                and header.get("event_fields") == IO_FIELDS and header.get("symbols") == IO_SYMBOLS
+                and header.get("affinity_bits") == 1024 and header.get("expected_affinity") == expected_affinity,
+                "header identity/mode/clock/fields/affinity mismatch")
+        require(header.get("max_event_line_bytes") == IO_MAX_EVENT_LINE
+                and header.get("max_serialized_bytes") == IO_MAX_SERIALIZED
+                and integer(header.get("event_size_bytes"), 1, 256)
+                and header.get("event_memory_bytes") == header["event_size_bytes"] * SYNC_MAX_EVENTS,
+                "invalid memory/serialization bounds")
+        require(integer(header.get("module_base"), 1) and header.get("caller_source") == "__builtin_return_address",
+                "missing caller/module attribution")
+        require(footer.get("kind") == "footer" and footer.get("trial_id") == trial_id
+                and footer.get("token") == token and type(footer.get("pid")) is int and footer["pid"] == pid
+                and footer.get("complete") is True and footer.get("overflow") is False,
+                "incomplete/foreign/overflow finalization")
+        counts = ("observed", "written", "dropped", "inflight", "clock_errors", "recording_errors", "canceled", "affinity_errors")
+        require(all(integer(footer.get(n)) for n in counts), "invalid completeness counters")
+        require(footer["observed"] == footer["written"] == len(records)-2
+                and all(footer[n] == 0 for n in counts[2:])
+                and type(footer.get("live_threads")) is int and footer["live_threads"] == 1,
+                "lost/canceled/unfinished/error events or live threads")
+        enabled, finalized = header.get("enabled_monotonic_ns"), footer.get("finalized_monotonic_ns")
+        require(integer(enabled) and integer(finalized) and enabled <= finalized
+                and child["launch_monotonic"] <= enabled/1e9 <= finalized/1e9 <= child["exit_monotonic"],
+                "recorder outside owned child interval")
+        events, last_exit = [], {}
+        for sequence, record in enumerate(records[1:-1], 1):
+            guard()
+            require(set(record) == {"e"} and type(record["e"]) is list and len(record["e"]) == len(IO_FIELDS),
+                    "invalid event layout")
+            e = dict(zip(IO_FIELDS, record["e"]))
+            require(integer(e["sequence"], 1, SYNC_MAX_EVENTS) and e["sequence"] == sequence
+                    and integer(e["tid"], 1, 2**31-1) and integer(e["symbol"], 0, 4)
+                    and integer(e["fd"], -2**31, 2**31-1) and integer(e["caller"], header["module_base"]+1)
+                    and integer(e["entry_ns"]) and integer(e["exit_ns"]) and integer(e["affinity_ns"])
+                    and enabled <= e["affinity_ns"] <= e["entry_ns"] <= e["exit_ns"] <= finalized
+                    and e["affinity_ns"] >= last_exit.get(e["tid"], enabled),
+                    "malformed/unattributed/out-of-order event")
+            require(integer(e["requested_bytes"]) and integer(e["return_value"], -1, 2**63-1)
+                    and e["return_value"] <= e["requested_bytes"]
+                    and integer(e["errno"], -2**31, 2**31-1), "invalid result/byte relationship")
+            require((integer(e["offset"], -2**63, 2**63-1) if e["symbol"] in (0, 1, 4) else e["offset"] is None)
+                    and ((integer(e["buffer_size"]) and e["requested_bytes"] <= e["buffer_size"])
+                         if e["symbol"] == 4 else e["buffer_size"] is None), "invalid offset/fortified buffer size")
+            require(type(e["clock_error"]) is int and e["clock_error"] == 0
+                    and type(e["affinity_status"]) is int and e["affinity_status"] == 0
+                    and type(e["affinity_errno"]) is int and e["affinity_errno"] == 0
+                    and e["affinity"] == expected_affinity, "clock/affinity mismatch or unavailable observation")
+            e["operation"] = IO_SYMBOLS[e["symbol"]]
+            last_exit[e["tid"]] = e["exit_ns"]
+            events.append(e)
+        require(isinstance(application_interval, (list, tuple)) and len(application_interval) == 2
+                and all(type(v) in (int, float) and math.isfinite(v) for v in application_interval)
+                and child["launch_monotonic"] <= application_interval[0] <= application_interval[1] <= child["exit_monotonic"]
+                and type(shutdown_start) in (float, int) and math.isfinite(shutdown_start)
+                and application_interval[1] <= shutdown_start <= child["exit_monotonic"], "invalid application/shutdown boundaries")
+        lo, hi = (round(v*1e9) for v in application_interval)
+        shutdown = round(shutdown_start*1e9)
+        groups = {}
+        for name, key in (("by_operation", lambda e: e["operation"]), ("by_thread", lambda e: str(e["tid"])),
+                          ("by_caller", lambda e: hex(e["caller"]-header["module_base"]))):
+            grouped = {}
+            for e in events:
+                grouped.setdefault(key(e), []).append(e)
+            require(len(grouped) <= 256, "analysis group bound exceeded; retain raw trace")
+            groups[name] = {k: aggregate(v) for k, v in grouped.items()}
+        overlap = [e for e in events if e["entry_ns"] < hi and e["exit_ns"] > lo]
+        return {"schema": IO_SCHEMA, "valid": True, "reason": None, "evidence": evidence,
+                "clock": "CLOCK_MONOTONIC", "unit": "seconds", "header": header, "completeness": footer,
+                "summary": aggregate(events), **groups,
+                "failed_errno_counts": {str(n): sum(e["return_value"] == -1 and e["errno"] == n for e in events)
+                                        for n in sorted({e["errno"] for e in events if e["return_value"] == -1})},
+                "affinity": {"expected": expected_affinity, "observed_tids": sorted(last_exit),
+                    "scope": "event-time observations before real-call timing; not full-thread-lifetime evidence"},
+                "application_interval": list(application_interval), "shutdown_start": shutdown_start,
+                "application_overlap": aggregate(overlap, (lo, hi)),
+                "boundary_straddling_count": sum(e["entry_ns"] < lo < e["exit_ns"] or e["entry_ns"] < hi < e["exit_ns"] for e in events),
+                "before_application": aggregate([e for e in events if e["exit_ns"] <= lo]),
+                "after_application": aggregate([e for e in events if e["entry_ns"] >= hi]),
+                "shutdown_overlap": aggregate([e for e in events if e["exit_ns"] > shutdown],
+                                               (shutdown, round(child["exit_monotonic"]*1e9))),
+                "limitations": "Eligible libc attempt intervals only; retries count separately. Byte counts are not physical device traffic. "
+                    "Elapsed time includes kernel execution, blocking and scheduling; interval union is not application waiting. "
+                    "No userspace CPU/off-CPU/FUSE latency decomposition. Caller PCs are not verified file identities. "
+                    "Byte counts for clipped groups refer to whole calls, not time-proportional transferred bytes. "
+                    "Affinity queries and recording perturb execution. Preparation/verification not collected; no shared-library-internal/raw-syscall coverage."}
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError) as error:
+        raise TrialError("missing/corrupt backing-I/O diagnostic: " + str(error)) from error
+
+
 class MeasurementTrial(Trial):
     """Opt-in, one-use staged-directory trial; never a multi-run campaign.
 
@@ -2172,7 +2375,8 @@ class MeasurementTrial(Trial):
             raise TrialError("invalid diagnostic configuration")
         sync = anchor.get("daemon_diagnostic")
         if ("daemon_diagnostic" in anchor or "daemon_diagnostic" in state):
-            if (not isinstance(sync, dict) or sync != sync_configuration("sync-calls")
+            if (not isinstance(sync, dict) or sync.get("mode") not in ("sync-calls", "backing-io")
+                    or sync != sync_configuration(sync.get("mode"))
                     or state["backend"] != "myfs" or config.get("mode") is not None
                     or not isinstance(state.get("daemon_diagnostic"), dict)
                     or state["daemon_diagnostic"].get("configuration") != sync
@@ -2180,7 +2384,10 @@ class MeasurementTrial(Trial):
                     or not re.fullmatch(r"[0-9a-f]{32}", anchor.get("daemon_sync_token", ""))
                     or not isinstance(anchor.get("daemon_sync_build"), dict)):
                 raise TrialError("changed/invalid daemon diagnostic ownership configuration")
-        population = ("daemon_sync_instrumented_application_completion" if sync else
+            if sync["mode"] == "backing-io" and anchor.get("daemon_io_affinity") != io_affinity(state["affinities"]["daemon"]):
+                raise TrialError("changed backing-I/O diagnostic affinity")
+        population = (("daemon_backing_io_instrumented_application_completion" if sync["mode"] == "backing-io"
+                       else "daemon_sync_instrumented_application_completion") if sync else
                       "instrumented_application_completion" if config.get("mode") else "buffered_application_completion")
         if (not isinstance(config, dict) or config != diagnostic_configuration(config.get("mode"))
                 or not isinstance(state.get("diagnostic"), dict)
@@ -2192,14 +2399,21 @@ class MeasurementTrial(Trial):
 
     @property
     def sync_diagnostic(self):
-        return self.anchor.get("daemon_diagnostic", {}).get("mode") == "sync-calls"
+        # Historical internal name; both modes share the same owned-FD lifecycle.
+        return self.anchor.get("daemon_diagnostic", {}).get("mode") in ("sync-calls", "backing-io")
+
+    @property
+    def daemon_diagnostic_mode(self):
+        return self.anchor.get("daemon_diagnostic", {}).get("mode")
 
     def launch_daemon(self, command, log, limit, index):
         if not self.sync_diagnostic:
+            if any(name in os.environ for name in SYNC_ENV + IO_ENV):
+                raise TrialError("ambient daemon diagnostic handoff refused for uninstrumented measurement")
             return super().launch_daemon(command, log, limit, index)
         # taskset execs the daemon in place: only that direct child inherits this
         # FD. No tracer or new waiter. Recorder marks it CLOEXEC in its constructor.
-        env = {key: value for key, value in os.environ.items() if key not in SYNC_ENV}
+        env = {key: value for key, value in os.environ.items() if key not in SYNC_ENV + IO_ENV}
         if index != 1:
             if index not in (0, 2):
                 raise TrialError("unexpected diagnostic daemon lifecycle")
@@ -2207,7 +2421,7 @@ class MeasurementTrial(Trial):
         if self.state["phases"][-1]["name"] != "application_readiness":
             raise TrialError("sync recorder only allowed for application mount")
         directory = profile_directory(self.artifacts, self.anchor)
-        raw_name, receipt_name = sync_names(self.anchor["trial_id"])
+        raw_name, receipt_name = sync_names(self.anchor["trial_id"], self.daemon_diagnostic_mode)
         fd = None
         try:
             for name in (raw_name, receipt_name):
@@ -2222,8 +2436,13 @@ class MeasurementTrial(Trial):
                       "valid": None, "reason": "owned daemon has not finalized trace", "daemon": None}
             self.state["daemon_diagnostic"]["trace"] = record
             self.save()
-            env.update(M0_SYNC_FD=str(fd), M0_SYNC_TRIAL=self.anchor["trial_id"],
-                       M0_SYNC_TOKEN=self.anchor["daemon_sync_token"])
+            if self.daemon_diagnostic_mode == "backing-io":
+                env.update(M0_IO_FD=str(fd), M0_IO_TRIAL=self.anchor["trial_id"],
+                           M0_IO_TOKEN=self.anchor["daemon_sync_token"],
+                           M0_IO_AFFINITY=self.anchor["daemon_io_affinity"])
+            else:
+                env.update(M0_SYNC_FD=str(fd), M0_SYNC_TRIAL=self.anchor["trial_id"],
+                           M0_SYNC_TOKEN=self.anchor["daemon_sync_token"])
             identity = self.processes.launch(command, log, limit, pass_fds=(fd,), env=env)
             record["daemon"] = identity
             self.save()
@@ -2254,18 +2473,21 @@ class MeasurementTrial(Trial):
                 if self.clock.now() >= deadline:
                     raise TrialError("sync diagnostic validation timeout")
                 self.check_budget()
-            raw_name, receipt_name = sync_names(self.anchor["trial_id"])
+            raw_name, receipt_name = sync_names(self.anchor["trial_id"], self.daemon_diagnostic_mode)
             raw, file = profile_file_read(directory, raw_name, SYNC_MAX_BYTES, guard)
             if file["identity"] != previous["identity"]:
                 raise TrialError("sync artifact identity substituted")
             interval = self.state["measurements"]["application"]["wall_seconds"]["interval"]
             shutdown = next(p["start_monotonic"] for p in self.state["phases"] if p["name"] == "daemon_shutdown")
-            report = decode_sync_trace(raw, trial_id=self.anchor["trial_id"], token=self.anchor["daemon_sync_token"],
+            decoder = decode_backing_io_trace if self.daemon_diagnostic_mode == "backing-io" else decode_sync_trace
+            extra = {"expected_affinity": self.anchor["daemon_io_affinity"]} if self.daemon_diagnostic_mode == "backing-io" else {}
+            report = decoder(raw, trial_id=self.anchor["trial_id"], token=self.anchor["daemon_sync_token"],
                 child=child, application_interval=interval, shutdown_start=shutdown,
-                evidence=self.state["evidence"], guard=guard)
+                evidence=self.state["evidence"], guard=guard, **extra)
             report.update(artifact=str(self.artifacts / raw_name), file=file, daemon=child["identity"],
                           executable=self.anchor["daemon_sync_build"]["executable"],
-                          module_build_id=self.anchor["daemon_sync_build"]["provenance"]["daemon_sync"]["module_build_id"])
+                          module_build_id=self.anchor["daemon_sync_build"]["provenance"][
+                              "daemon_backing_io" if self.daemon_diagnostic_mode == "backing-io" else "daemon_sync"]["module_build_id"])
             if publish:
                 fd = os.open(receipt_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
                 try:
@@ -2343,7 +2565,8 @@ class MeasurementTrial(Trial):
         if daemon_diagnostic and (backend != "myfs" or diagnostic is not None):
             raise TrialError("daemon diagnostic requires myfs and cannot combine with Python profiling")
         # Pin reviewed executable/provenance before any expensive allocation.
-        sync_binary = sync_build(daemon, build_provenance) if daemon_diagnostic else None
+        expected_affinity = io_affinity(daemon_affinity) if daemon_diagnostic == "backing-io" else None
+        sync_binary = sync_build(daemon, build_provenance, daemon_diagnostic) if daemon_diagnostic else None
         config = measurement_limits(records, readiness_seconds=readiness_seconds,
             application_seconds=application_seconds, shutdown_seconds=shutdown_seconds,
             io_seconds=io_seconds, staging_seconds=staging_seconds,
@@ -2398,6 +2621,8 @@ class MeasurementTrial(Trial):
             anchor["daemon_diagnostic"] = sync_config
             anchor["daemon_sync_build"] = sync_binary
             anchor["daemon_sync_token"] = uuid.uuid4().hex
+            if expected_affinity is not None:
+                anchor["daemon_io_affinity"] = expected_affinity
         if diagnostic:
             anchor["diagnostic_application"] = {"path": str(APPLICATION), "file": profile_application_file(APPLICATION)}
         for path in (artifacts, workspace, *((canonical,) if shared is None else ())):
@@ -2446,9 +2671,10 @@ class MeasurementTrial(Trial):
                 "trace": {"valid": None, "reason": "application daemon not executed", "artifact": None},
                 "preparation": {"value": None, "reason": "NOT COLLECTED: recorder disabled for preparation mount"},
                 "verification": {"value": None, "reason": "NOT COLLECTED: recorder disabled for verification mount"}}
-            state["measurement_population"] = "daemon_sync_instrumented_application_completion"
+            state["measurement_population"] = ("daemon_backing_io_instrumented_application_completion"
+                if daemon_diagnostic == "backing-io" else "daemon_sync_instrumented_application_completion")
             state["baseline_eligible"] = False
-            state["label"] = "sync-call daemon diagnostic; excluded from baseline populations"
+            state["label"] = daemon_diagnostic + " daemon diagnostic; excluded from baseline populations"
         state["canonical_reference"] = {"ownership": "campaign" if shared else "trial-retained",
             "campaign_id": campaign_id if shared else None,
             "receipt": str(shared.artifacts / "state.json") if shared else None,
@@ -2534,7 +2760,7 @@ class MeasurementTrial(Trial):
         super().check_paths(mounted)
         if self.sync_diagnostic:
             pinned = self.anchor["daemon_sync_build"]
-            if sync_build(pinned["executable"]["path"], pinned["provenance"]) != pinned:
+            if sync_build(pinned["executable"]["path"], pinned["provenance"], self.daemon_diagnostic_mode) != pinned:
                 raise TrialError("diagnostic source/executable provenance changed")
             if self.state.get("daemon") is not None and any(
                     self.state["daemon"].get(k) != v for k, v in pinned["executable"].items()):
@@ -3058,6 +3284,11 @@ class MeasurementTrial(Trial):
 
 
 def main(argv=None):
+    class Once(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            if getattr(namespace, self.dest, None) is not None:
+                parser.error(option_string + " may be selected only once")
+            setattr(namespace, self.dest, values)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("prepare", "self-test"):
@@ -3107,8 +3338,8 @@ def main(argv=None):
             command.add_argument("--build-provenance", type=Path)
             command.add_argument("--application-cpus", type=cpu_list)
             command.add_argument("--daemon-cpus", type=cpu_list)
-            command.add_argument("--daemon-diagnostic", choices=("sync-calls",), default=None,
-                                 help="myfs only; isolated verified sync wrapper build; excludes baseline")
+            command.add_argument("--daemon-diagnostic", choices=("sync-calls", "backing-io"), default=None, action=Once,
+                                 help="myfs only; matching isolated wrapper build; backing-io requires --daemon-cpus; excludes baseline")
             command.add_argument("--diagnostic", choices=("python-cpu",), default=None,
                                  help="opt-in application CPU profile; instrumented completion is excluded from baseline")
         for limit, default in (("readiness", 10), ("application", 30), ("shutdown", 30), ("io", 30)):
