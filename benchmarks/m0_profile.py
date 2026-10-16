@@ -3109,7 +3109,7 @@ class MeasurementTrial(Trial):
         self.state["application_end_counters"] = entry.get("endpoint_counters", {
             "value": None, "reason": "adapter did not capture pre-reap endpoint", "evidence": self.state["evidence"]})
         if self.sync_diagnostic:
-            values["wall_seconds"]["population"]["completion"] = "daemon_sync_instrumented_application_completion"
+            values["wall_seconds"]["population"]["completion"] = self.state["measurement_population"]
             values["wall_seconds"]["limitation"] = "daemon instrumentation active; diagnostic only, excluded from baseline"
         if self.python_diagnostic:
             values["wall_seconds"]["population"]["completion"] = "instrumented_application_completion"

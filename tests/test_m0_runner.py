@@ -26,6 +26,27 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 
 
+def assert_persisted_completion(test, trial, *, population, completion, baseline, wall_value):
+    """Check published completion evidence, not just the preparation label."""
+    state = json.loads((trial.artifacts / "state.json").read_text())
+    test.assertEqual(state["outcome"], "passed")
+    test.assertEqual(state["measurement_population"], population)
+    test.assertIs(state["baseline_eligible"], baseline)
+    child = next(c for c in state["children"] if c["identity"] == state["application_identity"])
+    measurements = state["measurements"]["application"]
+    wall = measurements["wall_seconds"]
+    expected_population = {"application_child": child["identity"]}
+    if completion is not None:
+        expected_population["completion"] = completion
+    test.assertEqual(wall["population"], expected_population)
+    test.assertEqual(wall["value"], wall_value)
+    test.assertEqual(wall["interval"], [child["launch_monotonic"], child["exit_monotonic"]])
+    test.assertEqual(wall["evidence"], state["evidence"])
+    test.assertEqual(measurements["exit_status"]["value"], 0)
+    for field in ("user_seconds", "system_seconds", "peak_rss_bytes"):
+        test.assertEqual(measurements[field], child["resources"][field])
+
+
 class FakeClock:
     def __init__(self):
         self.value = 0.0
@@ -586,6 +607,13 @@ class MeasurementTests(unittest.TestCase):
         self.assertTrue(trial.workspace.exists())
         self.assertTrue(trial.canonical_directory.exists())
         self.assertEqual(trial.state["retention"]["artifacts"], "retained")
+
+    def test_persisted_ordinary_completion_population(self):
+        trial = self.prepare()
+        self.assertTrue(trial.execute(), trial.state["error"])
+        assert_persisted_completion(self, trial, population="buffered_application_completion",
+                                    completion=None, baseline=True, wall_value=5.0)
+        self.assertEqual(self.processes.reaps[trial.state["application_identity"]["pid"]], 1)
 
     def test_ext4_phase_order_and_exact_application_boundaries(self):
         trial = self.prepare()
@@ -1733,6 +1761,14 @@ class PythonProfileTests(unittest.TestCase):
         self.assertGreater(value["total_calls"], 0)
         return value
 
+    def test_persisted_python_completion_population(self):
+        trial = self.prepare()
+        self.passed(trial)
+        assert_persisted_completion(self, trial, population="instrumented_application_completion",
+            completion="instrumented_application_completion", baseline=False, wall_value=None)
+        child = next(c for c in trial.state["children"] if c["identity"] == trial.state["application_identity"])
+        self.assertEqual(child["reap_count"], 1)
+
     def test_default_application_command_and_offline_wall_unchanged(self):
         trial = self.prepare(diagnostic=None)
         self.assertTrue(trial.execute(), trial.state["error"])
@@ -2737,6 +2773,13 @@ class DaemonSyncLifecycleTests(unittest.TestCase):
             daemon=Path(sys.executable).resolve(), build_provenance=self.provenance(),
             daemon_diagnostic="sync-calls", **kwargs)
 
+    def test_persisted_sync_completion_population(self):
+        trial = self.prepare()
+        self.assertTrue(trial.execute(), trial.state["error"])
+        assert_persisted_completion(self, trial, population="daemon_sync_instrumented_application_completion",
+            completion="daemon_sync_instrumented_application_completion", baseline=False, wall_value=5.0)
+        self.assertEqual(self.processes.reaps[trial.state["application_identity"]["pid"]], 1)
+
     def test_full_fake_lifecycle_excludes_other_mounts_and_preserves_timing(self):
         trial = self.prepare()
         self.assertEqual(trial.state["outcome"], "prepared", trial.state["error"])
@@ -2911,6 +2954,13 @@ class BackingIORunnerTests(unittest.TestCase):
             mounts=self.mounts, host=self.host, clock=self.clock, daemon_affinity=[0],
             daemon=Path(sys.executable).resolve(), build_provenance=self.provenance(),
             daemon_diagnostic="backing-io", **kwargs)
+
+    def test_persisted_backing_io_completion_population(self):
+        trial = self.prepare()
+        self.assertTrue(trial.execute(), trial.state["error"])
+        assert_persisted_completion(self, trial, population="daemon_backing_io_instrumented_application_completion",
+            completion="daemon_backing_io_instrumented_application_completion", baseline=False, wall_value=5.0)
+        self.assertEqual(self.processes.reaps[trial.state["application_identity"]["pid"]], 1)
 
     def test_full_fake_io_lifecycle_fd_timing_ownership_and_cleanup(self):
         with mock.patch.dict(os.environ, {key:"unrelated" for key in runner.SYNC_ENV+runner.IO_ENV}):
