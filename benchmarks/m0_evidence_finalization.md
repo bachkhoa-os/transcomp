@@ -1,14 +1,22 @@
-# M0 profiling evidence and proposed acceptance decision
+# M0 profiling evidence and acceptance decision
 
-**Status: PROPOSED — AWAITING USER REVIEW**
+**Status: ACCEPTED — WITHIN DOCUMENTED EXPERIMENTAL SCOPE**
 
 Checkpoint: M0-D9b. Evidence review date: 2026-10-17.
 Repository reviewed: `feat/m0-d1a-single-trial-measurement` at
 `6217edf82b59737c5b048d07538612fd20491b67`, initially clean.
-This document records a proposed milestone decision, not approval to close M0
-or authorization to start M1 implementation.
+Acceptance update: M0-D9c, 2026-10-17. By explicit project-owner approval,
+M0 is accepted as an evidence and measurement milestone within its documented
+experimental scope. This includes acceptance of the empty list of causally
+established native filesystem bottlenecks as a valid disposition of the M0 exit
+criterion. It does not establish that no bottleneck exists.
 
-## 1. Purpose, authority and recommendation
+All existing measurement limitations remain binding. Acceptance does not establish
+production readiness, full POSIX compatibility, crash durability, concurrent
+visibility guarantees or a causal explanation of the historical timing difference.
+M1 remains separately authorized future work; it is neither started nor completed.
+
+## 1. Purpose, authority and decision
 
 The product direction is a directly readable and writable compressed directory
 for raw Linux data. Existing applications use ordinary file paths without
@@ -33,18 +41,20 @@ honest cache/durability qualifications and non-duplicated storage accounting.
 M1 concerns explicit visibility, sync, error and recovery contracts and tests;
 M2 concerns workflow compatibility; M3 permits evidence-driven optimization.
 
-**Recommendation:** accept the scoped M0 evidence package after explicit user
-review of the criterion assessment in section 11. Defer additional callback
-instrumentation. Recommend a separately authorized M1 contract/test audit after
-that decision; no M1 work is started here.
+**Decision:** the project owner explicitly accepted the scoped M0 evidence
+package on 2026-10-17, including the criterion assessment in section 11. Further
+profiling, including callback instrumentation, is deferred until a concrete
+engineering decision justifies it. No M1 implementation is authorized by this
+acceptance.
 
 **No causally established native filesystem bottleneck has been identified by the M0 diagnostic campaign.**
 
 This does not mean that no bottleneck exists. It means the collected populations
 do not establish a native cause of the historical ext4/myfs timing difference.
 The compatibility register and measured-cost/bottleneck disposition are separate
-deliverables below. Acceptance of that honest disposition against the roadmap's
-wording is an explicit reviewer decision, not an assumption made by this commit.
+deliverables below. The project owner's explicit approval accepts that honest
+disposition against the roadmap's wording. Measured costs, candidate bottlenecks
+and proven causal bottlenecks remain distinct.
 
 Evidence terms used throughout:
 
@@ -663,29 +673,30 @@ failures, logs, source, binaries and provenance are preserved. Only this documen
 is created in the repository; roadmap, production, runner, diagnostic C, fixture,
 application and tests remain unchanged.
 
-## 11. Proposed criterion-by-criterion acceptance
+## 11. Approved criterion-by-criterion acceptance
 
 The following assessments concern M0's scoped evidence deliverables, not overall
-filesystem readiness. Status labels do not constitute user acceptance.
+filesystem readiness. All five dispositions were accepted by explicit
+project-owner approval on 2026-10-17.
 
-| Roadmap deliverable | Proposed status | Evidence | Important limitations | Remaining action |
+| Roadmap deliverable | Accepted status | Evidence | Important limitations | Remaining action |
 |---|---|---|---|---|
-| Reproducible baseline | SATISFIED | Deterministic versioned workload/oracle, hashes, identities, fixed D5c schedule, eight measurements/backend and paired controls; sections 2–3, E5 | One synthetic workflow/machine/cache history; fixture reconstruction now required for replay | Reviewer accepts this scope; any future execution rechecks host/provenance and creates valid current identities |
+| Reproducible baseline | SATISFIED | Deterministic versioned workload/oracle, hashes, identities, fixed D5c schedule, eight measurements/backend and paired controls; sections 2–3, E5 | One synthetic workflow/machine/cache history; fixture reconstruction now required for replay | Scope accepted; any future execution rechecks host/provenance and creates valid current identities |
 | Raw evidence | SATISFIED | Original trial states/logs, pstats, complete sync/I/O traces, receipts, provenance and calculations; E5–E8 | Host-local evidence is not in the repository; volatile CSVs/old sync binary absent; standalone design reports unavailable | Preserve persistent evidence and these availability qualifications; do not infer full historical replay capability |
-| Correct output | SATISFIED | Exact independent input/output comparisons, successful application exits and fresh-remount verification for the measured workflows | Normal orderly completion only; not crash durability, concurrent visibility or full POSIX correctness | Reviewer accepts the scoped claim; M1/M2 contracts require separate verification |
+| Correct output | SATISFIED | Exact independent input/output comparisons, successful application exits and fresh-remount verification for the measured workflows | Normal orderly completion only; not crash durability, concurrent visibility or full POSIX correctness | Scoped claim accepted; M1/M2 contracts require separate verification |
 | Separate compatibility/contract-gap disposition | SATISFIED | Section 6, source references and existing-test qualifications | Register is a proposed audit scope, not proof every candidate is broken or every gap is found | Review priorities and supported scope; no implementation authorized |
-| Separate measured-bottleneck disposition | NEEDS USER DECISION | Section 7 separately records directly measured costs, unknown causes and explicit absence of a causally established native bottleneck | Roadmap does not explicitly demand at least one proven bottleneck, but acceptance of an honest unestablished/empty proven list must not be assumed | Accept this disposition, or specify a concrete unmet criterion before authorizing further work; do not automatically start another experiment |
+| Separate measured-bottleneck disposition | SATISFIED | Section 7 separately records directly measured costs, unknown causes and explicit absence of a causally established native bottleneck | The empty proven-bottleneck list is explicitly accepted as a valid disposition; it does not establish that no bottleneck exists | Preserve unresolved hypotheses; additional profiling requires a concrete engineering decision and separate authorization |
 
 The documentary separation missing from scattered campaign reports is supplied
 here. No measured result justifies production optimization at this point. The
-remaining decision is whether the scoped evidence and explicit unknowns meet
-M0's intended exit, particularly its measured-bottleneck wording.
+project-owner decision accepts the scoped evidence and explicit unknowns as
+meeting M0's intended exit, including its measured-bottleneck wording.
 
-**Proposed acceptance recommendation:** approve the M0 evidence package with its
-stated limitations and defer further profiling until a concrete engineering
-decision warrants it. If the user accepts the criterion interpretation, a later
-separately authorized checkpoint may audit M1 visibility, sync, error and recovery
-contracts against existing code/tests. This document neither changes roadmap
-status nor starts or completes M1.
+**Approved M0 decision:** M0 is accepted within its documented experimental scope
+by explicit project-owner approval dated 2026-10-17. All stated limitations remain
+binding. Further profiling is deferred until a concrete engineering decision
+warrants it. A later separately authorized checkpoint may audit M1 visibility,
+sync, error and recovery contracts against existing code/tests. This document
+does not modify the roadmap or authorize, start or complete M1.
 
-**Status remains: PROPOSED — AWAITING USER REVIEW.**
+**Status: ACCEPTED — WITHIN DOCUMENTED EXPERIMENTAL SCOPE.**
